@@ -3589,6 +3589,15 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 use_hybrid_linear_attention_layerwise = False
 
+        early_enabled = self.launch_config.get("enable_early_prefetch", False)
+        if early_enabled and (
+            is_fawa
+            or use_ratio_rate
+            or use_cp_parallel
+            or use_hybrid_linear_attention
+        ):
+            raise ValueError("Early requires the native direct or layerwise connector")
+
         if is_fawa:
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
         elif use_ratio_rate:
@@ -3604,9 +3613,29 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config, role, kv_cache_config
             )
         elif use_layerwise:
-            self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
+            if early_enabled:
+                from .early_connector import EarlyLayerWiseConnector
+
+                self.connector = EarlyLayerWiseConnector(
+                    vllm_config, role, kv_cache_config
+                )
+            else:
+                self.connector = UCMLayerWiseConnector(
+                    vllm_config, role, kv_cache_config
+                )
         else:
-            self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
+            if early_enabled:
+                from .early_connector import EarlyDirectConnector
+
+                self.connector = EarlyDirectConnector(vllm_config, role, kv_cache_config)
+            else:
+                self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
+
+    def on_new_request(self, request: "Request") -> None:
+        self.connector.on_new_request(request)
+
+    def shutdown(self) -> None:
+        self.connector.shutdown()
 
     @property
     def requires_kv_delivery(self) -> bool:
@@ -3734,6 +3763,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         external_hit_tokens, need_load = self.connector.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
+        if external_hit_tokens is None:
+            return None, False
         self._record_prefix_cache_token_metrics(
             request,
             num_computed_tokens,

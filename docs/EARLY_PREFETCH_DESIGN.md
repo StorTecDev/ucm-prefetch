@@ -18,7 +18,7 @@ READY 通过保存的 block IDs 和受保护命中结果进入原生 token 计�
 | 组件 | 职责与关系 |
 |---|---|
 | EarlyDirectConnector / EarlyLayerWiseConnector | 薄子类；继承原生初始化、metadata、逐层执行和 KV load，只接入请求生命周期与保存结果 |
-| EarlyScheduler / EarlyWorker / Control | 请求实例 identity、异步提交、PENDING/READY/FAILED/CANCELLED、Stan HRRN、既有批次线程及传输；非 owner 模式保留 rank 汇总 |
+| EarlyScheduler / EarlyWorker / Control | 请求实例 identity、异步提交、PENDING/READY/FAILED/CANCELLED、HRRN、既有批次线程及传输；非 owner 模式保留 rank 汇总 |
 | OwnerBroker : BrokerState | 在既有 broker/job table 上扩展原生共享对象握手、每 generation 单 owner、共享域额度、接管及排空确认 |
 | OwnerWorker / Consumer / LoadConsistency | 组合现有 worker 和同一个原生 RankConsistencyManager；关联真实任务完成、消费范围及 generation，不创建另一套加载队列 |
 | Early::DomainProvider | EarlyCacheStore 的可选能力接口；查询已创建 buffer 的身份/容量，提交延后 pin 查询并等待同一 buffer 的释放事件 |
@@ -164,7 +164,7 @@ sequenceDiagram
 等待节奏调用 Check，不增加 lookup/data 线程或 Posix 并发。
 
 数据队列每请求选取最早的可提交批次。每个有限轮次内，每请求取得一次有界
-推进机会；该轮候选按 Stan HRRN 选择前四分之一，完成该轮后才接纳新到候选。
+推进机会；该轮候选按 HRRN 选择前四分之一，完成该轮后才接纳新到候选。
 等待完成的批次仍在 active 中回收，不占用提交机会。整请求 PENDING 保持不变；owner 模式等 owner 的完整受保护结果，兼容路径等全部 rank。软化门控不属于此设计。
 
 取消后停止新提交，已接受的任务由 Check/Wait 排空，再标记尚未完成的本地 owner

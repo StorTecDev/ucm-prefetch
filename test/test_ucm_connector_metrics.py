@@ -290,6 +290,7 @@ CONNECTOR_INTERFACE_METHODS = {
 
 
 def _install_stubs():
+    _install_module("vllm", __path__=[])
     _install_module(
         "numpy",
         ndarray=object,
@@ -362,6 +363,10 @@ def _install_stubs():
         MLAAttentionSpec=type("MLAAttentionSpec", (), {}),
         SlidingWindowSpec=type("SlidingWindowSpec", (), {}),
         UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
+    )
+    _install_module(
+        "vllm.v1.request",
+        RequestStatus=Enum("RequestStatus", ["WAITING", "PREEMPTED"]),
     )
     _install_module(
         "vllm.v1.outputs",

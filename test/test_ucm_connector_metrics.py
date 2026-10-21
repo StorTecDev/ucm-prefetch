@@ -282,6 +282,7 @@ CONNECTOR_INTERFACE_METHODS = {
 
 
 def _install_stubs():
+    _install_module("vllm", __path__=[])
     _install_module(
         "numpy",
         ndarray=object,
@@ -302,7 +303,7 @@ def _install_stubs():
     _install_package("ucm", REPO_ROOT / "ucm")
     _install_package("ucm.integration", REPO_ROOT / "ucm" / "integration")
     _install_package("ucm.integration.vllm", REPO_ROOT / "ucm" / "integration" / "vllm")
-    _install_module("torch", Tensor=type("Tensor", (), {}))
+    _install_module("torch", Tensor=type("Tensor", (), {}), dtype=type("dtype", (), {}))
     _install_module(
         "prometheus_client",
         Counter=FakeCounter,
@@ -350,8 +351,13 @@ def _install_stubs():
         KVCacheConfig=type("KVCacheConfig", (), {}),
         KVCacheSpec=type("KVCacheSpec", (), {}),
         MambaSpec=type("MambaSpec", (), {}),
+        MLAAttentionSpec=type("MLAAttentionSpec", (), {}),
         SlidingWindowSpec=type("SlidingWindowSpec", (), {}),
         UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
+    )
+    _install_module(
+        "vllm.v1.request",
+        RequestStatus=Enum("RequestStatus", ["WAITING", "PREEMPTED"]),
     )
     _install_module(
         "vllm.v1.outputs",
@@ -360,6 +366,7 @@ def _install_stubs():
     _install_module(
         "ucm.integration.vllm.device",
         create_device=lambda *args, **kwargs: None,
+        get_current_device_id=lambda: 0,
     )
     _install_module("ucm.logger", init_logger=lambda name: _Logger())
     _install_module(
@@ -1255,13 +1262,16 @@ def test_ucm_connector_prefers_lite_when_lite_and_fawa_are_both_enabled(monkeypa
     monkeypatch.setitem(
         sys.modules,
         "ucm.integration.vllm.hma_connector",
-        SimpleNamespace(UCMFAWAConnector=FakeFawaConnector),
+        SimpleNamespace(
+            UCMFAWAConnector=FakeFawaConnector,
+            UCMFAWALiteConnector=FakeInnerConnector,
+        ),
     )
 
     connector = UCMConnector(
         _vllm_config(launch_config={"use_lite": True}),
         KVConnectorRole.SCHEDULER,
-        kv_cache_config=object(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
     )
 
     assert type(connector.connector) is FakeInnerConnector

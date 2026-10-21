@@ -16,7 +16,7 @@ The figure simplifies one successful reuse followed by saving. The Worker includ
 
 The engine checks its own cache before calling `get_num_new_matched_tokens()`. The Connector generates UCM identifiers, queries external blocks after the already-computed portion, records request matches and returns additional reusable tokens.
 
-The regular path returns `False` as the second result: it does not use the scheduling mode that resumes a request after asynchronous load completion. Store transfers can still be asynchronous, and the Worker must wait before consumption. `update_state_after_alloc()` is a no-op in the regular direct implementation; block mappings are created from scheduling output in the next step.
+The default synchronous path returns `False` as the second result and waits before consumption. With supported request-async loading enabled, an external hit returns `True`. `update_state_after_alloc()` records the load plan, and subsequent metadata carries it even when the request has no forward tokens in that step. The request waits for remote KV completion while the Scheduler can run other requests.
 
 ### 2. Scheduling output becomes Worker metadata
 
@@ -26,7 +26,7 @@ A new request may load existing blocks and save new ones. Continuing chunked pre
 
 ### 3. Worker loads; Attention waits before use
 
-`start_load_kv()` submits loads using metadata and registered layouts. The direct implementation waits for this step's loads in that method; `wait_for_layer_load()` performs no additional per-layer wait.
+`start_load_kv()` submits loads using metadata and registered layouts. The default direct path waits in that method. Request-async direct loads remain pending until `get_finished()` polls their completion. Neither direct mode performs a per-layer wait in `wait_for_layer_load()`.
 
 The layerwise implementation submits the first layer in `start_load_kv()`. Before each Attention layer, `wait_for_layer_load()` waits for that layer and submits the next, allowing next-layer transfer to overlap current-layer computation. Invalid-block reports and Worker metadata carry load failures back to the engine and Scheduler instead of treating lookup hits as usable device data.
 
@@ -41,6 +41,37 @@ The layerwise path submits saves in `save_kv_layer()`; the direct path primarily
 When the Scheduler calls `request_finished()`, the Connector checks whether asynchronous saving is involved. Returning `True` asks the engine to defer releasing the corresponding KV blocks. The Worker later waits for related pending saves in `get_finished()` and reports request IDs so the engine can continue resource reclamation.
 
 This feedback ends transfer ownership; failed tasks also need a completed resource lifecycle. Verify errors and [restart/replay behavior](../user-guide/observability/verify-cache.md) to establish persistence. Permission to release a buffer does not establish a successful cache write.
+
+## Combining Early Prefetch and request-async loading
+
+Set these top-level UCM options:
+
+```yaml
+use_layerwise: false
+enable_early_prefetch: true
+use_request_async_load: true
+```
+
+Early requires the native `UcmPipelineStore` with `Cache|Posix`. Both flag defaults remain unchanged. An exact-type whitelist admits only `UCMDirectConnector` and `EarlyDirectConnector`; other subclasses do not inherit permission. Unsupported connectors, including layerwise implementations, retain the existing disable-and-warn behavior for request-async loading. Existing startup restrictions on Early with CP, FAWA/HMA and hybrid attention remain in force.
+
+Early prepares lookup and L2-to-L1 prefetch. Request-async loading submits the transfer after HBM allocation and resumes the request after completion. Worker polling uses `Check`, followed by `Wait` to collect the result and task resources. Submission, metadata replacement, cancellation and preemption do not prove that in-flight I/O has safely ended.
+
+Pending async loads retain their Early state during cancellation or preemption. Normal shutdown waits for outstanding loads first. Owner mode keeps the existing generation-scoped consumption and retire/quiesce/release protocol. Errors with unproven I/O completion fence the worker and retain protection; recovery uses the existing whole-domain restart procedure. These retained references must not be treated as ordinary orphan tasks. Capacity rejection proven to occur before I/O follows native load-failure recovery without adding retries.
+
+These options apply only to Direct connectors and do not change layerwise
+synchronization. Generic regression coverage includes constructor admission,
+metadata handoff, completion, cancellation, preemption, owner consumption, and
+shutdown. With the normal UCM/vLLM test dependencies installed, run the following
+from the repository root; historical benchmark inputs are not required:
+
+```bash
+ENABLE_UCM_PATCH=0 PYTHONPATH=. python -B -m pytest \
+  --noconftest --rootdir=. -c /dev/null -p no:cacheprovider -q \
+  test/test_early_request_async.py \
+  test/test_early_request_async_lifecycle.py \
+  test/test_early_ready_reuse.py \
+  test/test_early_v080_compat.py
+```
 
 ## Layout and engine differences
 

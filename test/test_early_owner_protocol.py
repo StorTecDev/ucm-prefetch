@@ -243,9 +243,18 @@ def test_task_scope_wraps_same_native_consistency_and_preserves_errors():
 def make_worker(rank):
     store = Mock()
     store.config = {"timeout_ms": 1000}
-    connector = SimpleNamespace(use_request_async_load=False, store=store, tp_rank=rank, tp_size=2, is_mla=True,
-        _rank_consistency=Mock(), unique_id="owner-test",
-        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_index=0)))
+    connector = SimpleNamespace(
+        use_request_async_load=False,
+        store=store,
+        tp_rank=rank,
+        tp_size=2,
+        is_mla=True,
+        _rank_consistency=Mock(),
+        unique_id="owner-test",
+        _vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_index=0)
+        ),
+    )
     original = owner.worker_capability
     owner.worker_capability = lambda c: capability(rank=c.tp_rank)
     try:

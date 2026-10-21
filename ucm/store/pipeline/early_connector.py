@@ -17,6 +17,7 @@ class _ReservedLoad:
         self.reservations = ()
         self.observer = None
         self.receipts = {}
+        self.io_failure_handler = None
 
     def __getattr__(self, name):
         return getattr(self.pipeline, name)
@@ -35,10 +36,15 @@ class _ReservedLoad:
                 self.observer.rejected(receipt)
             raise
         except Exception:
-            if receipt is not None:
-                self.observer.complete(receipt, None, False)
-            elif self.observer:
-                self.observer.unscoped_failure()
+            self._io_failed(receipt, None)
+            raise
+
+    def Check(self, task):
+        try:
+            return self.pipeline.Check(task)
+        except Exception:
+            # Native polling drops failed tasks without a later Wait callback.
+            self._io_failed(self.receipts.pop(task, None), task)
             raise
 
     def Wait(self, task):
@@ -46,14 +52,19 @@ class _ReservedLoad:
         try:
             result = self.pipeline.Wait(task)
         except Exception:
-            if receipt is not None:
-                self.observer.complete(receipt, task, False)
-            elif self.observer:
-                self.observer.unscoped_failure()
+            self._io_failed(receipt, task)
             raise
         if receipt is not None:
             self.observer.complete(receipt, task, True)
         return result
+
+    def _io_failed(self, receipt, task):
+        if receipt is not None:
+            self.observer.complete(receipt, task, False)
+        elif self.observer:
+            self.observer.unscoped_failure()
+        if self.io_failure_handler is not None:
+            self.io_failure_handler("native I/O failed; drain state is not proven")
 
     def Dump(self, ids, indexes, addrs, *args):
         if self.observer:
@@ -159,6 +170,10 @@ class EarlyPipelineStore(UcmPipelineStore):
 
     def set_consumer(self, observer):
         self.store_.observer = observer
+
+    def set_io_failure_handler(self, handler):
+        """Retain the worker when asynchronous I/O cannot prove safe completion."""
+        self.store_.io_failure_handler = handler
 
     def prefetch_reserved(self, handle: int) -> dict:
         return ucmpipelinestore.EarlyPrefetchReserved(self._native_store, handle)

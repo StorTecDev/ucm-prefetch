@@ -36,7 +36,7 @@ class Control:
 @pytest.fixture
 def worker():
     store = Mock()
-    connector = SimpleNamespace(store=store, tp_rank=0, tp_size=8, is_mla=True,
+    connector = SimpleNamespace(use_request_async_load=False, store=store, tp_rank=0, tp_size=8, is_mla=True,
         unique_id="batch-unit", request_hasher=Mock(side_effect=lambda block: bytes(reversed(block))),
         _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_index=0)))
     instance = early.EarlyWorker(connector, Control)

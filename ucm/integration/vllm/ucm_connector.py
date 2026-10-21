@@ -1361,9 +1361,10 @@ class UCMWorkerMetadata(KVConnectorWorkerMetadata):
 
 
 class UCMDirectConnector(KVConnectorBase_V1):
-    """
-    This connector means synchronize:
-    load -> forward -> save
+    """Load complete KV blocks before a request runs.
+
+    Request-async loading lets the scheduler run other requests while the
+    transfer completes. Synchronous loading waits before the current forward.
 
     Store operations that participate in rank consistency must use
     RankConsistencyManager. It owns StoreNotFoundError classification and
@@ -1497,16 +1498,20 @@ class UCMDirectConnector(KVConnectorBase_V1):
         request_async_configured = bool(
             self.launch_config.get("use_request_async_load", False)
         )
-        # Keep the first implementation deliberately scoped to the direct
-        # connector. Layerwise, CP and HMA connectors have different task and
-        # block-layout semantics and must opt in separately.
-        self.use_request_async_load = (
-            request_async_configured and type(self) is UCMDirectConnector
-        )
+        self.use_request_async_load = False
+        if request_async_configured:
+            # Early imports the native classes; resolve it only after module setup.
+            from .early_connector import EarlyDirectConnector
+
+            # Subclasses can change task/layout semantics and need separate validation.
+            self.use_request_async_load = type(self) in (
+                UCMDirectConnector,
+                EarlyDirectConnector,
+            )
         if request_async_configured and not self.use_request_async_load:
             logger.warning(
                 "Request-async loading is currently supported only by "
-                "UCMDirectConnector; disabling it for %s.",
+                "UCMDirectConnector and EarlyDirectConnector; disabling it for %s.",
                 type(self).__name__,
             )
         # Scheduler-side plans waiting to be included in connector metadata.

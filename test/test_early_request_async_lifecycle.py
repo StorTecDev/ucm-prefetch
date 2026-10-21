@@ -268,3 +268,28 @@ def test_real_worker_initialization_installs_async_failure_handler(enabled):
             assert handler.__self__ is worker.owner_protocol
     finally:
         worker.close()
+
+
+def test_owner_retirement_waits_for_actual_async_completion(worker_factory):
+    state = worker_factory(owner=True)
+    state.connector.start_load_kv(None)
+    protocol = state.worker.owner_protocol
+    identity = dict(key=state.job.key, attempt=state.job.attempt)
+    protocol.receive(dict(identity, op="retire", reason="cancel"))
+    assert state.connector.get_finished({"r"}) == (None, None)
+    assert not messages(state, "quiesced")
+    state.store.release_reservation.assert_not_called()
+    state.pipeline.Check.return_value = True
+    assert state.connector.get_finished(set()) == (None, {"r"})
+    assert len(messages(state, "quiesced")) == 1
+    assert not messages(state, "consumed")
+    state.store.release_reservation.assert_not_called()
+    protocol.receive(dict(identity, op="release_owner"))
+    state.store.release_reservation.assert_called_once_with(41)
+    protocol.receive(dict(identity, op="forget"))
+    assert not state.worker.jobs
+    assert not state.worker.request_keys
+    assert not protocol.consumer.generations
+    assert not protocol.consumer.tasks
+    state.connector.get_finished({"r"})
+    state.store.release_reservation.assert_called_once_with(41)

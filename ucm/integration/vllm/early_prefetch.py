@@ -368,7 +368,6 @@ class WorkerBatch:
     wait_started: float | None = None
 
 
-
 class EarlyWorker:
     def __init__(self, connector, control_factory=Control):
         self.connector, self.store = connector, connector.store
@@ -394,6 +393,9 @@ class EarlyWorker:
             max_workers=2, thread_name_prefix="ucm-early-activate"
         ) if capability.get("ready") else None)
         self.owner_protocol = OwnerWorker(self, capability, peer)
+        if connector.use_request_async_load:
+            # Private/fallback loads have no owner receipt but still outlive metadata.
+            self.store.set_io_failure_handler(self.owner_protocol.poison)
         self.io_limit = 0
         log.info("UCM_EARLY owner_capability peer=%s capability=%s", peer, capability)
         self.control = control_factory(
@@ -919,6 +921,10 @@ class EarlyWorker:
     def finished(self, request_ids):
         if self.owner_protocol.fatal:
             return
+        # Cancellation/preemption is not evidence that native async I/O drained.
+        # Completion polling calls this again even without another finish event.
+        pending = getattr(self.connector, "_pending_load_tasks", {})
+        request_ids = set(request_ids).difference(pending)
         with self.condition:
             # Native worker callbacks carry reusable request IDs, not a
             # generation. Only the broker's generation-scoped retire can stop

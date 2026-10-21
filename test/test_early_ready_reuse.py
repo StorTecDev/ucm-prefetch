@@ -658,6 +658,7 @@ def test_direct_completion_uses_native_method_without_layerwise_failure_attribut
     connector = object.__new__(EarlyDirectConnector)
     connector.use_layerwise = False
     connector._early = Mock()
+    connector._early.owner_protocol.fatal = None
     connector._connector_worker_meta = ucm_connector.UCMWorkerMetadata()
     if failure:
         connector._connector_worker_meta.mark_failed("r")

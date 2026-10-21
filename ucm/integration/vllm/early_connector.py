@@ -197,6 +197,8 @@ class _EarlyConnectorMixin:
             })
 
     def _early_load_completed(self, request_ids):
+        if self._early.owner_protocol.fatal:
+            return
         # v0.8.0 records direct-load failures in worker metadata; the
         # layerwise-only _failure_req_ids field is not present on direct workers.
         completed = set(request_ids)
@@ -217,11 +219,12 @@ class _EarlyConnectorMixin:
 
     def get_finished(self, finished_req_ids):
         result = super().get_finished(finished_req_ids)
-        if result[1]:
-            # Native polling has waited/reaped these tasks before releasing
-            # their Early reservations, including failed async transfers.
-            self._early_load_completed(result[1])
-        self._early.finished(finished_req_ids)
+        completed = result[1] or set()
+        if completed:
+            # Failure completion can unblock the scheduler without proving drain.
+            # The Store fences unknown I/O before this release is considered.
+            self._early_load_completed(completed)
+        self._early.finished(set(finished_req_ids) | completed)
         return result
 
     def shutdown(self):
@@ -237,7 +240,24 @@ class _EarlyConnectorMixin:
 
 
 class EarlyDirectConnector(_EarlyConnectorMixin, UCMDirectConnector):
-    pass
+
+    def shutdown(self):
+        early = self._early
+        if early is not None and self._role == KVConnectorRole.WORKER:
+            for request_id, pending in list(self._pending_load_tasks.items()):
+                if early.owner_protocol.fatal:
+                    break
+                try:
+                    # Normal polling stops during shutdown; retain pins until Wait.
+                    self._rank_consistency.wait_load(pending.task)
+                except Exception as error:
+                    early.owner_protocol.poison(
+                        f"async load shutdown drain unproven: {type(error).__name__}: {error}"
+                    )
+                    break
+                self._pending_load_tasks.pop(request_id)
+                self._early_load_completed({request_id})
+        super().shutdown()
 
 
 class EarlyLayerWiseConnector(_EarlyConnectorMixin, UCMLayerWiseConnector):

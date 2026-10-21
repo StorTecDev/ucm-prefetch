@@ -91,6 +91,7 @@ def test_async_reservation_is_released_only_after_native_completion(
     worker = object.__new__(EarlyDirectConnector)
     worker.use_layerwise = False
     worker._early = Mock()
+    worker._early.owner_protocol.fatal = None
     worker._pending_load_tasks = {}
     worker._finished_async_load_req_ids = set()
     worker._async_dump_req_ids = set()

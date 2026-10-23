@@ -238,8 +238,17 @@ Status AioImpl::Setup(size_t timeoutMs)
 Status AioImpl::ReadAsync(Io&& io)
 {
     auto cb = std::make_unique<struct iocb>();
-    auto data = std::make_unique<Callback>(std::move(io.callback));
+    // The kernel may retain the iovec array until physical completion, including
+    // after a cancellation request. Give it the callback's existing lifetime.
+    auto vectors = std::make_shared<std::vector<iovec>>(std::move(io.vectors));
+    auto data = std::make_unique<Callback>(
+        [callback = std::move(io.callback), vectors](Result result) { callback(result); });
     AioPrepareRead(cb.get(), io.fd, io.buffer, io.length, io.offset);
+    if (!vectors->empty()) {
+        cb->aio_lio_opcode = IOCB_CMD_PREADV;
+        cb->aio_buf = reinterpret_cast<uintptr_t>(vectors->data());
+        cb->aio_nbytes = vectors->size();
+    }
     cb->aio_data = (uintptr_t)(void*)data.get();
     Track(io.tag, cb.get());
     auto status = SubmitIo(cb.get());

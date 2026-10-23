@@ -30,6 +30,7 @@
 #include <linux/aio_abi.h>
 #include <mutex>
 #include <thread>
+#include <sys/uio.h>
 #include <unordered_map>
 #include <vector>
 #include "status/status.h"
@@ -60,6 +61,7 @@ public:
         void* buffer;
         Callback callback;
         uint64_t tag{0};
+        std::vector<iovec> vectors;
     };
     using SweepFn = std::function<void()>;
 

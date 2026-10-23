@@ -25,6 +25,7 @@
 #define UNIFIEDCACHE_POSIX_STORE_CC_IO_ENGINE_AIO_H
 
 #include <cerrno>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <tuple>
@@ -124,13 +125,13 @@ private:
     }
     template <bool dump>
     void OnIoCallback(const TaskPtr& task, WaiterPtr w, int32_t fd, bool last,
-                      const Detail::BlockId& id, const AioImpl::Result& result)
+                      const Detail::BlockId& id, size_t expectedBytes, const AioImpl::Result& result)
     {
         const auto tid = task->id;
-        const auto shortIo = result.error == 0 && result.nBytes != static_cast<ssize_t>(shardSize_);
+        const auto shortIo = result.error == 0 && result.nBytes != static_cast<ssize_t>(expectedBytes);
         if (result.error != 0 || shortIo) {
             UC_ERROR("Failed(error={}, bytes={}/{}) to do io on block({}).", result.error,
-                     result.nBytes, shardSize_, id);
+                     result.nBytes, expectedBytes, id);
             if (result.error != ECANCELED) { IncrementIoErrorMetric(); }
             task->Fail(!dump && shortIo ? Status::NotFound() : Status::Error());
             failureSet_.Insert(tid);
@@ -178,8 +179,32 @@ private:
         io.length = shardSize_;
         io.buffer = shard.addrs.front();
         io.tag = tid;
-        io.callback = [this, task, w, fd = result.fd, last, id](AioImpl::Result ioResult) {
-            OnIoCallback<dump>(task, w, fd, last, id, ioResult);
+        std::shared_ptr<void> discarded;
+        if constexpr (!dump) {
+            if (task->desc.fullBlockRead) {
+                io.length = shardSize_ * nShardPerBlock_;
+                const auto missing = std::count(shard.addrs.begin(), shard.addrs.end(), nullptr);
+                if (missing) {
+                    // Cached slices may be in use by H2D or a concurrent writer.
+                    // Read their file ranges into private scratch, never live L1.
+                    void* scratch = nullptr;
+                    if (posix_memalign(&scratch, 4096, missing * shardSize_) != 0) {
+                        handleFailure(result.fd, Status::OutOfMemory());
+                        return;
+                    }
+                    discarded = std::shared_ptr<void>(scratch, std::free);
+                }
+                auto* scratch = static_cast<std::byte*>(discarded.get());
+                for (auto* address : shard.addrs) {
+                    io.vectors.push_back({address ? address : scratch, shardSize_});
+                    if (!address) { scratch += shardSize_; }
+                }
+            }
+        }
+        const auto expectedBytes = io.length;
+        io.callback = [this, task, w, fd = result.fd, last, id, expectedBytes,
+                       discarded](AioImpl::Result ioResult) {
+            OnIoCallback<dump>(task, w, fd, last, id, expectedBytes, ioResult);
         };
         auto status = dump ? aio_.WriteAsync(std::move(io)) : aio_.ReadAsync(std::move(io));
         if (status.Failure()) {
@@ -217,7 +242,7 @@ private:
         const auto id = t->id;
         const auto& brief = t->desc.brief;
         const auto num = t->desc.size();
-        const auto size = shardSize_ * num;
+        const auto size = shardSize_ * num * (t->desc.fullBlockRead ? nShardPerBlock_ : 1);
         const auto tp = w->startTp;
         const auto isDump = (t->type == TransTask::Type::DUMP);
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);

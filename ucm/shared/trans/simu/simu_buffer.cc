@@ -72,6 +72,16 @@ std::shared_ptr<void> SimuBuffer::MakeHostBuffer(size_t size)
     return std::shared_ptr<void>(device, FreeMemory);
 }
 
+std::shared_ptr<void> SimuBuffer::MakeHostBuffer4DirectIo(size_t size)
+{
+    // Simulator copies are ordinary memcpy, but a real O_DIRECT backend still
+    // requires aligned host destinations when exercising the cache pipeline.
+    void* host = nullptr;
+    if (posix_memalign(&host, 4096, size) != 0) { return nullptr; }
+    std::memset(host, 0xa, size);
+    return std::shared_ptr<void>(host, FreeMemory);
+}
+
 Status Buffer::RegisterHostBuffer(void* host, size_t size, void** pDevice)
 {
     if (pDevice) { *pDevice = host; }

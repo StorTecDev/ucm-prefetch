@@ -64,6 +64,7 @@ enable_metrics: true
 | `use_dpc` | 选填 | bool | 默认 `false` | 非共享 buffer 模式下主机缓冲的分配方式。默认大页内存（传统 DirectIO 路径）；`true`：驱动内存接口（DPC 路径），可显式开启。 |
 | `cache_sdma_direct` | 选填 | bool | 依据编译环境变量决定，`PLATFORM=ascend-a3` 时默认 `true`，其他默认 `false` | 启用 SDMA H2D/D2H 传输路径，仅在 A3 设备生效，推荐关闭。 |
 | `cache_load_backend_only` | 选填 | bool | 默认 `false` | 即使在 cache 层命中还是会强制从 SSD 上加载，仅供测试使用。 |
+| `cache_full_block_load` | 选填 | bool | 默认 `false` | 通过 Posix AIO 将完整 block 读入主机缓存，保留逐层设备搬运。详见 [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers)。 |
 | `cache_io_aggregation` | 选填 | bool | 默认 `false`，仅在 `PLATFORM=ascend` 且模型为 V4 时自动开启 | 启用 IO 聚合 h2d 传输，仅在 A2 设备生效。 |
 | `share_buffer_enable` | 选填 | bool | MLA 默认启用，GQA 默认不启用 | 是否启用共享内存。MLA 如果不用 shm 或 GQA 用 shm 都会导致性能下降。 |
 

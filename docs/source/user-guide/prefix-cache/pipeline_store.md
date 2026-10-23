@@ -330,3 +330,50 @@ This log indicates that the **Posix Store** has received a **load or dump task**
 [UC][D] Posix task({task_id},{operation},{subtask_number},{size}) finished, cost {time}ms. [PID,TID]
 ```
 This log indicates that a load or dump task in the **Posix Store** has completed, along with its execution time in **in ms**.
+
+## Full-block L2 reads with layerwise device transfers
+
+Set `cache_full_block_load: true` inside `ucm_connector_config` to read complete
+blocks from Posix into the host cache while retaining layerwise host-to-device
+transfers. The default is `false`; disabling it restores the original shard reads.
+Apply these settings to an existing pipeline configuration, keeping its storage,
+capacity and device settings:
+
+```yaml
+use_layerwise: true
+use_request_async_load: false
+ucm_connectors:
+  - ucm_connector_name: UcmPipelineStore
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      posix_io_engine: aio
+      io_direct: true
+      cache_full_block_load: true
+```
+
+Ordinary demand loading and Early prefetch both support this mode. It does not
+enable request-level async loading for layerwise connectors. The backend must
+support full-block reads; Posix requires AIO, at most `IOV_MAX` shards per block,
+and a block size no greater than `UINT32_MAX` bytes.
+
+One `IOCB_CMD_PREADV` fills the missing layer buffers directly. Cached or
+peer-owned destinations use private scratch buffers to avoid overwriting live
+data. The H2D queue still transfers only the requested layer. Per-layer cache
+nodes, eviction units, disk padding and the dump format remain unchanged.
+
+Early submits up to 64 read units per turn and keeps at most 128 in flight:
+complete blocks in this mode, layer shards otherwise. Its byte accounting
+includes file ranges discarded into scratch. L1 capacity remains measured in
+layer-shard slots. Partial hits can increase bytes read and temporary host memory;
+capacity pressure or concurrent ownership can cause repeated reads. One AIO
+request does not guarantee one physical device command.
+
+Accepted reads retain their buffers and vector metadata until physical completion,
+including after cancellation or timeout. Short reads fail the task without
+publishing partially filled nodes as ready.
+
+Use `posix_load_read_ops_total`, `posix_load_read_bytes_total` and
+`posix_load_full_block_ops_total` to inspect successful reads. The ratio of byte
+and operation deltas identifies the effective read size. Rebuild all native
+libraries together when upgrading: the internal task descriptor and Store
+capability interface changed, so old and new `.so` files must not be mixed.

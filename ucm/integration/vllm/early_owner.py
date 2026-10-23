@@ -54,13 +54,14 @@ def worker_capability(connector):
         # includes the worker rank. MLA IDs arrive from the rank-0 scheduler
         # hasher, so fingerprint that same native identity once at handshake.
         scheduler_hasher = type(connector.request_hasher)(connector._vllm_config, 0)
-        layout = [connector.unique_id, native, config["tensor_size_list"],
+        full_block_load = bool(config.get("cache_full_block_load", False))
+        layout = [connector.unique_id, native, config["tensor_size_list"], full_block_load,
                   connector.use_layerwise, connector.hash_block_size, connector.blocks_per_chunk,
                   scheduler_hasher("UCM_HASH_SEED").hex()]
         return dict(version=VERSION, domain=json.dumps(domain),
                     layout=hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest(),
                     unique_id=str(connector.unique_id), native=native, layers=layers,
-                    task_shards=task_shards,
+                    task_shards=task_shards, full_block_load=full_block_load,
                     max_jobs=int(connector.launch_config.get("early_owner_max_jobs", 4)),
                     max_candidates=int(connector.launch_config.get("early_owner_max_candidate_blocks", 0)),
                     dp=connector._vllm_config.parallel_config.data_parallel_index,
@@ -119,7 +120,10 @@ class OwnerBroker(BrokerState):
             limit = slots * native["shard_bytes"]
             # Submission window only. Actual allocation/pins enforce capacity,
             # including zero reservable slots; no per-worker capacity division.
-            quota = 128 * native["shard_bytes"]
+            # Match the native window in physical read units; a full-block
+            # submission cannot use a window sized for one layer.
+            read_unit = "block_bytes" if group[0].get("full_block_load", False) else "shard_bytes"
+            quota = 128 * native[read_unit]
             io = len(members) * quota
             self.domains[domain] = dict(execution=ExecutionWindow(limit // native["block_bytes"]), limit=limit, io_limit=io,
                                         io_quota=quota, members=members, owners={},

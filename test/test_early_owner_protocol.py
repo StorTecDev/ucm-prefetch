@@ -511,6 +511,12 @@ def test_worker_capability_checks_actual_native_layout_and_configuration(field, 
     if ready:
         assert (cap["dp"], cap["rank"], cap["native"]) == (0, 1, info)
         assert cap["task_shards"] == 8 and "dump_task_shards" not in cap
+        assert cap["full_block_load"] is False
+        c.store.config["cache_full_block_load"] = True
+        full_cap = owner.worker_capability(c)
+        assert full_cap["full_block_load"] is True
+        assert full_cap["layout"] != cap["layout"]
+        assert full_cap["native"] == cap["native"]
         c.tp_rank = 0
         assert "dump_task_shards" not in owner.worker_capability(c)
         c.launch_config["enable_early_owner"] = False
@@ -576,17 +582,20 @@ def test_unscheduled_cancel_forget_clears_request_mapping_without_touching_reuse
 
 
 @pytest.mark.parametrize("nodes,reservable,load,dump", [(132, 112, 2, 6), (132, 132, 1600, 6000), (8, 8, 4, 8), (8, 0, 4, 8)])
-def test_budget_uses_actual_native_pool_not_maximum_task_subtraction(nodes, reservable, load, dump):
+@pytest.mark.parametrize("full_block_load", [False, True])
+def test_budget_uses_actual_native_pool_not_maximum_task_subtraction(nodes, reservable, load, dump, full_block_load):
     c = Cluster(dp=2)
     for cap in c.b.capabilities.values():
         cap["native"].update(nodes=nodes, reservable_nodes=reservable)
-        cap.update(task_shards=load, dump_task_shards=dump if cap["rank"] == 0 else 0)
+        cap.update(task_shards=load, dump_task_shards=dump if cap["rank"] == 0 else 0,
+                   full_block_load=full_block_load)
     job = c.job(count=1)
     domain = job["domain"]
     assert "used" not in domain and "claims" not in domain
     assert domain["limit"] == reservable * 4
     assert domain["native_load_headroom_bytes"] == (nodes - reservable) * 4
-    assert domain["io_quota"] * 4 == domain["io_limit"] == 4 * 128 * 4
+    read_bytes = 8 if full_block_load else 4
+    assert domain["io_quota"] * 4 == domain["io_limit"] == 4 * 128 * read_bytes
     c.message(job, "owner_answer", state="READY", hit=int(bool(reservable)), capacity_truncated=not bool(reservable))
     assert job["status"] == "READY"
     c.drain(job)

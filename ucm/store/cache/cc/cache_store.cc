@@ -143,6 +143,7 @@ private:
         config.Get("store_backend", param.storeBackend);
         config.Get("unique_id", param.uniqueId);
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
+        config.Get("cache_full_block_load", param.cacheFullBlockLoad);
         config.GetNumber("device_id", param.deviceId);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
@@ -192,6 +193,10 @@ private:
     Status CheckConfig(const Config& config)
     {
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
+        if (config.deviceId >= 0 && config.cacheFullBlockLoad &&
+            !config.storeBackend->SupportsFullBlockRead()) {
+            return Status::InvalidParam("cache_full_block_load requires a full-block read backend");
+        }
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
         }
@@ -280,6 +285,7 @@ private:
         UC_INFO("Set {}::GpuKvBufferNumber to {}.", ns, config.gpuKvBufferAddrs.size());
         UC_INFO("Set {}::UseGdr to {}.", ns, config.useGdr);
         UC_INFO("Set {}::LocalRankSize to {}.", ns, config.localRankSize);
+        UC_INFO("Set {}::CacheFullBlockLoad to {}.", ns, config.cacheFullBlockLoad);
     }
 };
 
@@ -302,7 +308,7 @@ public:
         if (param.deviceId >= 0 && !param.cacheLoadBackendOnly) {
             early_ = std::make_unique<ReservedPrefetch>(
                 &bufferMgr_, param.storeBackend, param.blockSize, param.shardSize,
-                param.timeoutMs);
+                param.timeoutMs, param.cacheFullBlockLoad);
             transfers_ = std::make_unique<EarlyNativeTransfer>(*param.storeBackend, transMgr_, param);
         }
         return Status::OK();

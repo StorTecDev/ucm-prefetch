@@ -100,6 +100,9 @@ _COUNTER_METRICS = [
     ),
     (
         "posix_s2h_bytes_total",
+        "posix_load_read_ops_total",
+        "posix_load_read_bytes_total",
+        "posix_load_full_block_ops_total",
         (
             "Total bytes transferred from posix storage to host buffer (load path, "
             "summed per completed task)"

@@ -22,6 +22,7 @@ class ReservedPrefetch::Batch final : public Early::Batch {
     struct Transfer {
         Detail::TaskHandle handle{0};
         std::vector<size_t> owners;
+        size_t bytes{0};
     };
     std::deque<Transfer> transfers_;
 
@@ -36,13 +37,67 @@ class ReservedPrefetch::Batch final : public Early::Batch {
         // On abandonment/error Run/destruction also drains unfinished tasks here.
         auto status = CompleteEarlyRead(*owner_.backend_, transfer.handle, transfer.owners,
             [&](size_t index) -> TransBuffer::Handle& { return r.Pin(index, owner_.shardsPerBlock_); });
-        if (status.Success()) { progress_.completedReadBytes += transfer.owners.size() * shardBytes; }
-        progress_.inflightBytes -= transfer.owners.size() * shardBytes;
+        if (status.Success()) { progress_.completedReadBytes += transfer.bytes; }
+        progress_.inflightBytes -= transfer.bytes;
         progress_.remainingL2Work -= std::min(progress_.remainingL2Work, transfer.owners.size());
         stats_->lastIoNs = EarlyStats::NowNs();
         transfers_.pop_front();
         progress_.advanced = true;
         Fail(status);
+    }
+
+    bool PrepareFullBlock(Reservation& r, Detail::TaskDesc& task,
+                          std::vector<size_t>& owners, size_t& availableBytes)
+    {
+        const auto shards = owner_.shardsPerBlock_;
+        const auto& block = r.blocks[cursor_ / shards];
+        std::vector<size_t> allocated;
+        size_t newlyReady = 0;
+        for (size_t j = 0; j < shards; ++j) {
+            auto& pin = r.Pin(cursor_ + j, shards);
+            if (pin) { continue; }
+            ++stats_->shards;
+            if (protectionLimitBytes) { pin = owner_.buffer_->TryGet(block, j); }
+            if (!pin) {
+                // No part of this block has been submitted. Roll back its new
+                // owners so capacity pressure cannot leave a pinned partial tail.
+                for (auto index : allocated) {
+                    auto& owned = r.Pin(index, shards);
+                    owned.MarkFailed(Status::NotFound());
+                    owned = {};
+                }
+                if (r.deferred && !cutoff_) {
+                    progress_.waitingCapacity = true;
+                    progress_.waitEpoch = EarlyBufferPins::ReleaseEpoch(*owner_.buffer_);
+                } else {
+                    prefixShards_ = cursor_;
+                    progress_.result.capacityTruncated = true;
+                    progress_.advanced = true;
+                }
+                return false;
+            }
+            if (pin.Owner() && !pin.Ready()) { allocated.push_back(cursor_ + j); }
+            else if (pin.Ready()) { ++newlyReady; }
+        }
+        Detail::Shard read{block, 0, std::vector<void*>(shards, nullptr)};
+        for (auto index : allocated) { read.addrs[index - cursor_] = r.Pin(index, shards).Data(); }
+        for (size_t j = 0; j < shards; ++j) {
+            auto& pin = r.Pin(cursor_ + j, shards);
+            if (!pin.Ready() && !read.addrs[j]) {
+                waiting_.push_back(cursor_ + j);
+                ++progress_.result.coalescedShards;
+            }
+        }
+        if (!allocated.empty()) {
+            owners.insert(owners.end(), allocated.begin(), allocated.end());
+            task.push_back(std::move(read));
+            availableBytes -= shards * owner_.shardBytes_;
+        }
+        progress_.remainingL2Work -= std::min(progress_.remainingL2Work, newlyReady);
+        progress_.waitingCapacity = false;
+        progress_.advanced = true;
+        cursor_ += shards;
+        return true;
     }
 
     Expected<Early::Progress> Advance(size_t availableBytes, bool blocking)
@@ -97,15 +152,22 @@ class ReservedPrefetch::Batch final : public Early::Batch {
             if (status_.Success() && !discard_) {
                 Detail::TaskDesc task;
                 task.brief = "EarlyL2ToL1";
+                task.fullBlockRead = owner_.fullBlockLoad_;
                 std::vector<size_t> owners;
                 const size_t total = prefixShards_;
-                const size_t end = std::min(total, cursor_ + size_t{64});
+                const size_t step = owner_.fullBlockLoad_ ? owner_.shardsPerBlock_ : 1;
+                const size_t end = std::min(total, cursor_ + size_t{64} * step);
                 // Bound localization per turn as well as submitted bytes. A
                 // previous negative result is never trusted for allocation.
                 {
                 EarlyStats::Phase positioning{stats_->pinMs};
                 while ((!progress_.waitingCapacity || retryCapacity) && cursor_ < end && availableBytes >= shardBytes) {
                     if (r->cancelled.load()) { Fail(Status::Error("reserved prefetch cancelled")); break; }
+                    if (owner_.fullBlockLoad_) {
+                        if (!PrepareFullBlock(*r, task, owners, availableBytes)) { break; }
+                        retryCapacity = false;
+                        continue;
+                    }
                     auto& pin = r->Pin(cursor_, owner_.shardsPerBlock_);
                     const auto& block = r->blocks[cursor_ / owner_.shardsPerBlock_];
                     const auto shard = cursor_ % owner_.shardsPerBlock_;
@@ -148,7 +210,10 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                 if (!task.empty() && status_.Success() && !r->cancelled.load()) {
                     // All allocating bookkeeping precedes Load. The reservation
                     // is retained before the backend can start writing to it.
-                    transfers_.push_back({0, std::move(owners)});
+                    const auto readBytes = task.fullBlockRead
+                        ? task.size() * owner_.shardsPerBlock_ * owner_.shardBytes_
+                        : owners.size() * owner_.shardBytes_;
+                    transfers_.push_back({0, std::move(owners), readBytes});
                     active_ = r;
                     auto& transfer = transfers_.back();
                     if (stats_->firstIoMs < 0) { stats_->firstIoMs = EarlyStats::Milliseconds(stats_->elapsed); }
@@ -159,8 +224,8 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                     if (!result) { transfers_.pop_back(); Fail(result.Error()); }
                     else {
                         transfer.handle = result.Value();
-                        const auto bytes = transfer.owners.size() * shardBytes;
-                        progress_.result.l2ReadShards += transfer.owners.size();
+                        const auto bytes = transfer.bytes;
+                        progress_.result.l2ReadShards += bytes / owner_.shardBytes_;
                         progress_.result.l2ReadBytes += bytes;
                         progress_.inflightBytes += bytes;
                         ++stats_->ioBatches;
@@ -234,7 +299,8 @@ class ReservedPrefetch::Batch final : public Early::Batch {
 
 public:
     Batch(ReservedPrefetch& owner, const std::shared_ptr<Reservation>& r, uint64_t handle)
-        : Early::Batch(owner.shardBytes_, 128 * owner.shardBytes_,
+        : Early::Batch(owner.shardBytes_ * (owner.fullBlockLoad_ ? owner.shardsPerBlock_ : 1),
+                       128 * owner.shardBytes_ * (owner.fullBlockLoad_ ? owner.shardsPerBlock_ : 1),
                        EarlyBufferPins::ReservableSlots(*owner.buffer_) * owner.shardBytes_),
           owner_(owner), reservation_(r), handle_(handle)
     {

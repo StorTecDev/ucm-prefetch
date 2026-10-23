@@ -105,6 +105,9 @@ No Cache Store-specific Gauges are exported by default.
 
 | Metric                                  | Description                                                 |
 | --------------------------------------- | ----------------------------------------------------------- |
+| `ucm:posix_load_read_ops_total` | Successfully completed POSIX AIO reads |
+| `ucm:posix_load_read_bytes_total` | Bytes delivered by successful POSIX AIO reads |
+| `ucm:posix_load_full_block_ops_total` | Successfully completed full-block POSIX vector reads |
 | `ucm:posix_s2h_bytes_total`           | Cumulative bytes read from Posix storage into host buffers  |
 | `ucm:posix_h2s_bytes_total`           | Cumulative bytes written from host buffers to Posix storage |
 | `ucm:posix_lookup_query_blocks_total` | Total blocks submitted to Posix Lookup                      |

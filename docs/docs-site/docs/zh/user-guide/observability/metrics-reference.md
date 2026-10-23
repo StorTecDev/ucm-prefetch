@@ -138,6 +138,9 @@ Posix Store 通过文件系统读写 KV 数据，适合判断**文件后端的�
 
 | 指标 | 说明 |
 | --------------------------------------- | ----------------------------------------------------------- |
+| `ucm:posix_load_read_ops_total` | 成功完成的 POSIX AIO 读取次数 |
+| `ucm:posix_load_read_bytes_total` | 成功完成的 POSIX AIO 读取字节数 |
+| `ucm:posix_load_full_block_ops_total` | 成功完成的完整 block 向量读取次数 |
 | `ucm:posix_s2h_bytes_total` | 从 Posix 存储读入主机缓冲的累计字节数[^posix-bytes] |
 | `ucm:posix_h2s_bytes_total` | 从主机缓冲写入 Posix 存储的累计字节数[^posix-bytes] |
 | `ucm:posix_lookup_query_blocks_total` | 提交给 Posix Lookup 的块总数 |

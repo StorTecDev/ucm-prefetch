@@ -99,10 +99,19 @@ _COUNTER_METRICS = [
         "Total bytes dumped through the Cache stage (per-task size summed)",
     ),
     (
-        "posix_s2h_bytes_total",
         "posix_load_read_ops_total",
+        "Successfully completed POSIX AIO read operations.",
+    ),
+    (
         "posix_load_read_bytes_total",
+        "Bytes delivered by successful POSIX AIO read operations.",
+    ),
+    (
         "posix_load_full_block_ops_total",
+        "Successfully completed full-block POSIX vector reads.",
+    ),
+    (
+        "posix_s2h_bytes_total",
         (
             "Total bytes transferred from posix storage to host buffer (load path, "
             "summed per completed task)"

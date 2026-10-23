@@ -63,6 +63,7 @@ These fields apply to pipelines containing Cache. Budget shared buffers per shar
 | `cache_buffer_capacity_gb` | Optional | int | See description | Native Cache Store defaults to 256 GiB with shared buffers, or 32 GiB per worker when `share_buffer_enable` is false. The vLLM connector supplies 128 GiB when shared buffers are enabled and capacity is omitted. Shared buffers default on for MLA. A positive explicit capacity overrides the native defaults; budget all unshared workers on the host. |
 | `cache_sdma_direct` | Optional | bool | Depends on build env: `true` when `PLATFORM=ascend-a3`, `false` otherwise | Enable SDMA H2D/D2H transfer. Only effective on A3 devices. Recommended to disable. |
 | `cache_load_backend_only` | Optional | bool | Default: `false` | Force load from SSD even on cache hit. Test only. |
+| `cache_full_block_load` | Optional | bool | Default: `false` | Read full blocks from Posix AIO into the host cache while preserving layerwise device transfers. See [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers). |
 | `cache_io_aggregation` | Optional | bool | Default: `false`, auto-enabled when `PLATFORM=ascend` and model is V4 | Enable IO aggregation H2D transfer. Only effective on A2 devices. |
 | `share_buffer_enable` | Optional | bool | MLA: default enabled; GQA: default disabled | Enable shared memory. MLA without shm or GQA with shm causes performance degradation. |
 

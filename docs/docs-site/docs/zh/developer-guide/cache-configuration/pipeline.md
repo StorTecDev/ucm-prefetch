@@ -115,3 +115,41 @@ vllm bench serve \
 分别比较无缓存 prefill、存储重放和内存热缓存重放。保持模型与输入集相同，记录外部命中 token、Posix 读取字节数、主机内存、TTFT 和吞吐，判断当前负载下存储 I/O 是否比重新计算更划算。
 
 [实现与扩展说明](../extending-store.md#backend-entrypoints)。
+
+## L2 整块读取与逐层设备搬运 { #full-block-l2-reads-with-layerwise-device-transfers }
+
+在 `ucm_connector_config` 中设置 `cache_full_block_load: true`，可以将完整 block
+从 Posix 读入主机缓存，同时保留逐层的主机到设备搬运。默认值为 `false`，关闭后恢复原有
+shard 读取。将以下设置合入已有管线配置，并保留其存储、容量和设备设置：
+
+```yaml
+use_layerwise: true
+use_request_async_load: false
+ucm_connectors:
+  - ucm_connector_name: UcmPipelineStore
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      posix_io_engine: aio
+      io_direct: true
+      cache_full_block_load: true
+```
+
+普通按需加载和 Early 预取都支持此模式。它不会为 layerwise connector 启用请求级异步加载。
+后端必须支持整块读取；Posix 要求使用 AIO，每个 block 的 shard 数不超过 `IOV_MAX`，
+block 大小不超过 `UINT32_MAX` 字节。
+
+一次 `IOCB_CMD_PREADV` 直接填充缺失层的缓冲区。已缓存或由其他任务持有写入所有权的层，
+使用私有 scratch 缓冲区接收对应文件范围，避免覆盖活跃数据。H2D 队列仍只搬运请求的当前层。
+逐层缓存节点、淘汰单位、磁盘 padding 和 dump 格式保持不变。
+
+Early 每次最多提交 64 个读取单元，在途窗口为 128 个读取单元；此模式按完整 block 计量，
+原模式按 layer shard 计量。字节计账包括读入 scratch 后丢弃的文件范围，L1 容量仍按逐层
+shard 槽位计量。部分命中可能增加读取字节和临时主机内存；容量压力或并发所有权可能导致重复
+读取。一次 AIO 请求不保证对应一次物理设备命令。
+
+已提交的读取会保留缓冲区和向量元数据直到物理 I/O 完成，取消或超时也遵循这一规则。
+短读会使任务失败，不会把未完整填充的节点发布为就绪状态。
+
+使用 `posix_load_read_ops_total`、`posix_load_read_bytes_total` 和
+`posix_load_full_block_ops_total` 观察成功读取，通过字节与操作数增量之比判断实际读取粒度。
+升级时需要统一重编全部原生库：内部任务描述和 Store 能力接口已发生变化，不得混用新旧 `.so`。

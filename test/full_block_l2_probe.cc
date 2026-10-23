@@ -93,7 +93,8 @@ static void FullRead(bool partial)
     std::atomic<size_t> reads{0};
     TestHooks::SetAioSubmitHook([&](aio_context_t ctx, int64_t nr, iocb** cb) {
         Require(nr == 1 && cb[0]->aio_lio_opcode == IOCB_CMD_PREADV, "single vector read");
-        Require(cb[0]->aio_offset == 0 && cb[0]->aio_nbytes == Fixture::layers, "whole file vectors");
+        Require(cb[0]->aio_offset == 0 && cb[0]->aio_nbytes == Fixture::layers,
+                "whole file vectors");
         auto* vectors = reinterpret_cast<iovec*>(cb[0]->aio_buf);
         size_t bytes = 0;
         for (size_t i = 0; i < cb[0]->aio_nbytes; ++i) { bytes += vectors[i].iov_len; }
@@ -166,7 +167,8 @@ static void CacheRead(bool full, bool early, bool partial)
     }
     std::atomic<size_t> reads{0};
     TestHooks::SetAioSubmitHook([&](aio_context_t ctx, int64_t nr, iocb** cb) {
-        Require(cb[0]->aio_lio_opcode == (full ? IOCB_CMD_PREADV : IOCB_CMD_PREAD), "cache IO granularity");
+        Require(cb[0]->aio_lio_opcode == (full ? IOCB_CMD_PREADV : IOCB_CMD_PREAD),
+                "cache IO granularity");
         ++reads;
         return static_cast<int32_t>(syscall(SYS_io_submit, ctx, nr, cb));
     });
@@ -189,7 +191,8 @@ static void CacheRead(bool full, bool early, bool partial)
             result = step.Value();
         }
         Require(result.result.l2ReadBytes == (full ? config.blockSize :
-                (Fixture::layers - (partial ? 1 : 0)) * config.shardSize), "physical byte accounting");
+                (Fixture::layers - (partial ? 1 : 0)) * config.shardSize),
+                        "physical byte accounting");
         while (!two.Value().done) {
             two = second.Value().batch->Step(128 * config.blockSize);
             Require(bool(two), "coalesced completion");
@@ -209,7 +212,8 @@ static void CacheRead(bool full, bool early, bool partial)
     Require(bool(destination), "device allocation");
     for (size_t layer = 0; layer < Fixture::layers; ++layer) {
         auto* address = static_cast<std::byte*>(destination.get()) + layer * config.shardSize;
-        Require(stream->HostToDevice(target[layer].data(), address, config.shardSize).Success(), "initialize device");
+        Require(stream->HostToDevice(target[layer].data(), address, config.shardSize).Success(),
+                "initialize device");
     }
     for (size_t layer = 0; layer < Fixture::layers; ++layer) {
         auto* address = static_cast<std::byte*>(destination.get()) + layer * config.shardSize;
@@ -218,7 +222,8 @@ static void CacheRead(bool full, bool early, bool partial)
         Require(bool(task) && native.Wait(task.Value()).Success(), "layer transfer");
         for (size_t i = 0; i < Fixture::layers; ++i) {
             auto* src = static_cast<std::byte*>(destination.get()) + i * config.shardSize;
-            Require(stream->DeviceToHost(src, target[i].data(), config.shardSize).Success(), "read back device");
+            Require(stream->DeviceToHost(src, target[i].data(), config.shardSize).Success(),
+                    "read back device");
         }
         for (size_t later = layer + 1; later < Fixture::layers; ++later) {
             Require(target[later][0] == 0xff, "future layers must not transfer early");
@@ -247,7 +252,8 @@ static void CapacityRollback()
     auto result = reserved.Value().batch->Run();
     Require(bool(result) && result.Value().capacityTruncated && result.Value().totalHitBlocks == 0,
             "whole-block capacity truncation");
-    Require(reads == 0 && reserved.Value().batch->ProtectedBytes() == 0, "no partial IO or leaked pins");
+    Require(reads == 0 && reserved.Value().batch->ProtectedBytes() == 0,
+            "no partial IO or leaked pins");
     prefetch.Release(reserved.Value().handle);
 }
 
@@ -271,7 +277,8 @@ public:
         Require(task.fullBlockRead, "full-block batch descriptor");
         maxBatch = std::max(maxBatch, task.size());
         for (const auto& block : task) {
-            Require(block.addrs.size() == Fixture::layers && block.index == 0, "complete block shape");
+            Require(block.addrs.size() == Fixture::layers && block.index == 0,
+                    "complete block shape");
             for (size_t i = 0; i < block.addrs.size(); ++i) {
                 if (block.addrs[i]) { memset(block.addrs[i], i + 1, Fixture::layerBytes); }
             }
@@ -300,14 +307,16 @@ static void MultiBlockWindow()
     auto none = batch->Step(config.blockSize - 1);
     Require(bool(none) && backend.reads == 0, "block-sized minimum credit");
     auto first = batch->Step(batch->windowBytes);
-    Require(bool(first) && backend.reads == 64 && backend.maxBatch == 64, "64 complete blocks per batch");
+    Require(bool(first) && backend.reads == 64 && backend.maxBatch == 64,
+            "64 complete blocks per batch");
     auto state = first.Value();
     while (!state.done) {
         auto next = batch->Step(batch->windowBytes);
         Require(bool(next), "multi-block step");
         state = next.Value();
     }
-    Require(backend.reads == blocks.size() && state.result.totalHitBlocks == blocks.size(), "multi-block completion");
+    Require(backend.reads == blocks.size() && state.result.totalHitBlocks == blocks.size(),
+            "multi-block completion");
     Require(state.result.l2ReadBytes == blocks.size() * config.blockSize && state.inflightBytes == 0,
             "actual bytes and drained window");
     Require(state.completedReadBytes == state.result.l2ReadBytes, "completed byte accounting");
@@ -340,13 +349,62 @@ static void NativeEarlyFallback()
     for (size_t layer = 0; layer < Fixture::layers; ++layer) {
         Detail::TaskDesc desc{{f.block, layer, {destination.get()}}};
         UC::CacheStore::TransTask task{UC::CacheStore::TransTask::Type::LOAD, std::move(desc)};
-        task.loadHandles.push_back(UC::CacheStore::EarlyBufferPins::Acquire(buffer, f.block, layer, true));
+        task.loadHandles.push_back(
+            UC::CacheStore::EarlyBufferPins::Acquire(buffer, f.block, layer, true));
         auto accepted = transfer.Submit(UC::CacheStore::EarlyNativeTask{std::move(task)});
         Require(bool(accepted) && transfer.Wait(accepted.Value()).Success(), "fallback transfer");
-        Require(stream->DeviceToHost(destination.get(), data.data(), config.shardSize).Success(), "fallback readback");
+        Require(stream->DeviceToHost(destination.get(), data.data(), config.shardSize).Success(),
+                "fallback readback");
         for (auto byte : data) { Require(byte == layer + 1, "fallback layer bytes"); }
     }
     Require(reads == 1, "fallback one read per block");
+}
+
+static void CancelledPrefetchRetainsDestinations()
+{
+    Fixture f;
+    auto config = CacheConfig(f.store, true);
+    UC::CacheStore::BufferManager manager;
+    Require(manager.Setup(config).Success(), "cancel cache setup");
+    UC::CacheStore::ReservedPrefetch prefetch(&manager, &f.store, config.blockSize,
+                                             config.shardSize, config.timeoutMs, true);
+    auto reservation = prefetch.Reserve(&f.block, 1);
+    Require(bool(reservation), "cancel reservation");
+    auto batch = reservation.Value().batch;
+    std::promise<std::pair<aio_context_t, iocb*>> accepted;
+    TestHooks::SetAioSubmitHook([&](aio_context_t ctx, int64_t nr, iocb** cb) {
+        accepted.set_value({ctx, *cb});
+        return static_cast<int32_t>(nr);
+    });
+    auto started = batch->Step(config.blockSize);
+    Require(bool(started) && !started.Value().done, "cancel starts actual read");
+    auto [ctx, cb] = accepted.get_future().get();
+    prefetch.Release(reservation.Value().handle);
+    auto pending = batch->Step(0);
+    Require(bool(pending) && !pending.Value().done, "cancel cannot complete physical IO");
+    Require(batch->ProtectedBytes() == config.blockSize, "cancel retains all destinations");
+    Require(syscall(SYS_io_submit, ctx, 1, &cb) == 1, "complete cancelled vector read");
+    for (;;) {
+        auto state = batch->Step(0);
+        if (!state) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Require(batch->ProtectedBytes() == 0, "cancel releases after physical completion");
+}
+
+static void ShortReadFailsWholeBlock()
+{
+    Fixture f;
+    bool truncated = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(f.path)) {
+        if (entry.is_regular_file() && entry.file_size() == Fixture::layers * Fixture::layerBytes) {
+            std::filesystem::resize_file(entry.path(), Fixture::layerBytes);
+            truncated = true;
+        }
+    }
+    Require(truncated, "truncate owned block file");
+    auto task = f.store.Load(f.Read());
+    Require(bool(task) && f.store.Wait(task.Value()) == Status::NotFound(), "short block rejected");
 }
 
 int main()
@@ -363,6 +421,8 @@ int main()
         CapacityRollback();
         MultiBlockWindow();
         NativeEarlyFallback();
+        CancelledPrefetchRetainsDestinations();
+        ShortReadFailsWholeBlock();
         std::cout << "PASS: full block read, partial hits, shape validation, delayed completion, layer transfers, Early coalescing, capacity rollback\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -57,11 +57,13 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
         if (fullBlockLoad_ && task->task.type == TransTask::Type::LOAD) {
             // LoadQueue expands cold layers into complete L1 blocks. Retain the
             // L2 lease until that queue and its per-layer H2D work have drained.
-            std::vector<Detail::BlockId> blocks;
-            for (const auto& shard : task->task.desc) { blocks.push_back(shard.owner); }
-            auto lease = backend_.AcquireReadLease(blocks.data(), blocks.size());
-            if (!lease) { task->Fail(lease.Error()); }
-            else { task->lease = std::move(lease.Value()); }
+            if (!task->owners.empty()) {
+                std::vector<Detail::BlockId> blocks;
+                for (auto i : task->owners) { blocks.push_back(task->task.desc[i].owner); }
+                auto lease = backend_.AcquireReadLease(blocks.data(), blocks.size());
+                if (!lease) { task->Fail(lease.Error()); }
+                else { task->lease = std::move(lease.Value()); }
+            }
             task->owners.clear();
             task->followers.clear();
         }

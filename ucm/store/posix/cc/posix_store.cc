@@ -23,6 +23,7 @@
  * */
 #include <algorithm>
 #include <array>
+#include <limits.h>
 #include <cstdint>
 #include <fmt/ranges.h>
 #include "logger/logger.h"
@@ -43,6 +44,8 @@ class PosixStore : public StoreV1 {
     TransManager transMgr_;
     bool transEnable_{false};
     bool ioDirect_{false};
+    bool fullBlockReadSupported_{false};
+    size_t shardsPerBlock_{0};
     const Detail::BlockId healthBlockId_{Detail::RandomBlockId()};
 
     Status CheckPathHealth(const std::string& path)
@@ -81,6 +84,9 @@ public:
         if (s.Failure()) [[unlikely]] { return s; }
         transEnable_ = config.deviceId >= 0;
         ioDirect_ = config.ioDirect;
+        fullBlockReadSupported_ = config.ioEngine == "aio" && config.shardSize > 0 &&
+            config.blockSize / config.shardSize <= IOV_MAX && config.blockSize <= UINT32_MAX;
+        shardsPerBlock_ = config.shardSize ? config.blockSize / config.shardSize : 0;
         if (transEnable_) {
             s = transMgr_.Setup(config, spaceMgr_.GetLayout());
             if (s.Failure()) [[unlikely]] { return s; }
@@ -89,6 +95,7 @@ public:
         return Status::OK();
     }
     std::string Readme() const override { return "PosixStore"; }
+    bool SupportsFullBlockRead() const override { return fullBlockReadSupported_; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
         RecordLookupQueries(num);
@@ -140,6 +147,16 @@ public:
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        if (task.fullBlockRead) {
+            if (!SupportsFullBlockRead()) {
+                return Status::InvalidParam("full-block reads require Posix AIO and a valid iovec size");
+            }
+            for (const auto& block : task) {
+                if (block.index != 0 || block.addrs.size() != shardsPerBlock_) {
+                    return Status::InvalidParam("invalid full-block read destinations");
+                }
+            }
+        }
         auto res = transMgr_.GetIoEngine()->Submit({TransTask::Type::LOAD, std::move(task)});
         if (!res) [[unlikely]] {
             UC_ERROR("Failed({}) to submit load task({}).", res.Error(), task.brief);
@@ -149,6 +166,7 @@ public:
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        if (task.fullBlockRead) { return Status::InvalidParam("full-block read used for dump"); }
         auto res = transMgr_.GetIoEngine()->Submit({TransTask::Type::DUMP, std::move(task)});
         if (!res) [[unlikely]] {
             UC_ERROR("Failed({}) to submit dump task({}).", res.Error(), task.brief);

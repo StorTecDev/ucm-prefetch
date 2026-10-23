@@ -52,6 +52,8 @@ public:
 
     Status Setup(const Detail::Dictionary& config) override;
     std::string Readme() const override;
+    bool SupportsFullBlockRead() const override
+    { return store_ && store_->SupportsFullBlockRead(); }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override;
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override;
     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override;

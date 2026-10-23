@@ -86,6 +86,7 @@ public:
      * @return Self descriptive information.
      */
     virtual std::string Readme() const = 0;
+    virtual bool SupportsFullBlockRead() const { return false; }
 
     /**
      * @brief Check whether the given blocks exist in storage.

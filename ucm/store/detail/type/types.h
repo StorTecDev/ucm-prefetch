@@ -51,7 +51,7 @@ struct BlockIdHasher {
 struct Shard {
     BlockId owner;            /* Parent block identifier */
     std::size_t index;        /* Shard index inside the block */
-    std::vector<void*> addrs; /* Device-side buffer addresses */
+    std::vector<void*> addrs; /* Tensor or host-slice addresses */
 };
 
 /**
@@ -67,6 +67,9 @@ struct TaskDesc : std::vector<Shard> {
     uintptr_t prerequisiteHandle{0};
     /** Optional worker-local reservations supplying already pinned load data. */
     std::vector<uint64_t> loadReservations;
+    // Each entry maps a complete file to layer destinations. Null destinations
+    // discard already cached/peer-owned slices without overwriting live data.
+    bool fullBlockRead{false};
 };
 
 }  // namespace UC::Detail

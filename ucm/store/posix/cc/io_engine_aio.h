@@ -136,6 +136,16 @@ private:
             task->Fail(!dump && shortIo ? Status::NotFound() : Status::Error());
             failureSet_.Insert(tid);
         }
+        if constexpr (!dump) {
+            if (result.error == 0 && !shortIo) {
+                static UC::Metrics::CachedMetric readOps{"posix_load_read_ops_total"};
+                static UC::Metrics::CachedMetric readBytes{"posix_load_read_bytes_total"};
+                static UC::Metrics::CachedMetric fullOps{"posix_load_full_block_ops_total"};
+                UC::Metrics::UpdateStats(readOps, 1.0);
+                UC::Metrics::UpdateStats(readBytes, static_cast<double>(expectedBytes));
+                if (task->desc.fullBlockRead) { UC::Metrics::UpdateStats(fullOps, 1.0); }
+            }
+        }
         ::close(fd);
         if constexpr (dump) {
             if (last) { CommitBlock(id, !failureSet_.Contains(tid)); }

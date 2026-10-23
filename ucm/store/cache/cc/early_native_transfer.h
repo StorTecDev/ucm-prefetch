@@ -41,6 +41,7 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
     StoreV1& backend_;
     TransManager& native_;
     const size_t shardBytes_;
+    const bool fullBlockLoad_;
     std::mutex pendingMutex_;
     std::mutex nativeSubmitMutex_;
     std::condition_variable wake_;
@@ -53,8 +54,21 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
     void Dispatch(TaskPtr task, WaiterPtr waiter) override
     {
         waiter->Set(1);
+        if (fullBlockLoad_ && task->task.type == TransTask::Type::LOAD) {
+            // LoadQueue expands cold layers into complete L1 blocks. Retain the
+            // L2 lease until that queue and its per-layer H2D work have drained.
+            std::vector<Detail::BlockId> blocks;
+            for (const auto& shard : task->task.desc) { blocks.push_back(shard.owner); }
+            auto lease = backend_.AcquireReadLease(blocks.data(), blocks.size());
+            if (!lease) { task->Fail(lease.Error()); }
+            else { task->lease = std::move(lease.Value()); }
+            task->owners.clear();
+            task->followers.clear();
+        }
         // The all-READY path still submits immediately, without data queueing.
-        if (task->owners.empty() && task->followers.empty()) { SubmitNative(*task); }
+        if (task->status.Success() && task->owners.empty() && task->followers.empty()) {
+            SubmitNative(*task);
+        }
         {
             std::lock_guard lock(pendingMutex_);
             pending_.emplace_back(std::move(task), std::move(waiter));
@@ -222,7 +236,8 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
 
 public:
     EarlyNativeTransfer(StoreV1& backend, TransManager& native, const Config& config)
-        : backend_(backend), native_(native), shardBytes_(config.shardSize)
+        : backend_(backend), native_(native), shardBytes_(config.shardSize),
+          fullBlockLoad_(config.cacheFullBlockLoad)
     {
         timeoutMs_ = config.timeoutMs;
         thread_ = std::thread([this] { Run(); });

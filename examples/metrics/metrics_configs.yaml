@@ -74,6 +74,12 @@ counter:
   # rate() / 1e9 to get actual GB/s the worker is moving across the disk,
   # which the per-task *_bandwidth_gbps histogram cannot reveal because
   # it does not aggregate concurrent IO threads or account for idle gaps.
+  - name: "posix_load_read_ops_total"
+    documentation: "Successfully completed POSIX AIO read operations."
+  - name: "posix_load_read_bytes_total"
+    documentation: "Bytes delivered by successful POSIX AIO read operations."
+  - name: "posix_load_full_block_ops_total"
+    documentation: "Successfully completed full-block POSIX vector reads."
   - name: "posix_s2h_bytes_total"
     documentation: "Total bytes transferred from posix storage to host buffer (load path, summed per completed task)"
   - name: "posix_h2s_bytes_total"

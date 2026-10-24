@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 #include "copy_stream.h"
+#include "full_block_read.h"
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
@@ -49,6 +50,7 @@ class LoadQueue {
         Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
         bool fromPosix{false};
+        std::unique_ptr<FullBlockRead> fullBlockRead;
     };
 
 private:
@@ -62,6 +64,7 @@ private:
     size_t streamNumber_{1};
     bool useGdr_{false};
     bool cacheIOAggregation_{false};
+    bool fullBlockLoad_{false};
     bool cacheSdmaDirect_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     size_t localRankSize_{};

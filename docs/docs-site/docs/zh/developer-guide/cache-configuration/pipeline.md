@@ -118,11 +118,15 @@ vllm bench serve \
 
 ## L2 整块读取与逐层设备搬运 { #full-block-l2-reads-with-layerwise-device-transfers }
 
-在 `ucm_connector_config` 中设置 `cache_full_block_load: true`，可以将完整 block
-从 Posix 读入主机缓存，同时保留逐层的主机到设备搬运。默认值为 `false`，关闭后恢复原有
-shard 读取。将以下设置合入已有管线配置，并保留其存储、容量和设备设置：
+整块读取和紧凑 L2 布局是 Early 管线的可选功能。启用 `enable_early_prefetch`，并在
+`ucm_connector_config` 中设置 `cache_full_block_load: true`。普通 Cache/Posix 管线
+会拒绝这些选项，其均匀文件布局和公开默认值保持不变。启用整块读取时，Early 的冷加载回退
+也通过整块读取完成。
+
+将以下设置合入已有配置，并保留其存储、容量和设备设置：
 
 ```yaml
+enable_early_prefetch: true
 use_layerwise: true
 use_request_async_load: false
 ucm_connectors:
@@ -134,22 +138,51 @@ ucm_connectors:
       cache_full_block_load: true
 ```
 
-普通按需加载和 Early 预取都支持此模式。它不会为 layerwise connector 启用请求级异步加载。
-后端必须支持整块读取；Posix 要求使用 AIO，每个 block 的 shard 数不超过 `IOV_MAX`，
-block 大小不超过 `UINT32_MAX` 字节。
+`cache_full_block_load` 默认为 `false`。没有配置紧凑布局时，关闭它可恢复逐层 shard
+读取。它不会为 layerwise connector 启用请求级异步加载。整块读取要求使用 Early Posix
+AIO 后端，每个 block 的层数不超过 `IOV_MAX`，均匀主机 block 不超过 `UINT32_MAX` 字节。
 
 一次 `IOCB_CMD_PREADV` 直接填充缺失层的缓冲区。已缓存或由其他任务持有写入所有权的层，
-使用私有 scratch 缓冲区接收对应文件范围，避免覆盖活跃数据。H2D 队列仍只搬运请求的当前层。
-逐层缓存节点、淘汰单位、磁盘 padding 和 dump 格式保持不变。
+使用私有 scratch 接收对应数据，避免覆盖活跃内容。H2D 仍只搬运请求的当前层；L1 节点、
+张量偏移和淘汰单位保持逐层组织。没有启用紧凑布局时，磁盘 padding 和 dump 格式也保持不变。
 
-Early 每次最多提交 64 个读取单元，在途窗口为 128 个读取单元；此模式按完整 block 计量，
-原模式按 layer shard 计量。字节计账包括读入 scratch 后丢弃的文件范围，L1 容量仍按逐层
-shard 槽位计量。部分命中可能增加读取字节和临时主机内存；容量压力或并发所有权可能导致重复
-读取。一次 AIO 请求不保证对应一次物理设备命令。
+### 紧凑 L2 布局 { #packed-l2-layout }
 
-已提交的读取会保留缓冲区和向量元数据直到物理 I/O 完成，取消或超时也遵循这一规则。
-短读会使任务失败，不会把未完整填充的节点发布为就绪状态。
+`posix_packed_layer_bytes` 是 `ucm_connector_config` 内的可选整数列表，按层顺序指定
+每层的物理磁盘长度，同时保留原有均匀 L1 槽位。不设置时使用均匀磁盘布局；系统不会自动
+根据模型生成这个列表。
+
+在 Early `Cache|Posix` 管线中，紧凑布局必须满足以下条件：
+
+- `cache_full_block_load: true`、`use_layerwise: true`，且每个 chunk 只有一个 KV
+  block，即 `blocks_per_chunk == 1`。
+- `store_io_alignment: 4096`（默认值），每项为正数且是 4096 的倍数；列表最多 1024
+  项且不超过 `IOV_MAX`，总和不超过 `UINT32_MAX` 字节。
+- 每个实际层对应一项，且不超过该层的 L1 shard 大小。长度必须等于该层最后一个非空张量
+  的结束偏移向上对齐到 4096 字节；保留其前面的张量槽位和间隙，只移除未使用的尾部 padding。
+- 保持既有均匀 L1 张量大小列表和偏移。运行时会拒绝可能截断真实张量的布局及 load/dump 地址。
+- 关闭 `cache_load_backend_only`、`cache_io_aggregation`、`cache_sdma_direct` 和 `use_gdr`。
+
+磁盘层偏移按长度前缀和计算。文件放入独立的 `.ucm-packed-v1-<count>` 命名空间，其下目录名
+编码完整的逐层长度列表，不同布局不会相互复用文件。改变列表会选择另一个命名空间，需要
+为新布局重新填充缓存数据，不能将均匀文件直接解释成紧凑文件。原有 Early 读租约会保护紧凑
+文件，直到最后一个读取者释放租约后才允许删除。
+
+### 容量、完成与升级 { #capacity-completion-and-upgrades }
+
+Early 每次最多提交 64 个读取单元，在途窗口为 128 个读取单元。整块 I/O 预算、成功读取
+字节计账和 Posix 容量/GC 使用实际磁盘 block 大小；启用紧凑布局时即长度列表之和。L1
+预留和容量仍按均匀逐层 shard 槽位计算，紧凑存储不会扩大 L1 或设备缓存容量。
+
+读取计账包括读入 scratch 后丢弃的范围。部分命中可能增加读取字节和临时内存，容量压力
+或并发所有权可能导致重复读取。一次 AIO 请求不保证一次物理设备命令。已提交读取会保留
+缓冲区和向量元数据直到物理 I/O 完成，取消或超时也遵循这一规则。短读会失败，不会把未完整
+填充的节点发布为就绪状态。
 
 使用 `posix_load_read_ops_total`、`posix_load_read_bytes_total` 和
 `posix_load_full_block_ops_total` 观察成功读取，通过字节与操作数增量之比判断实际读取粒度。
-升级时需要统一重编全部原生库：内部任务描述和 Store 能力接口已发生变化，不得混用新旧 `.so`。
+
+升级时统一重编全部原生库，并重启共享 Early 域内的 worker。Store 能力接口、域元数据和
+owner 协议均有变化，不得混用新旧库或 worker。通用测试位于
+`test/test_early_packed_layout.py`、`test/full_block_l2_probe.cc`、
+`test/packed_l2_probe.cc` 和 `test/early_scope_probe.cc`。

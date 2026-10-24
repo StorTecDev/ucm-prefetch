@@ -64,7 +64,8 @@ These fields apply to pipelines containing Cache. Budget shared buffers per shar
 | `use_dpc` | Optional | bool | Default: `false` | Host buffer allocation in non-shared-buffer mode. Defaults to huge pages (legacy DirectIO path); set `true` to use the driver memory API (DPC path). |
 | `cache_sdma_direct` | Optional | bool | Depends on build env: `true` when `PLATFORM=ascend-a3`, `false` otherwise | Enable SDMA H2D/D2H transfer. Only effective on A3 devices. Recommended to disable. |
 | `cache_load_backend_only` | Optional | bool | Default: `false` | Force load from SSD even on cache hit. Test only. |
-| `cache_full_block_load` | Optional | bool | Default: `false` | Read full blocks from Posix AIO into the host cache while preserving layerwise device transfers. See [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers). |
+| `cache_full_block_load` | Optional | bool | Default: `false` | Early-only full-block Posix AIO reads into L1, preserving layerwise device transfers. Ordinary Cache/Posix rejects this option. See [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers). |
+| `posix_packed_layer_bytes` | Optional | list[int] | Unset: uniform disk layout | Early layerwise full-block pipeline only. Exact 4096-byte-aligned physical lengths in layer order, validated against live tensors; L1 remains uniform. See [packed layout](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout). |
 | `cache_io_aggregation` | Optional | bool | Default: `false`, auto-enabled when `PLATFORM=ascend` and model is V4 | Enable IO aggregation H2D transfer. Only effective on A2 devices. |
 | `share_buffer_enable` | Optional | bool | MLA: default enabled; GQA: default disabled | Enable shared memory. MLA without shm or GQA with shm causes performance degradation. |
 

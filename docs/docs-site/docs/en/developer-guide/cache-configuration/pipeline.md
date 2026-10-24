@@ -156,13 +156,17 @@ I/O is cheaper than recomputation for your workload.
 
 ## Full-block L2 reads with layerwise device transfers
 
-Set `cache_full_block_load: true` inside `ucm_connector_config` to read complete
-blocks from Posix into the host cache while retaining layerwise host-to-device
-transfers. The default is `false`; disabling it restores the original shard reads.
-Apply these settings to an existing pipeline configuration, keeping its storage,
+Full-block and packed L2 loading are opt-in features of the Early pipeline.
+Enable `enable_early_prefetch` and set `cache_full_block_load: true` inside
+`ucm_connector_config`. Ordinary Cache/Posix pipelines reject these options;
+their uniform file layout and public defaults remain unchanged. Early's cold-load
+fallback also uses full-block reads when this option is enabled.
+
+Apply these settings to an existing configuration, retaining its storage,
 capacity and device settings:
 
 ```yaml
+enable_early_prefetch: true
 use_layerwise: true
 use_request_async_load: false
 ucm_connectors:
@@ -174,29 +178,69 @@ ucm_connectors:
       cache_full_block_load: true
 ```
 
-Ordinary demand loading and Early prefetch both support this mode. It does not
-enable request-level async loading for layerwise connectors. The backend must
-support full-block reads; Posix requires AIO, at most `IOV_MAX` shards per block,
-and a block size no greater than `UINT32_MAX` bytes.
+`cache_full_block_load` defaults to `false`. Without a packed layout, disabling
+it restores layer-shard reads. The option does not enable request-level async
+loading for layerwise connectors. Full-block reads require the Early Posix AIO
+backend, at most `IOV_MAX` layers per block, and a uniform host block no larger
+than `UINT32_MAX` bytes.
 
-One `IOCB_CMD_PREADV` fills the missing layer buffers directly. Cached or
-peer-owned destinations use private scratch buffers to avoid overwriting live
-data. The H2D queue still transfers only the requested layer. Per-layer cache
-nodes, eviction units, disk padding and the dump format remain unchanged.
+One `IOCB_CMD_PREADV` fills missing layer buffers directly. Cached or peer-owned
+destinations use private scratch so active data is not overwritten. H2D still
+transfers only the requested layer. L1 nodes, tensor offsets and eviction units
+remain layer-based. Without packing, disk padding and the dump format also remain
+unchanged.
 
-Early submits up to 64 read units per turn and keeps at most 128 in flight:
-complete blocks in this mode, layer shards otherwise. Its byte accounting
-includes file ranges discarded into scratch. L1 capacity remains measured in
-layer-shard slots. Partial hits can increase bytes read and temporary host memory;
-capacity pressure or concurrent ownership can cause repeated reads. One AIO
-request does not guarantee one physical device command.
+### Packed L2 layout
 
-Accepted reads retain their buffers and vector metadata until physical completion,
-including after cancellation or timeout. Short reads fail the task without
-publishing partially filled nodes as ready.
+`posix_packed_layer_bytes` is an optional integer list inside
+`ucm_connector_config`. It specifies the physical disk length of each layer,
+in layer order, while retaining the original uniform L1 slices. Omit it to keep
+the uniform disk layout. Packing is not inferred automatically from the model.
 
-Use `posix_load_read_ops_total`, `posix_load_read_bytes_total` and
+For the Early `Cache|Posix` pipeline, packing requires all of the following:
+
+- `cache_full_block_load: true`, `use_layerwise: true`, and one KV block per
+  chunk (`blocks_per_chunk == 1`).
+- `store_io_alignment: 4096` (the default), positive lengths divisible by 4096,
+  at most 1024 entries and no more than `IOV_MAX`, and a sum no larger than
+  `UINT32_MAX` bytes.
+- One entry per actual layer, with each entry no larger than its L1 shard.
+  The length must be the end offset of the last non-null tensor in that layer,
+  rounded up to 4096 bytes. Preserve preceding tensor slots and gaps; only unused
+  trailing padding may be removed.
+- The existing uniform L1 tensor-size list and offsets. Runtime validation rejects
+  layouts or load/dump addresses that would truncate a real tensor.
+- `cache_load_backend_only`, `cache_io_aggregation`, `cache_sdma_direct`, and
+  `use_gdr` disabled.
+
+Files use prefix-sum layer offsets and a separate `.ucm-packed-v1-<count>`
+namespace whose nested names encode all layer lengths. Different layouts do not
+reuse one another's files. Changing the list selects another namespace; populate
+cache data for the new layout instead of treating uniform files as packed files.
+Existing Early read leases protect packed files from deletion until the last
+reader releases its lease.
+
+### Capacity, completion and upgrades
+
+Early submits up to 64 read units per turn and keeps at most 128 in flight.
+Full-block I/O credit, successful-read byte accounting, and Posix capacity/GC use
+the actual disk block size: the packed-length sum when packing is enabled.
+L1 reservations and capacity still use uniform layer-shard slots; packing does
+not increase L1 or device-cache capacity.
+
+Read accounting includes ranges discarded into scratch. Partial hits can increase
+bytes read and temporary memory, and capacity pressure or concurrent ownership can
+cause repeated reads. One AIO request does not guarantee one physical device command.
+Accepted reads retain buffers and vector metadata until physical completion,
+including after cancellation or timeout. Short reads fail without publishing
+partially filled nodes as ready.
+
+Use `posix_load_read_ops_total`, `posix_load_read_bytes_total`, and
 `posix_load_full_block_ops_total` to inspect successful reads. The ratio of byte
-and operation deltas identifies the effective read size. Rebuild all native
-libraries together when upgrading: the internal task descriptor and Store
-capability interface changed, so old and new `.so` files must not be mixed.
+and operation deltas identifies the effective read size.
+
+Rebuild all native libraries together and restart workers in a shared Early
+domain when upgrading. Store capabilities, domain metadata and the owner protocol
+changed; do not mix old and new libraries or workers. Generic coverage is in
+`test/test_early_packed_layout.py`, `test/full_block_l2_probe.cc`,
+`test/packed_l2_probe.cc`, and `test/early_scope_probe.cc`.

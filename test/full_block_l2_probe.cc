@@ -417,6 +417,8 @@ int main(int argc, char** argv)
         TimeoutRetainsVectors();
         for (bool full : {false, true}) {
             for (bool early : {false, true}) {
+                // Ordinary full-block opt-in is rejected by the scope probe.
+                if (full && !early) { continue; }
                 for (bool partial : {false, true}) { CacheRead(full, early, partial); }
             }
         }

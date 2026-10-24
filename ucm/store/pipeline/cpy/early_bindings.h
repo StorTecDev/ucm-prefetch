@@ -86,6 +86,7 @@ void BindOperations(pybind11::module_& module)
         out["reservable_nodes"] = domain.reservable;
         out["shard_bytes"] = domain.shardBytes;
         out["block_bytes"] = domain.blockBytes;
+        out["disk_block_bytes"] = domain.diskBlockBytes;
         return out;
     });
     module.def("EarlyReleaseEpoch", [](Pipeline& pipeline) {

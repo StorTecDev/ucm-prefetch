@@ -14,6 +14,7 @@ from .ucm_connector import (
     UCMDirectConnector,
     UCMLayerWiseConnector,
     logger,
+    _get_store_io_sizes,
 )
 
 
@@ -25,6 +26,45 @@ class EarlyConnectorMetadata(UCMConnectorMetadata):
 
 class _EarlyConnectorMixin:
     _defer_scheduler_store = True
+
+    def _create_store(self, kv_cache_layout, cpu_affinity_cores=None):
+        """Validate Early disk lengths before any native resource is created.
+
+        Args:
+            kv_cache_layout: Materialized worker layout, or None for a scheduler.
+            cpu_affinity_cores: Optional native worker CPU affinity.
+
+        Returns:
+            The native Early pipeline using the original public store defaults.
+        """
+        from .early_storage_layout import validate_packed_config, validate_packed_layers
+
+        config = self.connector_configs[0]["ucm_connector_config"]
+        lengths = validate_packed_config(config)
+        self._early_disk_block_bytes = sum(lengths) if lengths is not None else None
+        if lengths is not None and kv_cache_layout is not None:
+            shard, _ = _get_store_io_sizes(
+                kv_cache_layout.shard_size * self.blocks_per_chunk,
+                kv_cache_layout.block_size * self.blocks_per_chunk,
+            )
+            validate_packed_layers(
+                dict(config, shard_size=shard,
+                     tensor_size_list=kv_cache_layout.tensor_size_list * self.blocks_per_chunk),
+                kv_cache_layout,
+                layerwise=self.use_layerwise,
+                blocks_per_chunk=self.blocks_per_chunk,
+            )
+        return super()._create_store(kv_cache_layout, cpu_affinity_cores)
+
+    def _publish_block_size(self, block_size):
+        """Publish actual disk bytes so scheduler GC uses the fixed data budget.
+
+        Args:
+            block_size: Original uniform block size when compact disk layout is off.
+        """
+        return super()._publish_block_size(
+            getattr(self, "_early_disk_block_bytes", None) or block_size
+        )
 
     def _lookup_context(self):
         context = current_lookup.get()
@@ -61,7 +101,7 @@ class _EarlyConnectorMixin:
         )
         logger.info(
             "UCM_EARLY enabled role=%s dp=%s tp=%s share_identity=%s "
-            "policy=stan_hrrn lookup_workers=4 data_workers=1 work_unit=shard "
+            "policy=hrrn lookup_workers=4 data_workers=1 work_unit=shard "
             "connector=%s source=%s",
             role,
             vllm_config.parallel_config.data_parallel_index,

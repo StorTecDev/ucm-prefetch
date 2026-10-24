@@ -50,7 +50,7 @@ private:
     ThreadPool<IoUnit> loadPool_;
     ThreadPool<IoUnit> dumpPool_;
     size_t ioSize_;
-    size_t shardSize_;
+    Config ioConfig_;
     size_t nShardPerBlock_;
     bool ioDirect_;
     size_t timeoutMs_;

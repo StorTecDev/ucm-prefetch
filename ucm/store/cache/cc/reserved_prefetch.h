@@ -64,6 +64,7 @@ class ReservedPrefetch {
     TransBuffer* buffer_;
     size_t shardsPerBlock_, shardBytes_, timeoutMs_;
     bool fullBlockLoad_;
+    size_t readUnitBytes_;
     std::mutex mutex_;
     uint64_t next_{1};
     std::unordered_map<uint64_t, std::shared_ptr<Reservation>> reservations_;
@@ -138,6 +139,8 @@ public:
         : backend_(backend), buffer_(manager->GetTransBuffer()),
           shardsPerBlock_(blockSize / shardSize), shardBytes_(shardSize),
           timeoutMs_(timeoutMs), fullBlockLoad_(fullBlockLoad),
+          readUnitBytes_(fullBlockLoad ? (backend->FullBlockReadBytes()
+              ? backend->FullBlockReadBytes() : blockSize) : shardSize),
           hintBlockCapacity_(buffer_ ? EarlyBufferPins::HintBlockCapacity(*buffer_, shardsPerBlock_) : 0)
     {}
 

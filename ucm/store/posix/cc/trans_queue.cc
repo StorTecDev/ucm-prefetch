@@ -33,7 +33,7 @@ Status TransQueue::Setup(const Config& config, TaskIdSet* failureSet, const Spac
     failureSet_ = failureSet;
     layout_ = layout;
     ioSize_ = config.tensorSize;
-    shardSize_ = config.shardSize;
+    ioConfig_ = config;
     nShardPerBlock_ = config.blockSize / config.shardSize;
     ioDirect_ = config.ioDirect;
     timeoutMs_ = config.timeoutMs;
@@ -149,15 +149,16 @@ Status TransQueue::H2S(IoUnit& ios)
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_open_errors_total"), 1.0);
         return s;
     }
-    auto offset = shardSize_ * ios.shard.index;
+    auto offset = ioConfig_.LayerOffset(ios.shard.index);
+    const auto bytes = ioConfig_.layerBytes.empty() ? ioSize_ : ioConfig_.LayerBytes(ios.shard.index);
     for (const auto& addr : ios.shard.addrs) {
-        s = file.Write(addr, ioSize_, offset);
+        s = file.Write(addr, bytes, offset);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to write file({}:{}).", s, path, offset);
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_errors_total"), 1.0);
             return s;
         }
-        offset += ioSize_;
+        offset += bytes;
     }
     return Status::OK();
 }
@@ -174,15 +175,16 @@ Status TransQueue::S2H(IoUnit& ios)
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_open_errors_total"), 1.0);
         return s;
     }
-    auto offset = shardSize_ * ios.shard.index;
+    auto offset = ioConfig_.LayerOffset(ios.shard.index);
+    const auto bytes = ioConfig_.layerBytes.empty() ? ioSize_ : ioConfig_.LayerBytes(ios.shard.index);
     for (const auto& addr : ios.shard.addrs) {
-        s = file.Read(addr, ioSize_, offset);
+        s = file.Read(addr, bytes, offset);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to read file({}:{}).", s, path, offset);
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_errors_total"), 1.0);
             return s;
         }
-        offset += ioSize_;
+        offset += bytes;
     }
     return Status::OK();
 }

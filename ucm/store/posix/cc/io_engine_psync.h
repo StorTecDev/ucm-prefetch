@@ -40,7 +40,7 @@ class IoEnginePsync : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> 
     static constexpr size_t kDispatchQueueDepth = 8192;
 
     TransQueue queue_;
-    size_t shardSize_;
+    Config ioConfig_;
     SpscRingQueue<TaskPair> waiting_;
     alignas(64) std::atomic_bool stop_{false};
     SpinLock pushLock_;
@@ -50,7 +50,7 @@ public:
     Status Setup(const Config& config, const SpaceLayout* layout)
     {
         timeoutMs_ = config.timeoutMs;
-        shardSize_ = config.shardSize;
+        ioConfig_ = config;
         auto s = queue_.Setup(config, &failureSet_, layout);
         if (s.Failure()) [[unlikely]] { return s; }
         waiting_.Setup(kDispatchQueueDepth);
@@ -118,7 +118,8 @@ private:
         const auto id = t->id;
         const auto& brief = t->desc.brief;
         const auto num = t->desc.size();
-        const auto size = shardSize_ * num;
+        size_t size = 0;
+        for (const auto& shard : t->desc) { size += ioConfig_.LayerBytes(shard.index); }
         const auto tp = w->startTp;
         const auto isDump = (t->type == TransTask::Type::DUMP);
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);

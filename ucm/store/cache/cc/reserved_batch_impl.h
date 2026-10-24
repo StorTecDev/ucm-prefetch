@@ -91,7 +91,7 @@ class ReservedPrefetch::Batch final : public Early::Batch {
         if (!allocated.empty()) {
             owners.insert(owners.end(), allocated.begin(), allocated.end());
             task.push_back(std::move(read));
-            availableBytes -= shards * owner_.shardBytes_;
+            availableBytes -= owner_.readUnitBytes_;
         }
         progress_.remainingL2Work -= std::min(progress_.remainingL2Work, newlyReady);
         progress_.waitingCapacity = false;
@@ -211,8 +211,10 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                     // All allocating bookkeeping precedes Load. The reservation
                     // is retained before the backend can start writing to it.
                     const auto readBytes = task.fullBlockRead
-                        ? task.size() * owner_.shardsPerBlock_ * owner_.shardBytes_
+                        ? task.size() * owner_.readUnitBytes_
                         : owners.size() * owner_.shardBytes_;
+                    const auto readShards = task.fullBlockRead
+                        ? task.size() * owner_.shardsPerBlock_ : owners.size();
                     transfers_.push_back({0, std::move(owners), readBytes});
                     active_ = r;
                     auto& transfer = transfers_.back();
@@ -225,7 +227,7 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                     else {
                         transfer.handle = result.Value();
                         const auto bytes = transfer.bytes;
-                        progress_.result.l2ReadShards += bytes / owner_.shardBytes_;
+                        progress_.result.l2ReadShards += readShards;
                         progress_.result.l2ReadBytes += bytes;
                         progress_.inflightBytes += bytes;
                         ++stats_->ioBatches;
@@ -299,8 +301,8 @@ class ReservedPrefetch::Batch final : public Early::Batch {
 
 public:
     Batch(ReservedPrefetch& owner, const std::shared_ptr<Reservation>& r, uint64_t handle)
-        : Early::Batch(owner.shardBytes_ * (owner.fullBlockLoad_ ? owner.shardsPerBlock_ : 1),
-                       128 * owner.shardBytes_ * (owner.fullBlockLoad_ ? owner.shardsPerBlock_ : 1),
+        : Early::Batch(owner.readUnitBytes_,
+                       128 * owner.readUnitBytes_,
                        EarlyBufferPins::ReservableSlots(*owner.buffer_) * owner.shardBytes_),
           owner_(owner), reservation_(r), handle_(handle)
     {

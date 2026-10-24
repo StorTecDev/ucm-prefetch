@@ -29,6 +29,7 @@
 #include "logger/logger.h"
 #include "metrics_api.h"
 #include "posix_file.h"
+#include "packed_layout.h"
 #include "read_lease.h"
 #include "space_manager.h"
 #include "trans_manager.h"
@@ -46,6 +47,8 @@ class PosixStore : public StoreV1 {
     bool ioDirect_{false};
     bool fullBlockReadSupported_{false};
     size_t shardsPerBlock_{0};
+    size_t diskBlockBytes_{0};
+    std::vector<size_t> packedLayerBytes_;
     const Detail::BlockId healthBlockId_{Detail::RandomBlockId()};
 
     Status CheckPathHealth(const std::string& path)
@@ -74,19 +77,24 @@ public:
     Status Setup(const Detail::Dictionary& inConfig) override
     {
         auto config = ParseConfig(inConfig);
-        Configure(inConfig, config);
-        auto s = CheckConfig(config);
+        auto s = Configure(inConfig, config);
+        if (s.Failure()) { return s; }
+        s = CheckConfig(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
             return s;
         }
+        s = PrepareStorage(config);
+        if (s.Failure()) { return s; }
         s = spaceMgr_.Setup(config);
         if (s.Failure()) [[unlikely]] { return s; }
         transEnable_ = config.deviceId >= 0;
         ioDirect_ = config.ioDirect;
-        fullBlockReadSupported_ = config.ioEngine == "aio" && config.shardSize > 0 &&
+        fullBlockReadSupported_ = EarlyLayoutEnabled() && config.ioEngine == "aio" && config.shardSize > 0 &&
             config.blockSize / config.shardSize <= IOV_MAX && config.blockSize <= UINT32_MAX;
         shardsPerBlock_ = config.shardSize ? config.blockSize / config.shardSize : 0;
+        diskBlockBytes_ = config.DiskBlockBytes();
+        packedLayerBytes_ = config.layerBytes;
         if (transEnable_) {
             s = transMgr_.Setup(config, spaceMgr_.GetLayout());
             if (s.Failure()) [[unlikely]] { return s; }
@@ -96,6 +104,10 @@ public:
     }
     std::string Readme() const override { return "PosixStore"; }
     bool SupportsFullBlockRead() const override { return fullBlockReadSupported_; }
+    size_t FullBlockReadBytes() const override { return diskBlockBytes_; }
+    size_t PackedLayerBytes(size_t index) const override
+    { return index < packedLayerBytes_.size() ? packedLayerBytes_[index] : 0; }
+
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
         RecordLookupQueries(num);
@@ -187,8 +199,28 @@ public:
     }
 
 protected:
-    virtual void Configure(const Detail::Dictionary&, Config&) {}
+    virtual bool EarlyLayoutEnabled() const { return false; }
+    virtual Status Configure(const Detail::Dictionary& input, Config&)
+    {
+        if (input.Contains("posix_packed_layer_bytes")) {
+            return Status::InvalidParam("packed layout requires EarlyPosix");
+        }
+        return Status::OK();
+    }
+    virtual Status PrepareStorage(Config&) { return Status::OK(); }
     const SpaceLayout* GetLayout() const { return spaceMgr_.GetLayout(); }
+
+    Status CheckPackedTask(const Detail::TaskDesc& task) const
+    {
+        if (packedLayerBytes_.empty() || task.fullBlockRead) { return Status::OK(); }
+        for (const auto& shard : task) {
+            if (shard.index >= packedLayerBytes_.size() || shard.addrs.size() != 1 ||
+                !shard.addrs.front()) {
+                return Status::InvalidParam("invalid packed host slice");
+            }
+        }
+        return Status::OK();
+    }
 
 private:
     static void RecordLookupQueries(size_t count)
@@ -355,6 +387,8 @@ private:
         UC_INFO("Set {}::TensorSize to {}.", ns, config.tensorSize);
         UC_INFO("Set {}::ShardSize to {}.", ns, config.shardSize);
         UC_INFO("Set {}::BlockSize to {}.", ns, config.blockSize);
+        UC_INFO("Set {}::DiskBlockBytes to {}.", ns, config.DiskBlockBytes());
+        UC_INFO("Set {}::PackedLayerBytes to {}.", ns, config.layerBytes);
         UC_INFO("Set {}::IoEngine to {}.", ns, config.ioEngine);
         UC_INFO("Set {}::IoDirect to {}.", ns, config.ioDirect);
         UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
@@ -393,12 +427,33 @@ private:
 
 class EarlyPosixStore final : public PosixStore {
 protected:
-    void Configure(const Detail::Dictionary&, Config& config) override
+    bool EarlyLayoutEnabled() const override { return true; }
+    Status Configure(const Detail::Dictionary& input, Config& config) override
     {
         config.acquireRemoveGuard = PosixReadLease::AcquireRemoveGuard;
+        return ParsePackedLayout(input, config);
+    }
+    Status PrepareStorage(Config& config) override
+    {
+        for (const auto& backend : config.storageBackends) {
+            if (backend.empty()) { return Status::InvalidParam("empty Early storage backend"); }
+        }
+        return PreparePackedNamespace(config);
     }
 
 public:
+    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
+    {
+        auto status = CheckPackedTask(task);
+        if (status.Failure()) { return status; }
+        return PosixStore::Load(std::move(task));
+    }
+    Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
+    {
+        auto status = CheckPackedTask(task);
+        if (status.Failure()) { return status; }
+        return PosixStore::Dump(std::move(task));
+    }
     Expected<std::shared_ptr<ReadLease>> AcquireReadLease(
         const Detail::BlockId* blocks, size_t num) override
     {

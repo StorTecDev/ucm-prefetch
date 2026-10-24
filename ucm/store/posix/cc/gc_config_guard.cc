@@ -87,7 +87,7 @@ std::vector<std::pair<std::string, std::string>> GcConfigGuard::Entries(const Co
         {"storage_backends", fmt::format("{}", fmt::join(backends, ":"))},
         {"data_dir_shard_bytes", std::to_string(config.dataDirShardBytes)},
         {"gc_enable", Boolean(config.posixGcEnable && config.posixCapacityGb > 0)},
-        {"block_size", std::to_string(config.blockSize)},
+        {"block_size", std::to_string(config.DiskBlockBytes())},
         {"capacity_gb", std::to_string(config.posixCapacityGb)},
         {"recycle_percent", Number(config.posixGcRecyclePercent)},
         {"precise_mode", Boolean(config.posixGcPreciseMode)},

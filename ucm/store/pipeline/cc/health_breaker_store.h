@@ -54,6 +54,10 @@ public:
     std::string Readme() const override;
     bool SupportsFullBlockRead() const override
     { return store_ && store_->SupportsFullBlockRead(); }
+    size_t FullBlockReadBytes() const override
+    { return store_ ? store_->FullBlockReadBytes() : 0; }
+    size_t PackedLayerBytes(size_t index) const override
+    { return store_ ? store_->PackedLayerBytes(index) : 0; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override;
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override;
     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override;

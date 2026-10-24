@@ -46,7 +46,6 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     streamNumber_ = config.EffectiveStreamNumber();
     useGdr_ = config.useGdr;
     cacheIOAggregation_ = config.cacheIOAggregation;
-    fullBlockLoad_ = config.cacheFullBlockLoad;
     cacheSdmaDirect_ = config.cacheSdmaDirect;
     cpuAffinityCores_ = config.cpuAffinityCores;
     localRankSize_ = config.localRankSize;
@@ -135,15 +134,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                 Detail::Shard{shard.owner, shard.index, {shardTask.bufferHandle.Data()}}
             };
             backendTask.brief = "Backend2Cache";
-            Expected<Detail::TaskHandle> res = Status::Error();
-            if (fullBlockLoad_) {
-                shardTask.fullBlockRead = std::make_unique<FullBlockRead>(*backend_);
-                auto status = shardTask.fullBlockRead->Submit(
-                    *buffer_, shard, shardTask.bufferHandle, nShardPerBlock_);
-                res = status.Success() ? Expected<Detail::TaskHandle>{0} : status;
-            } else {
-                res = backend_->Load(std::move(backendTask));
-            }
+            auto res = backend_->Load(std::move(backendTask));
             if (!res) [[unlikely]] {
                 UC_ERROR("Failed({}) to submit load task({}) to backend.", res.Error(), task->id);
                 UC::Metrics::UpdateStats(
@@ -276,7 +267,6 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 
 Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
 {
-    if (task.fullBlockRead) { return task.fullBlockRead->Wait(); }
     if (task.backendTaskHandle != 0) {
         auto s = backend_->Wait(task.backendTaskHandle);
         if (s.Failure()) [[unlikely]] {

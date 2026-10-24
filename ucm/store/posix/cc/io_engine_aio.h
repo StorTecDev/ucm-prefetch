@@ -49,7 +49,7 @@ class IoEngineAio : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> {
         size_t shardCount{0};
         bool aborted{false};
     };
-    size_t shardSize_;
+    Config ioConfig_;
     size_t nShardPerBlock_;
     const SpaceLayout* layout_;
     std::mutex regMutex_;
@@ -82,7 +82,7 @@ public:
     Status Setup(const Config& config, const SpaceLayout* layout)
     {
         timeoutMs_ = config.timeoutMs;
-        shardSize_ = config.shardSize;
+        ioConfig_ = config;
         nShardPerBlock_ = config.blockSize / config.shardSize;
         layout_ = layout;
         blockOperator_.Setup(layout, config.openConcurrency, config.commitConcurrency);
@@ -185,29 +185,31 @@ private:
         }
         AioImpl::Io io;
         io.fd = result.fd;
-        io.offset = shard.index * shardSize_;
-        io.length = shardSize_;
+        io.offset = ioConfig_.LayerOffset(shard.index);
+        io.length = ioConfig_.LayerBytes(shard.index);
         io.buffer = shard.addrs.front();
         io.tag = tid;
         std::shared_ptr<void> discarded;
         if constexpr (!dump) {
             if (task->desc.fullBlockRead) {
-                io.length = shardSize_ * nShardPerBlock_;
+                io.length = ioConfig_.DiskBlockBytes();
                 const auto missing = std::count(shard.addrs.begin(), shard.addrs.end(), nullptr);
                 if (missing) {
                     // Cached slices may be in use by H2D or a concurrent writer.
                     // Read their file ranges into private scratch, never live L1.
                     void* scratch = nullptr;
-                    if (posix_memalign(&scratch, 4096, missing * shardSize_) != 0) {
+                    if (posix_memalign(&scratch, 4096, missing * ioConfig_.shardSize) != 0) {
                         handleFailure(result.fd, Status::OutOfMemory());
                         return;
                     }
                     discarded = std::shared_ptr<void>(scratch, std::free);
                 }
                 auto* scratch = static_cast<std::byte*>(discarded.get());
-                for (auto* address : shard.addrs) {
-                    io.vectors.push_back({address ? address : scratch, shardSize_});
-                    if (!address) { scratch += shardSize_; }
+                for (size_t index = 0; index < shard.addrs.size(); ++index) {
+                    auto* address = shard.addrs[index];
+                    const auto bytes = ioConfig_.LayerBytes(index);
+                    io.vectors.push_back({address ? address : scratch, bytes});
+                    if (!address) { scratch += bytes; }
                 }
             }
         }
@@ -252,7 +254,11 @@ private:
         const auto id = t->id;
         const auto& brief = t->desc.brief;
         const auto num = t->desc.size();
-        const auto size = shardSize_ * num * (t->desc.fullBlockRead ? nShardPerBlock_ : 1);
+        size_t size = 0;
+        for (const auto& shard : t->desc) {
+            size += t->desc.fullBlockRead ? ioConfig_.DiskBlockBytes()
+                                         : ioConfig_.LayerBytes(shard.index);
+        }
         const auto tp = w->startTp;
         const auto isDump = (t->type == TransTask::Type::DUMP);
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);

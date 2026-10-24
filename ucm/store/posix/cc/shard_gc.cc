@@ -35,7 +35,7 @@ ShardGarbageCollector::~ShardGarbageCollector() { StopBackgroundCheck(); }
 Status ShardGarbageCollector::ValidateAndInitCapacity()
 {
     capacityBytes_ = config_.posixCapacityGb * 1024ULL * 1024ULL * 1024ULL;
-    maxFileCount_ = capacityBytes_ / config_.blockSize;
+    maxFileCount_ = capacityBytes_ / config_.DiskBlockBytes();
     size_t thresholdFilesPerShard = static_cast<size_t>(
         maxFileCount_ / layout_->SampleShards(1.0).size() * config_.posixGcTriggerThresholdRatio);
     size_t recycleNum = static_cast<size_t>(thresholdFilesPerShard * config_.posixGcRecyclePercent);
@@ -44,7 +44,7 @@ Status ShardGarbageCollector::ValidateAndInitCapacity()
                                                              config_.posixGcRecyclePercent)) +
                                   1;
         size_t minCapacityBytes =
-            minFilesPerShard * layout_->SampleShards(1.0).size() * config_.blockSize;
+            minFilesPerShard * layout_->SampleShards(1.0).size() * config_.DiskBlockBytes();
         size_t minCapacityGb =
             (minCapacityBytes + 1024ULL * 1024ULL * 1024ULL - 1) / (1024ULL * 1024ULL * 1024ULL);
         return Status::InvalidParam(
@@ -243,7 +243,7 @@ std::tuple<bool, size_t, size_t> ShardGarbageCollector::ShouldTrigger()
     const auto estimatedFiles = static_cast<double>(sampledFiles.load()) *
                                 static_cast<double>(shardCount) /
                                 static_cast<double>(sampleShards.size());
-    const auto usedBytes = estimatedFiles * static_cast<double>(config_.blockSize);
+    const auto usedBytes = estimatedFiles * static_cast<double>(config_.DiskBlockBytes());
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_store_used_bytes"), usedBytes);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_store_capacity_bytes"),
                              static_cast<double>(capacityBytes_));

@@ -87,6 +87,9 @@ public:
      */
     virtual std::string Readme() const = 0;
     virtual bool SupportsFullBlockRead() const { return false; }
+    // Zero preserves backends whose I/O layout is the caller's uniform L1 layout.
+    virtual size_t FullBlockReadBytes() const { return 0; }
+    virtual size_t PackedLayerBytes(size_t) const { return 0; }
 
     /**
      * @brief Check whether the given blocks exist in storage.

@@ -17,7 +17,7 @@ from .early_control import BrokerState
 from .early_capacity import ExecutionWindow
 
 log = logging.getLogger(__name__)
-VERSION = 5
+VERSION = 9
 
 
 def worker_capability(connector):
@@ -36,6 +36,16 @@ def worker_capability(connector):
         shard, block = native["shard_bytes"], native["block_bytes"]
         if not shard or block % shard or shard != config["shard_size"] or block != config["block_size"]:
             return {"reason": "native/config layout mismatch"}
+        packed = config.get("posix_packed_layer_bytes")
+        disk_block = native.get("disk_block_bytes", block)
+        if packed is not None and (
+            not config.get("cache_full_block_load")
+            or len(packed) != block // shard
+            or disk_block != sum(packed)
+        ):
+            return {"reason": "native/config packed layout mismatch"}
+        if not disk_block or disk_block > block:
+            return {"reason": "invalid native disk block size"}
         layers = list(connector.layer_ids) if connector.use_layerwise else [0]
         if not layers or len(set(layers)) != len(layers) or min(layers) < 0 or max(layers) >= block // shard:
             return {"reason": "unsupported consumer shard range"}
@@ -55,7 +65,7 @@ def worker_capability(connector):
         # hasher, so fingerprint that same native identity once at handshake.
         scheduler_hasher = type(connector.request_hasher)(connector._vllm_config, 0)
         full_block_load = bool(config.get("cache_full_block_load", False))
-        layout = [connector.unique_id, native, config["tensor_size_list"], full_block_load,
+        layout = [connector.unique_id, native, config["tensor_size_list"], full_block_load, packed,
                   connector.use_layerwise, connector.hash_block_size, connector.blocks_per_chunk,
                   scheduler_hasher("UCM_HASH_SEED").hex()]
         return dict(version=VERSION, domain=json.dumps(domain),
@@ -123,7 +133,8 @@ class OwnerBroker(BrokerState):
             # Match the native window in physical read units; a full-block
             # submission cannot use a window sized for one layer.
             read_unit = "block_bytes" if group[0].get("full_block_load", False) else "shard_bytes"
-            quota = 128 * native[read_unit]
+            read_bytes = native.get("disk_block_bytes", native["block_bytes"]) if read_unit == "block_bytes" else native[read_unit]
+            quota = 128 * read_bytes
             io = len(members) * quota
             self.domains[domain] = dict(execution=ExecutionWindow(limit // native["block_bytes"]), limit=limit, io_limit=io,
                                         io_quota=quota, members=members, owners={},

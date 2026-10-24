@@ -42,6 +42,17 @@ struct Config {
     size_t tensorSize{0};
     size_t shardSize{0};
     size_t blockSize{0};
+    std::vector<size_t> layerBytes{};
+    std::vector<size_t> layerOffsets{};
+    size_t diskBlockBytes{0};
+
+    size_t LayerBytes(size_t index) const
+    { return layerBytes.empty() ? shardSize : layerBytes[index]; }
+    size_t LayerOffset(size_t index) const
+    { return layerBytes.empty() ? index * shardSize : layerOffsets[index]; }
+    size_t DiskBlockBytes() const
+    { return layerBytes.empty() ? blockSize : diskBlockBytes; }
+
     std::string ioEngine{"psync"};  // "aio", "psync"
     bool ioDirect{true};
     std::vector<ssize_t> cpuAffinityCores{};

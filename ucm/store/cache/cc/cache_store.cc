@@ -46,6 +46,8 @@ class CacheStore : public StoreV1 {
 
     BufferManager bufferMgr_;
     bool transEnable_{false};
+    std::vector<size_t> packedLayerBytes_;
+    std::vector<size_t> tensorSizes_;
     TransManager transMgr_;
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
 
@@ -73,6 +75,12 @@ public:
             return s;
         }
         transEnable_ = config.deviceId >= 0;
+        if (transEnable_ && config.storeBackend->PackedLayerBytes(0)) {
+            tensorSizes_ = config.tensorSizes;
+            for (size_t i = 0; i < config.blockSize / config.shardSize; ++i) {
+                packedLayerBytes_.push_back(config.storeBackend->PackedLayerBytes(i));
+            }
+        }
         if (transEnable_) {
             s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer());
             if (s.Failure()) [[unlikely]] { return s; }
@@ -136,6 +144,29 @@ public:
         return s;
     }
 
+protected:
+    virtual bool EarlyLayoutEnabled() const { return false; }
+
+    Status CheckPackedTask(const Detail::TaskDesc& task) const
+    {
+        if (packedLayerBytes_.empty()) { return Status::OK(); }
+        for (const auto& shard : task) {
+            if (shard.index >= packedLayerBytes_.size() || shard.addrs.size() != tensorSizes_.size()) {
+                return Status::InvalidParam("invalid packed device layer");
+            }
+            size_t offset = 0;
+            for (size_t i = 0; i < tensorSizes_.size(); ++i) {
+                offset += tensorSizes_[i];
+                // A real tensor in a truncated tail would silently corrupt KV.
+                // Validate both load and dump before acquiring pins or starting I/O.
+                if (shard.addrs[i] && offset > packedLayerBytes_[shard.index]) {
+                    return Status::InvalidParam("packed layer would truncate a device tensor");
+                }
+            }
+        }
+        return Status::OK();
+    }
+
 private:
     Config ParseConfig(const Detail::Dictionary& config)
     {
@@ -193,6 +224,10 @@ private:
     Status CheckConfig(const Config& config)
     {
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
+        if (!EarlyLayoutEnabled() && (config.cacheFullBlockLoad ||
+                                      config.storeBackend->PackedLayerBytes(0))) {
+            return Status::InvalidParam("full-block and packed layouts require EarlyCache");
+        }
         if (config.deviceId >= 0 && config.cacheFullBlockLoad &&
             !config.storeBackend->SupportsFullBlockRead()) {
             return Status::InvalidParam("cache_full_block_load requires a full-block read backend");
@@ -212,6 +247,24 @@ private:
         if (config.deviceId == -1) { return Status::OK(); }
         s = CheckSizeConfig(config);
         if (s.Failure()) { return s; }
+        if (config.storeBackend->PackedLayerBytes(0)) {
+            if (!config.cacheFullBlockLoad || config.cacheLoadBackendOnly ||
+                config.cacheIOAggregation || config.cacheSdmaDirect || config.useGdr) {
+                return Status::InvalidParam("packed L2 requires the Early full-block cache path");
+            }
+            size_t total = 0;
+            for (size_t i = 0; i < config.blockSize / config.shardSize; ++i) {
+                auto bytes = config.storeBackend->PackedLayerBytes(i);
+                if (!bytes || bytes > config.shardSize) {
+                    return Status::InvalidParam("packed L2 and L1 layer counts disagree");
+                }
+                total += bytes;
+            }
+            if (config.storeBackend->PackedLayerBytes(config.blockSize / config.shardSize) ||
+                total != config.storeBackend->FullBlockReadBytes()) {
+                return Status::InvalidParam("packed L2 block size disagrees with L1 layers");
+            }
+        }
 #if !UCM_RUNTIME_ASCEND_SDMA_DIRECT
         if (config.cacheSdmaDirect) {
             return Status::InvalidParam("Cache SDMA Direct requires RUNTIME_ENVIRONMENT=ascend-a3");
@@ -294,7 +347,10 @@ private:
 class EarlyCacheStore final : public CacheStore, public Early::DomainProvider {
     std::unique_ptr<ReservedPrefetch> early_;
     std::unique_ptr<EarlyNativeTransfer> transfers_;
-    size_t earlyBlockBytes_{0}, earlyShardBytes_{0};
+    size_t earlyBlockBytes_{0}, earlyShardBytes_{0}, diskBlockBytes_{0};
+
+protected:
+    bool EarlyLayoutEnabled() const override { return true; }
 
 public:
     Status Setup(const Detail::Dictionary& config) override
@@ -305,6 +361,8 @@ public:
         const auto param = ParseConfig(config);
         earlyBlockBytes_ = param.blockSize;
         earlyShardBytes_ = param.shardSize;
+        diskBlockBytes_ = param.storeBackend->FullBlockReadBytes();
+        if (!diskBlockBytes_) { diskBlockBytes_ = earlyBlockBytes_; }
         if (param.deviceId >= 0 && !param.cacheLoadBackendOnly) {
             early_ = std::make_unique<ReservedPrefetch>(
                 &bufferMgr_, param.storeBackend, param.blockSize, param.shardSize,
@@ -322,6 +380,7 @@ public:
         auto result = EarlyBufferPins::DescribeDomain(*buffer);
         result.blockBytes = earlyBlockBytes_;
         result.shardBytes = earlyShardBytes_;
+        result.diskBlockBytes = diskBlockBytes_;
         return result;
     }
 
@@ -369,6 +428,8 @@ public:
 private:
     Expected<Detail::TaskHandle> SubmitBounded(TransTask::Type type, Detail::TaskDesc task)
     {
+        auto status = CheckPackedTask(task);
+        if (status.Failure()) { return status; }
         TransTask prepared{type, std::move(task)};
         if (type == TransTask::Type::LOAD && !prepared.desc.loadReservations.empty()) {
             prepared.loadHandles = early_->LoadHandles(prepared.desc);

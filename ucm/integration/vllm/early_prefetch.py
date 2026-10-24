@@ -684,7 +684,7 @@ class EarlyWorker:
         return 1 + (now - batch.entered) / max(batch.reservation["remaining_l2_work"], 1)
 
     def _choose(self, round_keys):
-        # Condition held; one pending batch per request participates in bounded
+        # Condition held; one pending batch per request participates in
         # HRRN selection. A request gets one quantum before any repeat while
         # another eligible request has not had a turn.
         self.preparing = [item for item in self.preparing

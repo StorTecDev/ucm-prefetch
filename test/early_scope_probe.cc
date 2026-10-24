@@ -7,7 +7,7 @@ extern "C" StoreV1* MakeCacheStore();
 static void OrdinaryPathsRemainUniform()
 {
     PackedFixture packed;
-    PosixStore rejected;
+    UC::PosixStore::PosixStore rejected;
     Require(rejected.Setup(packed.config).Failure(), "ordinary Posix rejects packed layout");
 
     Detail::Dictionary config;
@@ -23,7 +23,7 @@ static void OrdinaryPathsRemainUniform()
     config.SetNumber("posix_open_concurrency", 1);
     config.SetNumber("posix_commit_concurrency", 1);
     config.SetNumber("data_dir_shard_bytes", 0);
-    PosixStore ordinary;
+    UC::PosixStore::PosixStore ordinary;
     Require(ordinary.Setup(config).Success(), "ordinary store setup");
     Require(!ordinary.SupportsFullBlockRead() && ordinary.PackedLayerBytes(0) == 0,
             "ordinary store has no Early layout capability");
@@ -74,10 +74,38 @@ static void OrdinaryPathsRemainUniform()
     std::cout << "PASS ordinary layerwise bytes and original layout, Early-only option rejection\n";
 }
 
+
+static void PackedLeaseProtectsDeletion()
+{
+    PackedFixture fixture;
+    UC::PosixStore::Config config;
+    config.storageBackends = {fixture.path};
+    config.dataDirShardBytes = 0;
+    config.layerBytes.assign(fixture.lengths.begin(), fixture.lengths.end());
+    config.acquireRemoveGuard = PosixReadLease::AcquireRemoveGuard;
+    Require(PreparePackedNamespace(config).Success(), "packed GC namespace");
+    SpaceLayout layout;
+    Require(layout.Setup(config).Success(), "packed deletion layout");
+    const auto file = layout.DataFilePath(fixture.block, false);
+    Require(std::filesystem::exists(file), "GC and store resolve the same packed file");
+    auto first = fixture.store->AcquireReadLease(&fixture.block, 1);
+    auto second = fixture.store->AcquireReadLease(&fixture.block, 1);
+    Require(first && second, "independent packed read leases");
+    Require(layout.RemoveFile(fixture.block) == Status::Retry(), "GC blocked by live readers");
+    first.Value().reset();
+    Require(layout.RemoveFile(fixture.block) == Status::Retry(), "second reader remains protected");
+    Require(std::filesystem::exists(file), "protected packed bytes remain present");
+    second.Value().reset();
+    Require(layout.RemoveFile(fixture.block).Success(), "GC deletes after final release");
+    Require(!std::filesystem::exists(file), "packed deletion completed");
+    std::cout << "PASS packed namespace read leases protect actual unlink until final release\n";
+}
+
 int main()
 {
     try {
         OrdinaryPathsRemainUniform();
+        PackedLeaseProtectsDeletion();
         return PackedProbeMain();
     } catch (const std::exception& error) {
         std::cerr << "FAIL scope: " << error.what() << '\n';

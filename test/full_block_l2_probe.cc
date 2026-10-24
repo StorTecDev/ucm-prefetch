@@ -19,7 +19,7 @@ static void Require(bool ok, const char* why)
 }
 
 struct Fixture {
-    static constexpr size_t layerBytes = 4096;
+    inline static size_t layerBytes = 4096;
     static constexpr size_t layers = 14;
     std::string path;
     Detail::BlockId block{};
@@ -407,9 +407,11 @@ static void ShortReadFailsWholeBlock()
     Require(bool(task) && f.store.Wait(task.Value()) == Status::NotFound(), "short block rejected");
 }
 
-int main()
+int main(int argc, char** argv)
 {
     try {
+        if (argc > 1) { Fixture::layerBytes = std::stoull(argv[1]); }
+        Require(Fixture::layerBytes == 4096 || Fixture::layerBytes == 86016, "validated probe stride");
         FullRead(false);
         FullRead(true);
         TimeoutRetainsVectors();

@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -78,6 +79,8 @@ public:
     struct OpenResult {
         int32_t fd;
         int32_t error;
+        // Held through physical I/O completion, or terminal open/submit failure.
+        std::shared_ptr<void> writePermit{};
     };
     using OpenCallback = std::function<void(OpenResult)>;
     struct OpenTask {
@@ -107,9 +110,11 @@ public:
             if (worker.joinable()) { worker.join(); }
         }
     }
-    void Setup(const SpaceLayout* layout, const size_t nOpenWorker, const size_t nCommitWorker)
+    void Setup(const SpaceLayout* layout, const size_t nOpenWorker, const size_t nCommitWorker,
+               size_t writeInflightLimit = 0)
     {
         layout_ = layout;
+        writeInflightLimit_ = writeInflightLimit;
         for (size_t i = 0; i < nOpenWorker; ++i) {
             workers_.push_back(std::thread{[this] { OpenWorkerLoop(); }});
         }
@@ -121,7 +126,14 @@ public:
     {
         auto& q = openQueue_;
         std::lock_guard<std::mutex> lock{q.mutex};
-        q.queue.splice(q.queue.end(), tasks);
+        if (writeInflightLimit_ == 0) {
+            q.queue.splice(q.queue.end(), tasks);
+        } else {
+            while (!tasks.empty()) {
+                auto& target = tasks.front().activated ? q.queue : readQueue_;
+                target.splice(target.end(), tasks, tasks.begin());
+            }
+        }
         q.cv.notify_all();
     }
     void Submit(CommitTask&& task)
@@ -136,12 +148,13 @@ public:
         std::list<OpenTask> purged;
         {
             std::lock_guard<std::mutex> lock{openQueue_.mutex};
-            auto& q = openQueue_.queue;
-            for (auto it = q.begin(); it != q.end();) {
-                if (it->tag == tag) {
-                    purged.splice(purged.end(), q, it++);
-                } else {
-                    ++it;
+            for (auto* queue : {&openQueue_.queue, &readQueue_}) {
+                for (auto it = queue->begin(); it != queue->end();) {
+                    if (it->tag == tag) {
+                        purged.splice(purged.end(), *queue, it++);
+                    } else {
+                        ++it;
+                    }
                 }
             }
         }
@@ -163,13 +176,38 @@ private:
         constexpr const auto mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
         for (;;) {
             OpenTask task;
+            std::shared_ptr<void> writePermit;
             {
                 std::unique_lock<std::mutex> lock{openQueue_.mutex};
-                openQueue_.cv.wait(lock, [this] { return stop_ || !openQueue_.queue.empty(); });
+                auto writeEligible = [this] {
+                    return !openQueue_.queue.empty() &&
+                        (writeInflightLimit_ == 0 || writesInFlight_ < writeInflightLimit_);
+                };
+                openQueue_.cv.wait(lock, [&] {
+                    return stop_ || !readQueue_.empty() || writeEligible();
+                });
                 if (stop_) { break; }
-                if (openQueue_.queue.empty()) { continue; }
-                task = std::move(openQueue_.queue.front());
-                openQueue_.queue.pop_front();
+                // Read preference with bounded service fairness: an eligible
+                // write is selected after at most 16 read dequeues. Blocked
+                // writes never occupy open workers needed to submit reads.
+                const bool useRead = !readQueue_.empty() &&
+                    (!writeEligible() || readsSinceWrite_ < 16);
+                auto& queue = useRead ? readQueue_ : openQueue_.queue;
+                task = std::move(queue.front());
+                queue.pop_front();
+                if (useRead) {
+                    if (readsSinceWrite_ < 16) { ++readsSinceWrite_; }
+                } else {
+                    readsSinceWrite_ = 0;
+                    if (writeInflightLimit_ != 0) {
+                        ++writesInFlight_;
+                        writePermit = std::shared_ptr<void>(this, [this](void*) {
+                            std::lock_guard<std::mutex> guard{openQueue_.mutex};
+                            --writesInFlight_;
+                            openQueue_.cv.notify_all();
+                        });
+                    }
+                }
             }
             const auto path = layout_->DataFilePath(task.id, task.activated);
 #ifdef UCM_ENABLE_TEST_HOOKS
@@ -179,7 +217,7 @@ private:
             auto fd = ::open(path.c_str(), task.flags, mode);
 #endif
             auto err = (fd < 0) ? errno : 0;
-            if (task.callback) { task.callback(OpenResult{fd, err}); }
+            if (task.callback) { task.callback(OpenResult{fd, err, std::move(writePermit)}); }
         }
     }
     void CommitWorkerLoop()
@@ -213,6 +251,11 @@ private:
     const SpaceLayout* layout_;
     std::list<std::thread> workers_;
     TaskQueue<OpenTask> openQueue_;
+    // Protected by openQueue_.mutex; legacy FIFO remains unchanged when disabled.
+    std::list<OpenTask> readQueue_;
+    size_t writeInflightLimit_{0};
+    size_t writesInFlight_{0};
+    size_t readsSinceWrite_{0};
     TaskQueue<CommitTask> commitQueue_;
 };
 

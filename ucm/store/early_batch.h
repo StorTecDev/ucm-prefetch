@@ -14,7 +14,11 @@ struct Progress {
     bool advanced{false};
     bool canSubmit{true};
     bool discarded{false};  // explicit suffix retirement, after drain; not an I/O failure
+    // I/O credit still charged, not retained buffer bytes. Completed reads may
+    // return credit before their task is reaped; pins/lease remain protected.
     size_t inflightBytes{0};
+    // Credit can be zero before Check/Wait has reaped the native tasks.
+    size_t pendingReadTasks{0};
     size_t remainingL2Work{0};
     size_t completedReadBytes{0};
     PrefetchResult result{};

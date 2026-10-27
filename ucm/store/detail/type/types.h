@@ -25,6 +25,8 @@
 #define UNIFIEDCACHE_STORE_DETAIL_TYPE_TYPES_H
 
 #include <array>
+#include <atomic>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -54,6 +56,13 @@ struct Shard {
     std::vector<void*> addrs; /* Tensor or host-slice addresses */
 };
 
+// I/O budget only; retired bytes do not imply success, READY or task reaping.
+// Each read retires once after physical completion or a terminal pre-submit failure.
+// Backends without progress retain whole-task accounting.
+struct ReadProgress {
+    std::atomic<size_t> retiredBytes{0};
+};
+
 /**
  * @brief Batch descriptor for load or dump operations.
  *
@@ -69,7 +78,9 @@ struct TaskDesc : std::vector<Shard> {
     std::vector<uint64_t> loadReservations;
     // Each entry maps a complete file to layer destinations. Null destinations
     // discard already cached/peer-owned slices without overwriting live data.
+    // A single non-null address denotes a contiguous complete-file destination.
     bool fullBlockRead{false};
+    std::shared_ptr<ReadProgress> readProgress;
 };
 
 }  // namespace UC::Detail

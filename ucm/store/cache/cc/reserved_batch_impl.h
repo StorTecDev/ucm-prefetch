@@ -23,11 +23,25 @@ class ReservedPrefetch::Batch final : public Early::Batch {
         Detail::TaskHandle handle{0};
         std::vector<size_t> owners;
         size_t bytes{0};
+        std::shared_ptr<Detail::ReadProgress> progress;
+        size_t creditedBytes{0};
     };
     std::deque<Transfer> transfers_;
 
     void Fail(Status status)
     { if (status_.Success() && status.Failure()) { status_ = std::move(status); } }
+
+    void ReclaimCredit(Transfer& transfer)
+    {
+        // Budget accounting only: Check + Wait still synchronize data and pins.
+        const auto retired = std::min(transfer.bytes,
+            transfer.progress->retiredBytes.load(std::memory_order_relaxed));
+        if (retired > transfer.creditedBytes) {
+            progress_.inflightBytes -= retired - transfer.creditedBytes;
+            transfer.creditedBytes = retired;
+            progress_.advanced = true;
+        }
+    }
 
     void Complete(Reservation& r)
     {
@@ -38,10 +52,11 @@ class ReservedPrefetch::Batch final : public Early::Batch {
         auto status = CompleteEarlyRead(*owner_.backend_, transfer.handle, transfer.owners,
             [&](size_t index) -> TransBuffer::Handle& { return r.Pin(index, owner_.shardsPerBlock_); });
         if (status.Success()) { progress_.completedReadBytes += transfer.bytes; }
-        progress_.inflightBytes -= transfer.bytes;
+        progress_.inflightBytes -= transfer.bytes - transfer.creditedBytes;
         progress_.remainingL2Work -= std::min(progress_.remainingL2Work, transfer.owners.size());
         stats_->lastIoNs = EarlyStats::NowNs();
         transfers_.pop_front();
+        --progress_.pendingReadTasks;
         progress_.advanced = true;
         Fail(status);
     }
@@ -126,6 +141,9 @@ class ReservedPrefetch::Batch final : public Early::Batch {
             EarlyBufferPins::ReleaseEpoch(*owner_.buffer_) != progress_.waitEpoch;
         if (r->cancelled.load()) { Fail(Status::Error("reserved prefetch cancelled")); }
         if (!healthy_()) { Fail(Status::StoreUnhealthy()); }
+        // A slow task at the FIFO head must not hide completed read credit in
+        // later tasks. Resource reaping and READY retain their original order.
+        for (auto& transfer : transfers_) { ReclaimCredit(transfer); }
         while (!transfers_.empty()) {
             if (blocking && status_.Success() && !discard_ && progress_.inflightBytes < windowBytes &&
                 cursor_ < prefixShards_) { break; }
@@ -215,7 +233,8 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                         : owners.size() * owner_.shardBytes_;
                     const auto readShards = task.fullBlockRead
                         ? task.size() * owner_.shardsPerBlock_ : owners.size();
-                    transfers_.push_back({0, std::move(owners), readBytes});
+                    task.readProgress = std::make_shared<Detail::ReadProgress>();
+                    transfers_.push_back({0, std::move(owners), readBytes, task.readProgress, 0});
                     active_ = r;
                     auto& transfer = transfers_.back();
                     if (stats_->firstIoMs < 0) { stats_->firstIoMs = EarlyStats::Milliseconds(stats_->elapsed); }
@@ -226,6 +245,7 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                     if (!result) { transfers_.pop_back(); Fail(result.Error()); }
                     else {
                         transfer.handle = result.Value();
+                        ++progress_.pendingReadTasks;
                         const auto bytes = transfer.bytes;
                         progress_.result.l2ReadShards += readShards;
                         progress_.result.l2ReadBytes += bytes;

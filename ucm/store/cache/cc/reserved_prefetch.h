@@ -277,7 +277,8 @@ public:
         std::vector<TransBuffer::Handle> handles;
         for (size_t i = 0; i < task.size(); ++i) {
             const auto& shard = task[i];
-            if (shard.index >= shardsPerBlock_) { continue; }
+            const auto logicalLayers = buffer_->WholeBlock() ? buffer_->LayerCount() : shardsPerBlock_;
+            if (shard.index >= logicalLayers) { continue; }
             if (!previous || *previous != shard.owner) {
                 previous = &shard.owner;
                 auto [slot, inserted] = selected.try_emplace(shard.owner);
@@ -296,10 +297,11 @@ public:
                 group = slot->second;
             }
             if (!group) { continue; }
-            const auto& pin = group->pins[shard.index];
+            const auto& pin = group->pins[buffer_->WholeBlock() ? 0 : shard.index];
             if (!pin || !pin.Ready()) { continue; }
             if (handles.empty()) { handles.resize(task.size()); }
-            handles[i] = pin;  // native node reference, held until H2D completes
+            handles[i] = buffer_->WholeBlock() ? pin.LayerView(shard.index) : pin;
+            // The entire block remains referenced until this layer H2D completes.
             ++stats.matched;
         }
         stats.success = true;

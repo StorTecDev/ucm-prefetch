@@ -238,12 +238,22 @@ def test_pending_long_read_does_not_block_another_request(worker):
     worker.store.prefetch_reserved.assert_not_called()  # no synchronous whole-job waits
 
 
-def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker):
+@pytest.mark.parametrize("request_first", [False, True])
+@pytest.mark.parametrize("minimum", [1, 16])
+def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker, request_first, minimum):
+    worker.request_first = request_first
+    worker.min_submit_reads = minimum
     gates = [threading.Event(), threading.Event()]
     submitted = []
     capabilities = [Capability(4, submit=lambda i=i: submitted.append(i), gate=gates[i])
                     for i in range(2)]
-    worker.store.release_reservation.side_effect = lambda handle: setattr(capabilities[handle - 1], "cancelled", True)
+    def release(handle):
+        cap = capabilities[handle - 1]
+        cap.cancelled = True
+        if not cap.pending:  # An unstarted reservation has no physical I/O to drain.
+            cap.protected_bytes = 0
+            cap.drained.set()
+    worker.store.release_reservation.side_effect = release
     with worker.condition:
         for i, cap in enumerate(capabilities):
             enqueue(worker, str(i), i + 1, cap, age=20 - i)
@@ -257,7 +267,7 @@ def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker):
         closer.start()
         wait(lambda: all(cap.cancelled for cap in capabilities))
         assert closer.is_alive()
-        assert all(cap.protected_bytes for cap in capabilities)
+        assert all(cap.protected_bytes for cap in capabilities if cap.pending)
         assert len(submitted) == 2
     finally:
         for gate in gates:
@@ -411,3 +421,201 @@ def test_real_io_error_in_discarded_tail_is_failure_not_successful_capacity(work
     finally:
         first_gate.set()
         tail_gate.set()
+
+
+@pytest.mark.parametrize("first_work, expected", [(4, ["first", "first"]), (1, ["first", "next"])])
+def test_request_first_fills_window_and_backfills_unfinished_tail(worker, first_work, expected):
+    first_gate, next_gate = threading.Event(), threading.Event()
+    submitted = []
+    first = Capability(first_work, submit=lambda: submitted.append("first"), gate=first_gate)
+    next_cap = Capability(4, submit=lambda: submitted.append("next"), gate=next_gate)
+    with worker.condition:
+        worker.request_first = True
+        a, _ = enqueue(worker, "first", 1, first)
+        b, _ = enqueue(worker, "next", 2, next_cap)
+        a.entered, b.entered = 1, 2
+        worker.condition.notify_all()
+    try:
+        wait(lambda: first.pending + next_cap.pending == 2)
+        time.sleep(.02)
+        assert submitted == expected
+        assert not a.ready and not b.ready
+        first_gate.set()
+        wait(lambda: a.ready)
+        assert not b.ready  # READY can publish while the backfilled request drains.
+        assert first.pending + next_cap.pending <= 2
+    finally:
+        first_gate.set()
+        next_gate.set()
+    wait(lambda: a.ready and b.ready)
+
+
+def test_request_first_capacity_wait_backfills_and_resumes(worker):
+    released, next_gate = threading.Event(), threading.Event()
+    class CapacityWait(Capability):
+        def step(self, available):
+            if not released.is_set():
+                self.steps += 1
+                return dict(done=False, advanced=False, inflight_bytes=0, can_submit=False,
+                            remaining_l2_work=self.work, waiting_capacity=True, wait_epoch=0)
+            return super().step(available)
+    first = CapacityWait(1)
+    later = Capability(4, gate=next_gate)
+    with worker.condition:
+        worker.request_first = True
+        a, batch = enqueue(worker, "first", 1, first)
+        b, _ = enqueue(worker, "next", 2, later)
+        a.entered, b.entered = 1, 2
+        worker.condition.notify_all()
+    try:
+        wait(lambda: batch.waiting_capacity and later.pending == 2)
+        assert not a.ready and not b.ready and first.reads == 0
+        released.set()
+        next_gate.set()
+        with worker.condition:
+            worker.release_serial += 1
+            worker.condition.notify_all()
+        wait(lambda: a.ready and b.ready)
+        assert not batch.waiting_capacity and first.reads == 1
+    finally:
+        released.set()
+        next_gate.set()
+
+
+def test_request_first_orders_batches_and_skips_resource_blocked_jobs(worker):
+    with worker.condition:
+        worker.request_first = True
+        a, first = enqueue(worker, "first", 1, Capability(3))
+        b, other = enqueue(worker, "next", 2, Capability(3))
+        a.entered, b.entered = 1, 2
+        second = early.WorkerBatch(1, 32, result(3, 32, 3))
+        a.batches.append(second)
+        worker.preparing.insert(0, (a, second))
+        worker._choose({"next"})
+        assert worker.selected == [(a, first)]
+        worker.selected.clear()
+        first.waiting_capacity, first.can_submit = True, False
+        worker.preparing.append((a, first))
+        worker._choose(set())
+        assert worker.selected == [(b, other)]
+        worker.selected.clear()
+        first.waiting_capacity, first.done = False, True
+        worker._choose(set())
+        assert worker.selected == [(a, second)]
+        worker.preparing.clear()
+        worker.selected.clear()
+
+
+def test_request_first_config_rejects_non_boolean_before_starting_threads():
+    with pytest.raises(ValueError, match="early_prefetch_request_first must be a boolean"):
+        early.EarlyWorker(SimpleNamespace(store=Mock(), launch_config={"early_prefetch_request_first": "true"}), Control)
+
+
+def test_returned_credit_does_not_hide_pending_task_from_completion_polling(worker, monkeypatch):
+    """Credit can reach zero before the last callback publishes task completion."""
+    finish, observed = threading.Event(), threading.Event()
+    waits = []
+
+    class CreditReturned(Capability):
+        def step(self, available):
+            self.steps += 1
+            done = finish.is_set()
+            return dict(done=done, advanced=self.steps == 1 or done,
+                        inflight_bytes=0, pending_read_tasks=0 if done else 1,
+                        can_submit=False, waiting_capacity=not done, wait_epoch=0,
+                        remaining_l2_work=0 if done else 1, l2_read_bytes=1,
+                        completed_read_bytes=1 if done else 0,
+                        total_hit_blocks=1, capacity_truncated=False)
+
+    cap = CreditReturned(1)
+    original_wait = worker.condition.wait
+
+    def record_wait(timeout=None):
+        if cap.steps and not finish.is_set():
+            waits.append(timeout)
+            observed.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(worker.condition, "wait", record_wait)
+    worker.store.reserve_prefix.return_value = dict(
+        handle=1, total_hit_blocks=1, remaining_l2_work=1, batch=cap)
+    worker.receive(dict(op="reserve", key="credit", blocks=blocks(1)))
+    try:
+        assert observed.wait(1)
+        assert waits[0] == .001  # Never take the two-second capacity-only sleep.
+    finally:
+        with worker.condition:
+            finish.set()
+            worker.condition.notify_all()
+        wait(lambda: worker.jobs["credit"].ready)
+        worker.receive(dict(op="release", key="credit"))
+
+
+@pytest.mark.parametrize("flush", ["threshold", "deadline"])
+def test_completed_credit_is_coalesced_but_bounded_in_time(worker, monkeypatch, flush):
+    clock, submissions = [10.0], []
+    drain = threading.Event()
+    class GroupedCapability(Capability):
+        window_bytes = 8
+        def __init__(self):
+            super().__init__(32)
+            self.retired = 0
+        def step(self, available):
+            self.steps += 1
+            if drain.is_set():
+                self.pending = self.work = 0
+            retired, self.retired = self.retired, 0
+            self.pending -= retired
+            self.work -= retired
+            count = min(available, self.work - self.pending)
+            if count:
+                self.pending += count
+                self.reads += count
+                submissions.append(count)
+            return dict(done=self.work == 0, advanced=bool(retired or count),
+                        inflight_bytes=self.pending, can_submit=self.work > self.pending,
+                        remaining_l2_work=self.work, total_hit_blocks=self.hit,
+                        l2_read_bytes=self.reads, l2_read_shards=self.reads,
+                        capacity_truncated=False)
+    monkeypatch.setattr(early, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], monotonic_ns=time.monotonic_ns))
+    cap = GroupedCapability()
+    with worker.condition:
+        worker.request_first = True
+        worker.min_submit_reads, worker.submit_max_wait_ms = 4, 2
+        job, batch = enqueue(worker, "coalesce", 1, cap)
+        worker.condition.notify_all()
+    try:
+        wait(lambda: submissions == [8])
+        cap.retired = 1
+        wait(lambda: batch.inflight_bytes == 7)
+        time.sleep(.01)
+        assert submissions == [8]  # One retired unit is not a new tiny task.
+        if flush == "threshold":
+            cap.retired = 3
+            expected = 4
+        else:
+            clock[0] += .003
+            expected = 1
+        with worker.condition:
+            worker.condition.notify_all()
+        wait(lambda: len(submissions) == 2)
+        assert submissions == [8, expected]
+        assert cap.pending <= cap.window_bytes
+    finally:
+        drain.set()
+        with worker.condition:
+            worker.condition.notify_all()
+        wait(lambda: job.ready)
+
+
+@pytest.mark.parametrize("config", [
+    {"early_prefetch_min_submit_reads": 0},
+    {"early_prefetch_min_submit_reads": 65},
+    {"early_prefetch_min_submit_reads": True},
+    {"early_prefetch_submit_max_wait_ms": 0},
+    {"early_prefetch_submit_max_wait_ms": float("nan")},
+])
+def test_invalid_coalescing_config_rejected_before_threads(config):
+    with pytest.raises(ValueError, match="early_prefetch_"):
+        early.EarlyWorker(SimpleNamespace(store=Mock(), launch_config=config), Control)

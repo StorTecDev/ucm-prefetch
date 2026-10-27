@@ -23,6 +23,17 @@ public:
     Status Submit(TransBuffer& buffer, const Detail::Shard& shard,
                   const TransBuffer::Handle& requested, size_t shardsPerBlock)
     {
+        if (buffer.WholeBlock()) {
+            pins_.push_back(requested.WholeView());
+            owners_.push_back(0);
+            Detail::TaskDesc task{Detail::Shard{shard.owner, 0, {pins_[0].Data()}}};
+            task.fullBlockRead = true;
+            task.brief = "FullBlockL2ToL1";
+            auto read = backend_.Load(std::move(task));
+            if (!read) { return read.Error(); }
+            handle_ = read.Value();
+            return Status::OK();
+        }
         pins_.resize(shardsPerBlock);
         Detail::Shard block{shard.owner, 0, std::vector<void*>(shardsPerBlock, nullptr)};
         for (size_t i = 0; i < shardsPerBlock; ++i) {

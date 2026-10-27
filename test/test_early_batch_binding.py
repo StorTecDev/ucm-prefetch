@@ -21,7 +21,8 @@ from ucm.integration.vllm.early_consumer import Consumer, load_scope
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-def test_native_pipeline_batch_keeps_store_alive_and_hands_off_before_release(tmp_path, deferred):
+@pytest.mark.parametrize("block_l1", [False, True])
+def test_native_pipeline_batch_keeps_store_alive_and_hands_off_before_release(tmp_path, deferred, block_l1):
     store_dir = Path(native.__file__).resolve().parent.parent
     shard_bytes, shards = 4096, 128
     config = dict(storage_backends=[str(tmp_path)], device_id=0,
@@ -35,6 +36,8 @@ def test_native_pipeline_batch_keeps_store_alive_and_hands_off_before_release(tm
     ids = np.frombuffer(block * shards, dtype=np.uint8)
     indexes = array.array("Q", range(shards))
     source = np.arange(shards * shard_bytes, dtype=np.uint8).reshape(shards, shard_bytes)
+    if block_l1:
+        source ^= np.arange(shards, dtype=np.uint8)[:, None]
     addresses = np.array([[row.ctypes.data] for row in source], dtype=np.uint64)
     seed = native.PipelineStore()
     seed.Stack("Posix", str(store_dir / "posix/libposixstore.so"), config)
@@ -43,6 +46,9 @@ def test_native_pipeline_batch_keeps_store_alive_and_hands_off_before_release(tm
     del seed
 
     pipeline = native.PipelineStore()
+    if block_l1:
+        config.update(posix_io_engine="aio", io_direct=True,
+                      cache_full_block_load=True, cache_full_block_l1=True)
     pipeline.Stack("EarlyPosix", str(store_dir / "posix/libposixstore.so"), config)
     pipeline.Stack("EarlyCache", str(store_dir / "cache/libcachestore.so"),
                    dict(config, unique_id=uuid.uuid4().hex,
@@ -54,9 +60,13 @@ def test_native_pipeline_batch_keeps_store_alive_and_hands_off_before_release(tm
     domain = native.EarlyDomainInfo(pipeline)
     assert domain["backing"] == ""  # private buffer must never pass owner handshake
     assert domain["block_bytes"] == shards * shard_bytes
+    assert domain["shard_bytes"] == (shards * shard_bytes if block_l1 else shard_bytes)
+    assert domain["consumer_shard_bytes"] == shard_bytes
+    assert domain["consumer_block_bytes"] == shards * shard_bytes
+    assert domain["full_block_l1"] is block_l1
     cold = native.EarlyReservePrefix(pipeline, one_id, deferred)
     assert cold["total_hit_blocks"] == 1
-    assert cold["remaining_l2_work"] == shards
+    assert cold["remaining_l2_work"] == (1 if block_l1 else shards)
     batch = cold["batch"]
     if deferred:
         assert batch.protected_bytes == 0
@@ -74,7 +84,7 @@ def test_native_pipeline_batch_keeps_store_alive_and_hands_off_before_release(tm
         time.sleep(.001)
     assert progress["done"]
     assert progress["remaining_l2_work"] == 0
-    assert progress["l2_read_shards"] == shards
+    assert progress["l2_read_shards"] == (1 if block_l1 else shards)
     assert progress["l2_read_bytes"] == shards * shard_bytes
     assert batch.snapshot()["completed_read_bytes"] == shards * shard_bytes
     assert batch.protected_bytes == shards * shard_bytes

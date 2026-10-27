@@ -33,8 +33,11 @@ struct PackedFixture {
 
     explicit PackedFixture(const std::string& engine = "aio", size_t timeout = 5000)
     {
-        auto pattern = std::string("/tmp/ucm-packed-probe-") + std::to_string(getpid()) + "-XXXXXX";
-        path = mkdtemp(pattern.data());
+        auto pattern = (std::filesystem::temp_directory_path() /
+                        ("ucm-packed-probe-" + std::to_string(getpid()) + "-XXXXXX")).string();
+        auto* directory = mkdtemp(pattern.data());
+        Require(directory != nullptr, "temporary directory");
+        path = directory;
         block[0] = std::byte{71};
         for (size_t i = 0; i < 14; ++i) {
             const bool indexed = i < 3 || i == 6 || i == 10;
@@ -136,8 +139,11 @@ static void PackedRead(bool partial, const std::string& writer)
         ++ops;
         return static_cast<int32_t>(syscall(SYS_io_submit, ctx, nr, cb));
     });
-    auto read = reader.Load(f.Read(partial));
+    auto desc = f.Read(partial);
+    auto progress = desc.readProgress = std::make_shared<Detail::ReadProgress>();
+    auto read = reader.Load(std::move(desc));
     Require(read && reader.Wait(read.Value()).Success(), "packed full read");
+    Require(progress->retiredBytes == 1093632, "packed disk bytes returned, not L1 bytes");
     Require(ops == 1, "single physical read");
     f.Verify(partial);
     TestHooks::ClearAioHooks();

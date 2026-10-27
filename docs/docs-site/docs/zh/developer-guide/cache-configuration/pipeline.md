@@ -17,7 +17,7 @@ ucm_connectors:
       store_pipeline: "Cache|Posix"
       store_health:
         enabled: true
-      storage_backends: "/mnt/ucm-cache"
+      storage_backends: "./ucm-cache"
       io_direct: false
       # cache_buffer_capacity_gb: 256
       # posix_capacity_gb: 1024
@@ -142,14 +142,36 @@ ucm_connectors:
 读取。它不会为 layerwise connector 启用请求级异步加载。整块读取要求使用 Early Posix
 AIO 后端，每个 block 的层数不超过 `IOV_MAX`，均匀主机 block 不超过 `UINT32_MAX` 字节。
 
-一次 `IOCB_CMD_PREADV` 直接填充缺失层的缓冲区。已缓存或由其他任务持有写入所有权的层，
+默认逐层 L1 模式通过一次 `IOCB_CMD_PREADV` 直接填充缺失层的缓冲区。已缓存或由其他任务持有写入所有权的层，
 使用私有 scratch 接收对应数据，避免覆盖活跃内容。H2D 仍只搬运请求的当前层；L1 节点、
 张量偏移和淘汰单位保持逐层组织。没有启用紧凑布局时，磁盘 padding 和 dump 格式也保持不变。
+
+### 整块 L1 与逐层 H2D { #whole-block-l1-with-layerwise-h2d }
+
+同时设置 `cache_full_block_l1: true` 与 `cache_full_block_load: true`，可让每个 block
+使用一个连续 L1 缓冲区，并发起一次 `IOCB_CMD_PREAD`。继续保留 `use_layerwise: true`：
+H2D 按原有逐层队列、事件和张量偏移消费该整块内存的各层视图，不增加中间整块缓冲区或 CPU 拷贝。
+
+该选项默认关闭，仅用于 Early 整块读取路径。启用 packed L2 时，L1 使用相同的层长度前缀和
+与物理 block 大小；每层内部张量偏移不变。任一层的 H2D 引用都会保留整个 native 节点，
+预取 pin 和淘汰以整块为单位。原有逐层 D2H/dump 独立填充各层视图，全部层完成后才发布整块
+L1 命中。整块读取不会覆盖仍在工作的逐层写入者。
+
+`cache_buffer_capacity_gb` 仍限制物理 L1 字节数。该模式下
+`cache_load_exclusive_buffer_number` 按整块节点计数，预留容量与 owner 资格也按物理整块计算。
+native domain 分别报告物理 `shard_bytes`/`block_bytes` 和逻辑消费布局
+`consumer_shard_bytes`/`consumer_block_bytes`。Early 的 L2 shard 统计每 block 计一个物理
+读取单元，H2D 统计仍按层计数。
+
+切换此选项需要重编所有 native 库并重启共享域。整块 L1 使用共享布局版本 4 和 owner 协议
+版本 10，原有逐层 L1 保持共享布局版本 3。`test/block_l1_probe.cc` 覆盖真实 PREAD、packed
+层视图、逐层 H2D 顺序、逐层回存、取消、短读和共享布局兼容性。
 
 ### 紧凑 L2 布局 { #packed-l2-layout }
 
 `posix_packed_layer_bytes` 是 `ucm_connector_config` 内的可选整数列表，按层顺序指定
-每层的物理磁盘长度，同时保留原有均匀 L1 槽位。不设置时使用均匀磁盘布局；系统不会自动
+每层的物理磁盘长度。默认 L1 保留均匀逐层槽位，整块 L1 使用上述 packed 层偏移。
+不设置时使用均匀磁盘布局；系统不会自动
 根据模型生成这个列表。
 
 在 Early `Cache|Posix` 管线中，紧凑布局必须满足以下条件：
@@ -172,7 +194,8 @@ AIO 后端，每个 block 的层数不超过 `IOV_MAX`，均匀主机 block 不�
 
 Early 每次最多提交 64 个读取单元，在途窗口为 128 个读取单元。整块 I/O 预算、成功读取
 字节计账和 Posix 容量/GC 使用实际磁盘 block 大小；启用紧凑布局时即长度列表之和。L1
-预留和容量仍按均匀逐层 shard 槽位计算，紧凑存储不会扩大 L1 或设备缓存容量。
+在默认模式下按均匀逐层 shard 槽位计费；整块 L1 按实际物理 block 大小计费，
+配置的 L1 总字节容量保持不变。
 
 读取计账包括读入 scratch 后丢弃的范围。部分命中可能增加读取字节和临时内存，容量压力
 或并发所有权可能导致重复读取。一次 AIO 请求不保证一次物理设备命令。已提交读取会保留
@@ -186,3 +209,39 @@ Early 每次最多提交 64 个读取单元，在途窗口为 128 个读取单�
 owner 协议均有变化，不得混用新旧库或 worker。通用测试位于
 `test/test_early_packed_layout.py`、`test/full_block_l2_probe.cc`、
 `test/packed_l2_probe.cc` 和 `test/early_scope_probe.cc`。
+
+连接器顶层配置 `early_prefetch_request_first: true` 可优先读取最早且可提交的请求；
+默认为 `false`，保留原 HRRN 轮转。单个请求内部仍在全局字节窗口内并发读取。
+其剩余读取全部提交后，下一个请求可在尾部尚未完成时使用空余额度；查询、激活或
+容量等待也允许其他请求补位，等待解除后重新判断优先级。READY 仍要求该请求所有
+批次完成。原生读取批量和 L1 到设备的 layerwise 复制保持不变。大请求可能推迟
+后来的请求；此选项本身不保证提升设备带宽，也不保证文件在磁盘上物理连续。
+
+已完成 AIO 读取现在会在整个 task 回收前归还其请求字节数对应的 I/O 额度。
+该计数只用于读取准入；pin、lease、错误状态与 READY 仍按原有 Check/Wait
+完成边界处理，task 仍按 FIFO 回收。短读或提交前的终止失败会退额度，但不表示数据成功。
+
+连接器可设置 `early_prefetch_min_submit_reads: 16` 与
+`early_prefetch_submit_max_wait_ms: 2` 对补充提交合批。空余额度不足阈值时继续
+轮询完成，到期后的下一次执行器调度即提交；没有在途 I/O 时立即填充。
+阈值自动限制在全局窗口以内，小 owner 配额不会因此死锁。默认最小提交数为 1
+（不合批）；允许 1–64 块及 (0, 10] ms。期限是调度期限，并非操作系统抢占下的
+实时保证。即使 I/O 额度已归零，仍需及时回收尚未结束的原生任务并保留其引用。
+
+### 后台 AIO 写入窗口 { #bounded-background-aio-writes }
+
+在 `ucm_connector_config` 内设置 `posix_write_inflight_limit`，可限制从出队、打开
+文件之前到物理 I/O 完成或打开/提交终止失败期间的并发写操作数。默认 `0` 保留共享
+FIFO；1–4096 要求 `posix_io_engine: aio`。额度按 I/O 操作数计算，不按字节或整个
+回存任务计算，作用范围是当前 Posix AIO 引擎。
+
+启用后，读取使用独立队列，可绕过等待写入额度的任务。所有 open worker 合计每取出
+最多 16 个读取任务，就会选择一个具有可用额度的写任务。这是出队公平性，不是耗时
+保证。已接受写入的额度保留到物理完成，包括无法取消的 I/O。取消排队任务不消耗
+额度；打开、提交或短写失败会归还额度，但不会报告成功持久化。pin、读取 READY、
+lease 和写入提交语义保持不变。
+
+该选项可独立于整块 L1、请求优先调度及补充提交合批使用，不改变逐层 H2D。
+过小的上限可能降低纯写吞吐，应同时评估端到端延迟、写入积压和排空耗时及读取
+吞吐。`test/write_window_probe.cc` 覆盖并发上限、读取绕过、补充及排空、失败和
+取消、公平性以及关闭时的 FIFO 行为。

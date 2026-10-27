@@ -8,6 +8,9 @@ namespace UC::Early {
 struct Domain {
     std::string backing;
     size_t nodes{0}, reservable{0}, shardBytes{0}, blockBytes{0}, diskBlockBytes{0};
+    // Consumer layer geometry is distinct from physical whole-block L1 nodes.
+    size_t consumerShardBytes{0}, consumerBlockBytes{0};
+    bool fullBlockL1{false};
 };
 class DomainProvider {
 public:

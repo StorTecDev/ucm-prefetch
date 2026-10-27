@@ -376,6 +376,19 @@ class EarlyWorker:
         self.jobs = {}
         self.preparing = []
         self.selected = []
+        self.request_first = getattr(connector, "launch_config", {}).get(
+            "early_prefetch_request_first", False)
+        if type(self.request_first) is not bool:
+            raise ValueError("early_prefetch_request_first must be a boolean")
+        self.min_submit_reads = getattr(connector, "launch_config", {}).get(
+            "early_prefetch_min_submit_reads", 1)
+        self.submit_max_wait_ms = getattr(connector, "launch_config", {}).get(
+            "early_prefetch_submit_max_wait_ms", 2)
+        if type(self.min_submit_reads) is not int or not 1 <= self.min_submit_reads <= 64:
+            raise ValueError("early_prefetch_min_submit_reads must be an integer from 1 to 64")
+        if (type(self.submit_max_wait_ms) not in (int, float)
+                or not 0 < self.submit_max_wait_ms <= 10):
+            raise ValueError("early_prefetch_submit_max_wait_ms must be in (0, 10]")
         self.request_keys = {}
         self.closed = False
         dp_rank = connector._vllm_config.parallel_config.data_parallel_index
@@ -685,8 +698,8 @@ class EarlyWorker:
 
     def _choose(self, round_keys):
         # Condition held; one pending batch per request participates in
-        # HRRN selection. A request gets one quantum before any repeat while
-        # another eligible request has not had a turn.
+        # selection. Default HRRN gives each eligible request a turn before
+        # repeating; request-first keeps issuing for the oldest eligible job.
         self.preparing = [item for item in self.preparing
                           if not item[0].cancelled and not item[1].done and not item[1].discarded and item[1].can_submit]
         heads = {}
@@ -696,13 +709,23 @@ class EarlyWorker:
             current = heads.get(job.key)
             if current is None or batch.index < current[1].index:
                 heads[job.key] = (job, batch)
-        round_keys.intersection_update(heads)
-        if not round_keys:
-            round_keys.update(heads)
-        eligible = [heads[key] for key in round_keys]
-        now = time.monotonic()
-        eligible.sort(key=lambda item: self.ratio(item[1], now), reverse=True)
-        self.selected = eligible[:max(1, len(eligible) // 4)]
+        if self.request_first:
+            # Prefer the earliest eligible request while it can issue more reads.
+            # Once its native batch has submitted its entire tail, can_submit is
+            # false; the next request can use spare credit while that tail drains.
+            # Lookup, activation and capacity waits also permit useful backfill.
+            # The data loop still polls every active batch and bounds global I/O.
+            eligible = sorted(heads.values(), key=lambda item: (item[0].entered, item[0].key))
+            self.selected = eligible[:1]
+            round_keys.clear()
+        else:
+            round_keys.intersection_update(heads)
+            if not round_keys:
+                round_keys.update(heads)
+            eligible = [heads[key] for key in round_keys]
+            now = time.monotonic()
+            eligible.sort(key=lambda item: self.ratio(item[1], now), reverse=True)
+            self.selected = eligible[:max(1, len(eligible) // 4)]
         chosen = {batch for _, batch in self.selected}
         self.preparing = [item for item in self.preparing if item[1] not in chosen]
 
@@ -776,6 +799,7 @@ class EarlyWorker:
     def _data(self):
         active, round_keys = [], set()
         window, peak = 0, 0
+        refill_since = None
         while True:
             if self.owner_protocol.fatal:
                 return  # Quarantine; native references are not death-recoverable.
@@ -795,6 +819,11 @@ class EarlyWorker:
                     if not active:
                         return
                 else:
+                    if self.request_first and self.selected:
+                        # Reconsider priority when a capacity/lookup wait clears
+                        # while a younger request was waiting for global credit.
+                        self.preparing.extend(self.selected)
+                        self.selected.clear()
                     blocked = [item for item in self.selected if not self._resource_eligible(*item)]
                     self.preparing.extend(blocked)
                     self.selected = [item for item in self.selected if item not in blocked]
@@ -808,7 +837,18 @@ class EarlyWorker:
                         window = min(window or capability.window_bytes, capability.window_bytes)
                         if self.io_limit:
                             window = min(window, self.io_limit)
-                        if window - inflight >= capability.shard_bytes:
+                        available = window - inflight
+                        enough = available >= capability.shard_bytes
+                        if (enough and self.min_submit_reads > 1 and inflight
+                                and (not job.deferred or batch.activated)):
+                            target = min(window, self.min_submit_reads * capability.shard_bytes)
+                            if available < target:
+                                now = time.monotonic()
+                                if refill_since is None:
+                                    refill_since = now
+                                enough = now - refill_since >= self.submit_max_wait_ms / 1000
+                        if enough:
+                            refill_since = None
                             self.selected.pop(0)
                             round_keys.discard(job.key)
                         else:
@@ -845,7 +885,9 @@ class EarlyWorker:
                     # Native Check offers no completion callback. Match the
                     # existing bounded readiness cadence, with one data thread.
                     only_resource_wait = active and all(
-                        b.waiting_capacity and not b.inflight_bytes for _, b in active)
+                        b.waiting_capacity and not b.inflight_bytes and
+                        not b.stats.get("pending_read_tasks", b.inflight_bytes)
+                        for _, b in active)
                     if self.release_serial == observed_release:
                         self.condition.wait(timeout=2 if only_resource_wait else .001)
 

@@ -27,8 +27,10 @@ struct Fixture {
     UC::PosixStore::EarlyPosixStore store;
     Fixture(size_t timeout = 5000)
     {
-        char pattern[] = "/tmp/ucm-full-block-probe-XXXXXX";
-        path = mkdtemp(pattern);
+        auto pattern = (std::filesystem::temp_directory_path() / "ucm-full-block-probe-XXXXXX").string();
+        auto* directory = mkdtemp(pattern.data());
+        Require(directory != nullptr, "temporary directory");
+        path = directory;
         block[0] = std::byte{42};
         Detail::Dictionary config;
         config.SetNumber("device_id", 0);
@@ -102,8 +104,12 @@ static void FullRead(bool partial)
         ++reads;
         return static_cast<int32_t>(syscall(SYS_io_submit, ctx, nr, cb));
     });
-    auto read = f.store.Load(f.Read(partial));
+    auto desc = f.Read(partial);
+    auto progress = desc.readProgress = std::make_shared<Detail::ReadProgress>();
+    auto read = f.store.Load(std::move(desc));
     Require(bool(read) && f.store.Wait(read.Value()).Success(), "full read completion");
+    Require(progress->retiredBytes == Fixture::layers * Fixture::layerBytes,
+            "success retires exact bytes once");
     Require(reads == 1, "one IO per block");
     f.Verify(partial);
     auto bad = f.Read();
@@ -403,8 +409,176 @@ static void ShortReadFailsWholeBlock()
         }
     }
     Require(truncated, "truncate owned block file");
-    auto task = f.store.Load(f.Read());
+    auto desc = f.Read();
+    auto progress = desc.readProgress = std::make_shared<Detail::ReadProgress>();
+    auto task = f.store.Load(std::move(desc));
     Require(bool(task) && f.store.Wait(task.Value()) == Status::NotFound(), "short block rejected");
+    Require(progress->retiredBytes == Fixture::layers * Fixture::layerBytes,
+            "short read returns requested credit without claiming success");
+}
+
+
+// Controlled backend isolates the budget from task completion and pin lifetime.
+class ProgressBackend : public ImmediateBackend {
+public:
+    std::vector<Detail::TaskDesc> tasks;
+    std::vector<bool> done;
+    std::vector<size_t> waited;
+    std::weak_ptr<ReadLease> lease;
+    bool unknown{false}, fail{false};
+    Expected<std::shared_ptr<ReadLease>> AcquireReadLease(const Detail::BlockId*, size_t) override
+    {
+        auto owned = std::make_shared<ReadLease>();
+        lease = owned;
+        return owned;
+    }
+    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
+    {
+        Require(bool(task.readProgress), "progress installed before submission");
+        tasks.push_back(std::move(task));
+        done.push_back(false);
+        return tasks.size();
+    }
+    Expected<bool> Check(Detail::TaskHandle id) override
+    {
+        if (id == 1 && unknown) { return Status::Error("unknown completion"); }
+        return bool(done.at(id - 1));
+    }
+    Status Wait(Detail::TaskHandle id) override
+    {
+        Require(done.at(id - 1), "never Wait for an unfinished task");
+        Require(!lease.expired(), "lease retained through Wait");
+        waited.push_back(id);
+        return fail && id != 2 ? Status::NotFound() : Status::OK();
+    }
+};
+
+static void PartialCreditWithFifoReaping(bool full, int ending)
+{
+    ProgressBackend backend;
+    const auto layers = full ? Fixture::layers : 1;
+    auto config = CacheConfig(backend, full, 192 * layers);
+    config.blockSize = layers * config.shardSize;
+    UC::CacheStore::BufferManager manager;
+    Require(manager.Setup(config).Success(), "progress cache setup");
+    UC::CacheStore::ReservedPrefetch early(&manager, &backend, config.blockSize,
+                                           config.shardSize, 5000, full);
+    std::vector<Detail::BlockId> blocks(192);
+    for (size_t i = 0; i < blocks.size(); ++i) { memcpy(blocks[i].data(), &i, sizeof(i)); }
+    auto reserved = early.Reserve(blocks.data(), blocks.size());
+    Require(bool(reserved), "progress reservation");
+    auto batch = reserved.Value().batch;
+    auto unit = config.blockSize;
+    Require(batch->Step(128 * unit).Value().inflightBytes == 64 * unit, "first 64");
+    Require(batch->Step(128 * unit).Value().inflightBytes == 128 * unit, "window full");
+    backend.tasks[0].readProgress->retiredBytes = 63 * unit;
+    auto p = batch->Step(0).Value();
+    Require(p.inflightBytes == 65 * unit && !p.done && p.completedReadBytes == 0,
+            "63 callbacks reclaim credit without task completion");
+    Require(batch->ProtectedBytes() == 128 * unit, "credit does not release pins");
+    Require(p.pendingReadTasks == 2, "partial credit retains both pending tasks");
+    auto first = manager.GetTransBuffer()->TryGet(blocks[0], 0);
+    Require(first && !first.Ready(), "credit does not publish READY");
+    Require(batch->Step(0).Value().inflightBytes == 65 * unit, "no double credit");
+    Require(backend.tasks.size() == 2, "Step(0) never submits");
+    p = batch->Step(63 * unit).Value();
+    Require(backend.tasks.size() == 3 && backend.tasks[2].size() == 63 &&
+            p.inflightBytes == 128 * unit, "refill reclaimed window while tail is pending");
+    // A later task returns credit without bypassing FIFO Wait or publishing READY.
+    backend.done[1] = true;
+    backend.tasks[1].readProgress->retiredBytes = 64 * unit;
+    backend.unknown = ending == 2;
+    p = batch->Step(0).Value();
+    Require(p.inflightBytes == 64 * unit && p.completedReadBytes == 0,
+            "completed second task returns credit behind slow or unknown first");
+    Require(backend.waited.empty(), "FIFO Wait retained");
+    Require(p.pendingReadTasks == 3, "credit does not reap any task");
+    auto second = manager.GetTransBuffer()->TryGet(blocks[64], 0);
+    Require(second && !second.Ready() && !first.Ready(), "unreaped tasks are not READY");
+    if (ending == 0) { batch->Discard(); }
+    else { early.Release(reserved.Value().handle); }
+    Require(!backend.lease.expired(), "discard/cancel keeps live read lease");
+    p = batch->Step(0).Value();
+    Require(!p.done && batch->ProtectedBytes() == 191 * unit, "destinations retained");
+    backend.tasks[0].readProgress->retiredBytes = 64 * unit;
+    backend.tasks[2].readProgress->retiredBytes = 63 * unit;
+    p = batch->Step(0).Value();
+    Require(p.inflightBytes == 0 && p.pendingReadTasks == 3 && !p.done,
+            "zero credit is independent of pending native task completion");
+    backend.unknown = false;
+    backend.fail = ending == 3;
+    backend.done[0] = backend.done[2] = true;
+    backend.tasks[0].readProgress->retiredBytes = 64 * unit;
+    backend.tasks[2].readProgress->retiredBytes = 63 * unit;
+    auto final = batch->Step(0);
+    Require(ending == 0 ? bool(final) : !final, "terminal status after drain");
+    Require(batch->Snapshot().inflightBytes == 0 && batch->Snapshot().pendingReadTasks == 0 && batch->Snapshot().done,
+            "all credit returned exactly once");
+    Require(backend.tasks.size() == 3, "no suffix submission after cancel or discard");
+    if (ending == 3) {
+        Require(!first.Ready() && batch->Snapshot().completedReadBytes == 64 * unit,
+                "failed read is not successful bytes or READY");
+    }
+    early.Release(reserved.Value().handle);
+    Require(backend.lease.expired(), "lease released only after physical drain");
+}
+
+static void PartialAioCredit()
+{
+    Fixture f;
+    auto desc = f.Read();
+    auto progress = desc.readProgress = std::make_shared<Detail::ReadProgress>();
+    std::vector<std::shared_ptr<void>> secondBuffers;
+    Detail::Shard second{f.block, 0, {}};
+    for (size_t i = 0; i < Fixture::layers; ++i) {
+        void* p = nullptr;
+        Require(posix_memalign(&p, 4096, Fixture::layerBytes) == 0, "second destination");
+        secondBuffers.emplace_back(p, std::free);
+        second.addrs.push_back(p);
+    }
+    desc.push_back(std::move(second));
+    std::promise<std::pair<aio_context_t, iocb*>> held;
+    std::atomic<size_t> submitted{0};
+    TestHooks::SetAioSubmitHook([&](aio_context_t ctx, int64_t nr, iocb** cb) {
+        if (submitted.fetch_add(1) == 0) {
+            held.set_value({ctx, *cb});
+            return int32_t{1};
+        }
+        return static_cast<int32_t>(syscall(SYS_io_submit, ctx, nr, cb));
+    });
+    auto task = f.store.Load(std::move(desc));
+    Require(bool(task), "two-read task accepted");
+    auto [ctx, cb] = held.get_future().get();
+    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto unit = Fixture::layers * Fixture::layerBytes;
+    while (progress->retiredBytes != unit && std::chrono::steady_clock::now() < end) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto partial = progress->retiredBytes.load();
+    auto check = f.store.Check(task.Value());
+    // Drain even when assertions would fail, so a failing probe cannot strand IO.
+    Require(syscall(SYS_io_submit, ctx, 1, &cb) == 1, "release held physical read");
+    Require(f.store.Wait(task.Value()).Success(), "partial task drains");
+    Require(partial == unit && check && !check.Value(), "real callback credit before whole task");
+    Require(progress->retiredBytes == 2 * unit, "each callback contributes exactly once");
+}
+
+static void PreSubmitFailureCredit(bool missing)
+{
+    Fixture f;
+    auto desc = f.Read();
+    auto progress = desc.readProgress = std::make_shared<Detail::ReadProgress>();
+    if (missing) { desc[0].owner[0] = std::byte{99}; }
+    else {
+        TestHooks::SetAioSubmitHook([](aio_context_t, int64_t, iocb**) {
+            errno = EIO;
+            return int32_t{-1};
+        });
+    }
+    auto task = f.store.Load(std::move(desc));
+    Require(task && f.store.Wait(task.Value()).Failure(), "pre-submit error status");
+    Require(progress->retiredBytes == Fixture::layers * Fixture::layerBytes,
+            "open/submit error returns exact credit once");
 }
 
 int main(int argc, char** argv)
@@ -412,6 +586,12 @@ int main(int argc, char** argv)
     try {
         if (argc > 1) { Fixture::layerBytes = std::stoull(argv[1]); }
         Require(Fixture::layerBytes == 4096 || Fixture::layerBytes == 86016, "validated probe stride");
+        for (bool full : {false, true}) {
+            for (int ending = 0; ending < 4; ++ending) { PartialCreditWithFifoReaping(full, ending); }
+        }
+        PartialAioCredit();
+        PreSubmitFailureCredit(true);
+        PreSubmitFailureCredit(false);
         FullRead(false);
         FullRead(true);
         TimeoutRetainsVectors();

@@ -41,6 +41,8 @@ class TransBuffer {
     static constexpr Index npos = std::numeric_limits<Index>::max();
     std::shared_ptr<BufferStrategy> strategy_{nullptr};
     bool bypassHitOnLoad_{false};
+    bool wholeBlock_{false};
+    std::vector<size_t> layerOffsets_;
 
 public:
     enum class State : uint8_t { LOADING, READY, FAILED };
@@ -48,7 +50,7 @@ public:
     class Handle {
     public:
         Handle() = default;
-        Handle(const Handle& other) : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}
+        Handle(const Handle& other) : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}, view_{other.view_}
         {
             if (Valid()) { buf_->Acquire(pos_); }
         }
@@ -60,7 +62,7 @@ public:
             }
             return *this;
         }
-        Handle(Handle&& other) noexcept : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}
+        Handle(Handle&& other) noexcept : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}, view_{other.view_}
         {
             other.buf_ = nullptr;
             other.pos_ = npos;
@@ -80,18 +82,26 @@ public:
         bool Owner() const { return owner_; }
         void* Data()
         {
-            if (Valid()) { return buf_->DataAt(pos_); }
+            if (Valid()) { return buf_->DataAt(pos_, view_); }
             return nullptr;
         }
         void* DeviceData()
         {
-            if (Valid()) { return buf_->DeviceDataAt(pos_); }
+            if (Valid()) { return buf_->DeviceDataAt(pos_, view_); }
             return nullptr;
         }
-        bool Ready() const { return buf_->Ready(pos_); };
-        State GetState() const { return buf_->GetState(pos_); }
+        bool Ready() const { return buf_->GetState(pos_, view_) == State::READY; };
+        State GetState() const { return buf_->GetState(pos_, view_); }
         Status FailureStatus() const { return buf_->FailureStatus(pos_); }
-        void MarkReady() { buf_->MarkReady(pos_); };
+        void MarkReady() { buf_->MarkReady(pos_, view_); };
+        // Views retain the same native node reference; no staging allocation/copy.
+        Handle LayerView(size_t layer) const
+        {
+            if (!Valid() || !buf_->WholeBlock() || layer >= buf_->LayerCount()) { return {}; }
+            Handle result(*this); result.view_ = layer; return result;
+        }
+        Handle WholeView() const
+        { Handle result(*this); result.view_ = npos; return result; }
         void MarkFailed(const Status& status) { buf_->MarkFailed(pos_, status); }
 
     private:
@@ -104,14 +114,18 @@ public:
             std::swap(buf_, other.buf_);
             std::swap(pos_, other.pos_);
             std::swap(owner_, other.owner_);
+            std::swap(view_, other.view_);
         }
         TransBuffer* buf_{nullptr};
         Index pos_{npos};
         bool owner_{false};
+        size_t view_{npos};
     };
 
 public:
     Status Setup(const Config& config);
+    bool WholeBlock() const { return wholeBlock_; }
+    size_t LayerCount() const { return layerOffsets_.size(); }
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     Handle TryGet(const Detail::BlockId& blockId, size_t shardIdx);
@@ -126,14 +140,16 @@ private:
                  std::optional<size_t> maxAttempts = std::nullopt);
     void MoveTo(size_t iBucket, size_t iNode);
     void Remove(size_t iBucket, size_t iNode);
-    void* DataAt(Index pos);
-    void* DeviceDataAt(Index pos);
+    Handle MakeHandle(Index pos, size_t shard, bool owner, bool load, bool whole = false);
+    void ResetBlockState(Index pos);
+    void* DataAt(Index pos, size_t view = npos);
+    void* DeviceDataAt(Index pos, size_t view = npos);
     void Acquire(Index pos);
     void Release(Index pos);
     bool Ready(Index pos);
-    State GetState(Index pos);
+    State GetState(Index pos, size_t view = npos);
     Status FailureStatus(Index pos);
-    void MarkReady(Index pos);
+    void MarkReady(Index pos, size_t view = npos);
     void MarkFailed(Index pos, const Status& status);
     void MarkNotReady(Index pos);
 };

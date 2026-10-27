@@ -87,6 +87,9 @@ void BindOperations(pybind11::module_& module)
         out["shard_bytes"] = domain.shardBytes;
         out["block_bytes"] = domain.blockBytes;
         out["disk_block_bytes"] = domain.diskBlockBytes;
+        out["consumer_shard_bytes"] = domain.consumerShardBytes;
+        out["consumer_block_bytes"] = domain.consumerBlockBytes;
+        out["full_block_l1"] = domain.fullBlockL1;
         return out;
     });
     module.def("EarlyReleaseEpoch", [](Pipeline& pipeline) {
@@ -130,6 +133,7 @@ void BindOperations(pybind11::module_& module)
             out["capacity_truncated"] = progress.result.capacityTruncated;
             out["l2_read_bytes"] = progress.result.l2ReadBytes;
             out["completed_read_bytes"] = progress.completedReadBytes;
+            out["pending_read_tasks"] = progress.pendingReadTasks;
             return out;
         })
         .def("step", [](BoundBatch& b, size_t availableBytes) {
@@ -152,6 +156,7 @@ void BindOperations(pybind11::module_& module)
             out["capacity_truncated"] = progress.result.capacityTruncated;
             out["l2_read_bytes"] = progress.result.l2ReadBytes;
             out["completed_read_bytes"] = progress.completedReadBytes;
+            out["pending_read_tasks"] = progress.pendingReadTasks;
             out["coalesced_shards"] = progress.result.coalescedShards;
             return out;
         });

@@ -17,7 +17,7 @@ from .early_control import BrokerState
 from .early_capacity import ExecutionWindow
 
 log = logging.getLogger(__name__)
-VERSION = 9
+VERSION = 10
 
 
 def worker_capability(connector):
@@ -34,20 +34,33 @@ def worker_capability(connector):
         if getattr(connector._vllm_config.parallel_config, "pipeline_parallel_size", 1) != 1:
             return {"reason": "PP consumer cohort is not supported by owner protocol"}
         shard, block = native["shard_bytes"], native["block_bytes"]
-        if not shard or block % shard or shard != config["shard_size"] or block != config["block_size"]:
+        logical_shard = native.get("consumer_shard_bytes", shard)
+        logical_block = native.get("consumer_block_bytes", block)
+        if (not shard or not block or block % shard or not logical_shard
+                or logical_block % logical_shard
+                or logical_shard != config["shard_size"] or logical_block != config["block_size"]):
             return {"reason": "native/config layout mismatch"}
         packed = config.get("posix_packed_layer_bytes")
         disk_block = native.get("disk_block_bytes", block)
         if packed is not None and (
             not config.get("cache_full_block_load")
-            or len(packed) != block // shard
+            or len(packed) != logical_block // logical_shard
             or disk_block != sum(packed)
         ):
             return {"reason": "native/config packed layout mismatch"}
-        if not disk_block or disk_block > block:
+        if not disk_block or disk_block > logical_block:
             return {"reason": "invalid native disk block size"}
+        full_block_l1 = bool(config.get("cache_full_block_l1", False))
+        if native.get("full_block_l1", False) != full_block_l1:
+            return {"reason": "native/config whole-block L1 mismatch"}
+        if full_block_l1:
+            if not config.get("cache_full_block_load") or shard != disk_block or block != disk_block:
+                return {"reason": "invalid whole-block L1 physical geometry"}
+        elif shard != logical_shard or block != logical_block:
+            return {"reason": "native/config physical layer mismatch"}
         layers = list(connector.layer_ids) if connector.use_layerwise else [0]
-        if not layers or len(set(layers)) != len(layers) or min(layers) < 0 or max(layers) >= block // shard:
+        if (not layers or len(set(layers)) != len(layers) or min(layers) < 0
+                or max(layers) >= logical_block // logical_shard):
             return {"reason": "unsupported consumer shard range"}
         model_len = connector._vllm_config.model_config.max_model_len
         if not isinstance(model_len, int) or model_len <= 0:
@@ -56,7 +69,7 @@ def worker_capability(connector):
         token_unit = min(connector.hash_block_size, connector.block_size)
         task_shards = (model_len + token_unit - 1) // token_unit
         if not connector.use_layerwise:
-            task_shards *= block // shard
+            task_shards *= logical_block // logical_shard
         # Actual object identity, physical host and namespace reachability.
         domain = [Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                   os.readlink("/proc/self/ns/ipc"), os.readlink("/proc/self/ns/mnt"), native["backing"]]
@@ -71,7 +84,7 @@ def worker_capability(connector):
         return dict(version=VERSION, domain=json.dumps(domain),
                     layout=hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest(),
                     unique_id=str(connector.unique_id), native=native, layers=layers,
-                    task_shards=task_shards, full_block_load=full_block_load,
+                    task_shards=task_shards, full_block_load=full_block_load, full_block_l1=full_block_l1,
                     max_jobs=int(connector.launch_config.get("early_owner_max_jobs", 4)),
                     max_candidates=int(connector.launch_config.get("early_owner_max_candidate_blocks", 0)),
                     dp=connector._vllm_config.parallel_config.data_parallel_index,

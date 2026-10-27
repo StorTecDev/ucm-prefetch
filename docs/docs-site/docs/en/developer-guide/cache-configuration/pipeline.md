@@ -25,7 +25,7 @@ ucm_connectors:
       store_pipeline: "Cache|Posix"
       store_health:
         enabled: true
-      storage_backends: "/mnt/ucm-cache"
+      storage_backends: "./ucm-cache"
       io_direct: false
       # cache_buffer_capacity_gb: 256
       # posix_capacity_gb: 1024
@@ -184,17 +184,47 @@ loading for layerwise connectors. Full-block reads require the Early Posix AIO
 backend, at most `IOV_MAX` layers per block, and a uniform host block no larger
 than `UINT32_MAX` bytes.
 
-One `IOCB_CMD_PREADV` fills missing layer buffers directly. Cached or peer-owned
+With the default layer-based L1, one `IOCB_CMD_PREADV` fills missing layer buffers directly. Cached or peer-owned
 destinations use private scratch so active data is not overwritten. H2D still
 transfers only the requested layer. L1 nodes, tensor offsets and eviction units
 remain layer-based. Without packing, disk padding and the dump format also remain
 unchanged.
 
+### Whole-block L1 with layerwise H2D
+
+Set `cache_full_block_l1: true` alongside `cache_full_block_load: true` to use
+one contiguous L1 allocation and one `IOCB_CMD_PREAD` per block. Keep
+`use_layerwise: true`: each H2D task receives a view of its layer within that
+allocation, using the existing layerwise queues, events and tensor offsets.
+There is no intermediate full-block staging allocation or CPU scatter copy.
+
+The option defaults to `false` and requires the Early full-block path. With a
+packed L2 layout, L1 uses the same prefix-sum layer offsets and physical block
+length; tensor offsets *within* each layer remain unchanged. Every layer view
+retains the entire native node until its H2D completes. Eviction and prefetch
+pins operate on complete blocks. The existing layerwise D2H/dump path fills
+those views independently and publishes a complete L1 hit only after all layers
+are ready. A concurrent whole-block read cannot overwrite an active layer writer.
+
+`cache_buffer_capacity_gb` still limits physical L1 bytes. In this mode
+`cache_load_exclusive_buffer_number` counts whole-block nodes; reserved capacity
+and owner eligibility use the same physical units. Native domain information
+reports physical `shard_bytes`/`block_bytes` separately from
+`consumer_shard_bytes`/`consumer_block_bytes`. Early L2 shard statistics count
+one physical read unit per block; H2D statistics remain per-layer.
+
+Rebuild all native libraries and restart the shared domain when switching this
+option. Whole-block L1 uses shared-layout version 4 and owner protocol version 10;
+legacy L1 retains shared-layout version 3. `test/block_l1_probe.cc` checks direct
+kernel PREAD, packed layer views, H2D order, per-layer dumps, cancellation,
+short reads and shared-memory compatibility.
+
 ### Packed L2 layout
 
 `posix_packed_layer_bytes` is an optional integer list inside
 `ucm_connector_config`. It specifies the physical disk length of each layer,
-in layer order, while retaining the original uniform L1 slices. Omit it to keep
+in layer order. The default L1 retains uniform layer slots; whole-block L1 uses
+the packed offsets described above. Omit it to keep
 the uniform disk layout. Packing is not inferred automatically from the model.
 
 For the Early `Cache|Posix` pipeline, packing requires all of the following:
@@ -225,8 +255,9 @@ reader releases its lease.
 Early submits up to 64 read units per turn and keeps at most 128 in flight.
 Full-block I/O credit, successful-read byte accounting, and Posix capacity/GC use
 the actual disk block size: the packed-length sum when packing is enabled.
-L1 reservations and capacity still use uniform layer-shard slots; packing does
-not increase L1 or device-cache capacity.
+With `cache_full_block_l1: false`, L1 reservations and capacity use uniform
+layer-shard slots. Whole-block L1 instead charges the actual physical block
+length while retaining the configured total L1 byte capacity.
 
 Read accounting includes ranges discarded into scratch. Partial hits can increase
 bytes read and temporary memory, and capacity pressure or concurrent ownership can
@@ -244,3 +275,51 @@ domain when upgrading. Store capabilities, domain metadata and the owner protoco
 changed; do not mix old and new libraries or workers. Generic coverage is in
 `test/test_early_packed_layout.py`, `test/full_block_l2_probe.cc`,
 `test/packed_l2_probe.cc`, and `test/early_scope_probe.cc`.
+
+The connector-level `early_prefetch_request_first: true` option prioritizes the
+oldest eligible request for L2 reads (default: `false`, existing HRRN rounds).
+Reads within that request remain concurrent under the shared byte window. Once
+its remaining reads are submitted, another request can fill spare credit while
+the tail completes. Lookup, activation and capacity waits also allow backfill;
+priority is reconsidered when they clear. READY still requires all request
+batches to complete. L1-to-device layerwise copies and native read batching are
+unchanged. Large requests can delay younger requests; this option does not
+promise greater device bandwidth or physically contiguous files.
+
+Completed AIO reads now return their requested-byte I/O credit before the entire
+task is reaped. This counter is only admission accounting: buffer pins, leases,
+error status and READY still use the original Check/Wait completion boundary,
+and task reaping remains FIFO. A short read or terminal pre-submission error
+retires its requested credit without claiming successful data.
+
+The connector can coalesce refills with `early_prefetch_min_submit_reads: 16`
+and `early_prefetch_submit_max_wait_ms: 2`. Below the read-unit threshold, it
+continues polling completion and flushes at the next executor turn after the
+maximum wait. An empty I/O window is filled immediately. The threshold is
+clamped to the global window, so a small owner quota cannot deadlock. The
+minimum defaults to 1 (no coalescing); supported ranges are 1–64 reads and
+(0, 10] milliseconds. The wait is a scheduling deadline, not a real-time bound
+under OS descheduling. Completed credit reaching zero does not permit sleeping
+through pending native task completion or releasing their references.
+
+### Bounded background AIO writes
+
+Set `posix_write_inflight_limit` inside `ucm_connector_config` to limit concurrent
+write operations from dequeue-before-open until physical I/O completion or a
+terminal open/submission failure. The default `0` preserves the shared FIFO;
+values 1–4096 require `posix_io_engine: aio`. The limit counts I/O operations,
+not bytes or whole dump tasks, and applies to the local Posix AIO engine.
+
+When enabled, reads use a separate queue and bypass writes waiting for a permit.
+An eligible write is selected after at most 16 read dequeues across the open
+workers. This bounds dequeue fairness, not elapsed time. Accepted writes retain
+their permits through physical completion, including uncancellable I/O. Queued
+cancellation consumes no permit; open, submission and short-write failures
+release it without reporting successful persistence. Buffer pins, read READY,
+leases and write commit semantics are unchanged.
+
+The option can be used independently of whole-block L1, request-first scheduling
+and refill coalescing. It does not change layerwise H2D. Small limits can reduce
+write-only throughput; evaluate end-to-end latency and write backlog/drain as
+well as read throughput. `test/write_window_probe.cc` covers the cap, read bypass,
+refill/drain, failure and cancellation paths, fairness and the disabled FIFO.

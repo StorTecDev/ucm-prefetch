@@ -9,7 +9,7 @@ ucm_connectors:
   - ucm_connector_name: UcmPipelineStore
     ucm_connector_config:
       store_pipeline: "Cache|Posix"
-      storage_backends: /mnt/ucm-cache
+      storage_backends: ./ucm-cache
 enable_metrics: true
 ```
 
@@ -22,6 +22,10 @@ These fields belong at the YAML root. Descriptions identify model- or engine-spe
 | Parameter | Required | Type | Value Range | Description |
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | Optional | bool | Default: `true` | Enable layer-wise (per-layer) load/save mode. Recommended `true`; DeepSeek V4 series recommends `false`. |
+| `enable_early_prefetch` | Optional | bool | Default: `false` | Enable the Early prefetch path; required for whole-block reads and Early scheduling options. |
+| `early_prefetch_request_first` | Optional | bool | Default: `false` | With Early enabled, prioritize the oldest eligible request and backfill spare read credit; `false` retains HRRN rounds. |
+| `early_prefetch_min_submit_reads` | Optional | int | Default: `1`; 1–64 | Minimum free read units before a refill; clamped to the owner window. `1` disables coalescing; an empty I/O window refills immediately. |
+| `early_prefetch_submit_max_wait_ms` | Optional | number | Default: `2`; (0, 10] | Maximum coalescing wait in milliseconds before the next executor turn submits available reads; not a real-time bound. |
 | `enable_event_sync` | Optional | bool | Default: `true` | Performance optimization switch. Recommended to enable. |
 | `persist_token_threshold` | Optional | int | `0` | When request length < `persist_token_threshold`, UCM does not process the request. |
 | `wa_dump_block_wise` | Optional | bool | `true` | Only used in FAWA connector. `true`: every block's WA cache is dumped (high frequency); `false`: only dump last block's WA cache of each chunk prefill (low frequency). |
@@ -52,6 +56,7 @@ These options configure Posix in a Pipeline. Provide `storage_backends` when Pos
 | `posix_data_trans_concurrency` | Optional | int | Default: `128` | Read/write threads per card in `psync` mode. NFS over RDMA: 128/card. Not used in `aio` mode. |
 | `posix_open_concurrency` | Optional | int | Default: `32` | File open threads in `aio` mode. Not applicable in `psync`. |
 | `posix_commit_concurrency` | Optional | int | Default: `4` | File rename threads in `aio` mode. Not applicable in `psync`. |
+| `posix_write_inflight_limit` | Optional | int | Default: `0`; 0–4096 | Per-engine write-operation cap through physical completion. `0` retains FIFO; positive values require AIO and let reads bypass capped writes. See [write admission](../developer-guide/cache-configuration/pipeline.md#bounded-background-aio-writes). |
 | `posix_lookup_concurrency` | Optional | int | Default: `16` | Threads for checking file existence at mount point. |
 
 ## Cache host-buffer stage
@@ -64,7 +69,8 @@ These fields apply to pipelines containing Cache. Budget shared buffers per shar
 | `cache_sdma_direct` | Optional | bool | Depends on build env: `true` when `PLATFORM=ascend-a3`, `false` otherwise | Enable SDMA H2D/D2H transfer. Only effective on A3 devices. Recommended to disable. |
 | `cache_load_backend_only` | Optional | bool | Default: `false` | Force load from SSD even on cache hit. Test only. |
 | `cache_full_block_load` | Optional | bool | Default: `false` | Early-only full-block Posix AIO reads into L1, preserving layerwise device transfers. Ordinary Cache/Posix rejects this option. See [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers). |
-| `posix_packed_layer_bytes` | Optional | list[int] | Unset: uniform disk layout | Early layerwise full-block pipeline only. Exact 4096-byte-aligned physical lengths in layer order, validated against live tensors; L1 remains uniform. See [packed layout](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout). |
+| `cache_full_block_l1` | Optional | bool | Default: `false` | Early full-block path only; requires `cache_full_block_load: true`. Use one contiguous L1 block and one PREAD while preserving layerwise H2D. See [whole-block L1](../developer-guide/cache-configuration/pipeline.md#whole-block-l1-with-layerwise-h2d). |
+| `posix_packed_layer_bytes` | Optional | list[int] | Unset: uniform disk layout | Early layerwise full-block pipeline only. Exact 4096-byte-aligned physical lengths in layer order, validated against live tensors; L1 is uniform by default; whole-block L1 uses packed offsets. See [packed layout](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout). |
 | `cache_io_aggregation` | Optional | bool | Default: `false`, auto-enabled when `PLATFORM=ascend` and model is V4 | Enable IO aggregation H2D transfer. Only effective on A2 devices. |
 | `share_buffer_enable` | Optional | bool | MLA: default enabled; GQA: default disabled | Enable shared memory. MLA without shm or GQA with shm causes performance degradation. |
 

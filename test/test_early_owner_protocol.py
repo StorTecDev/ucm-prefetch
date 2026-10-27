@@ -658,3 +658,44 @@ def test_rebound_plan_is_checked_without_losing_partial_completion():
         observer.bind({"r": dict(t, expected=blocks(1))}, [0, 1])
     observer.poison.assert_called_once()
     observer.send.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", [None, "native_flag", "physical_size", "consumer_size", "layer_count"])
+def test_whole_block_l1_keeps_logical_layer_consumers_and_physical_budget(mutation):
+    class Hasher:
+        def __init__(self, config, rank):
+            self.rank = rank
+
+        def __call__(self, value):
+            return bytes([self.rank]) * 16
+
+    lengths = [86016 if i in {0, 1, 2, 6, 10} else 73728 for i in range(14)]
+    physical = sum(lengths)
+    info = dict(backing="verified-block-backing", nodes=120, reservable_nodes=100,
+                shard_bytes=physical, block_bytes=physical, disk_block_bytes=physical,
+                consumer_shard_bytes=86016, consumer_block_bytes=14 * 86016,
+                full_block_l1=True)
+    config = dict(share_buffer_enable=True, shard_size=86016, block_size=14 * 86016,
+                  tensor_size_list=[73728, 8448], cache_full_block_load=True,
+                  cache_full_block_l1=True, posix_packed_layer_bytes=lengths)
+    c = SimpleNamespace(store=SimpleNamespace(config=config, domain_info=lambda: info),
+        launch_config={}, is_mla=True, cp_world_size=1, layer_ids=list(range(14)),
+        use_layerwise=True, unique_id="block-native", hash_block_size=64, block_size=64,
+        blocks_per_chunk=1, request_hasher=Hasher(None, 0), tp_rank=0, tp_size=1,
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_index=0),
+            model_config=SimpleNamespace(max_model_len=40000)))
+    if mutation == "native_flag":
+        info["full_block_l1"] = False
+    elif mutation == "physical_size":
+        info["shard_bytes"] = 86016
+    elif mutation == "consumer_size":
+        info["consumer_block_bytes"] -= 86016
+    elif mutation == "layer_count":
+        config["posix_packed_layer_bytes"] = lengths[:-1]
+    cap = owner.worker_capability(c)
+    assert cap.get("ready", False) is (mutation is None)
+    if mutation is None:
+        assert cap["layers"] == list(range(14))
+        assert cap["task_shards"] == 625
+        assert cap["native"]["shard_bytes"] == cap["native"]["block_bytes"] == 1093632
+        assert cap["full_block_l1"] and cap["full_block_load"]

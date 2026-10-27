@@ -20,18 +20,21 @@ TransBuffer::Handle EarlyBufferPins::Acquire(TransBuffer& buffer,
     const Detail::BlockId& block, size_t shard, bool load)
 {
     auto& strategy = *buffer.strategy_;
-    const auto bucket = Hash(block, shard);
+    if (buffer.WholeBlock() && shard >= buffer.LayerCount()) { return {}; }
+    const auto key = buffer.WholeBlock() ? 0 : shard;
+    const auto bucket = Hash(block, key);
     bool owner = false;
     strategy.BucketLock(bucket);
-    auto node = buffer.FindAt(bucket, block, shard, owner);
+    auto node = buffer.FindAt(bucket, block, key, owner);
     if (node == invalidIndex && (load ? strategy.NodeCount() : ReservableSlots(buffer)) != 0) {
-        node = buffer.Alloc(block, shard, bucket, load, 2 * strategy.NodeCount());
+        node = buffer.Alloc(block, key, bucket, load, 2 * strategy.NodeCount());
         owner = true;
     } else if (load && buffer.bypassHitOnLoad_ && owner && buffer.Ready(node)) {
         buffer.MarkNotReady(node);
     }
+    auto handle = buffer.MakeHandle(node, shard, owner, load);
     strategy.BucketUnlock(bucket);
-    return TransBuffer::Handle(&buffer, node, owner);
+    return handle;
 }
 
 Early::Domain EarlyBufferPins::DescribeDomain(TransBuffer& buffer)
@@ -146,8 +149,10 @@ TransBuffer::Handle EarlyBufferPins::PinNode(TransBuffer& buffer, size_t node,
     auto* meta = strategy.MetaAt(node);
     const auto state = meta->state.load(std::memory_order_acquire);
     TransBuffer::Handle result;
+    const bool partialDump = buffer.WholeBlock() &&
+        strategy.FillAt(node)->mode == BlockFillState::Mode::Layers;
     if (state == TransBuffer::State::READY ||
-        (state == TransBuffer::State::LOADING && meta->reference != 0)) {
+        (state == TransBuffer::State::LOADING && meta->reference != 0 && !partialDump)) {
         ++meta->reference;
         strategy.MarkAccessed(node);
         result = TransBuffer::Handle(&buffer, node, false);

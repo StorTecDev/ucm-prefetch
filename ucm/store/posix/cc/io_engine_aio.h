@@ -85,7 +85,8 @@ public:
         ioConfig_ = config;
         nShardPerBlock_ = config.blockSize / config.shardSize;
         layout_ = layout;
-        blockOperator_.Setup(layout, config.openConcurrency, config.commitConcurrency);
+        blockOperator_.Setup(layout, config.openConcurrency, config.commitConcurrency,
+                             static_cast<size_t>(config.writeInflightLimit));
         aio_.SetSweepFn([this] { SweepDeadlines(); });
         UC_INFO(
             "AIO engine setup: timeoutMs={}, watchdogGraceMs={}, "
@@ -123,6 +124,12 @@ private:
     {
         blockOperator_.Submit(BlockOperator::CommitTask{std::move(id), success});
     }
+    static void RetireRead(const TaskPtr& task, size_t bytes)
+    {
+        if (task->desc.readProgress) {
+            task->desc.readProgress->retiredBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
     template <bool dump>
     void OnIoCallback(const TaskPtr& task, WaiterPtr w, int32_t fd, bool last,
                       const Detail::BlockId& id, size_t expectedBytes, const AioImpl::Result& result)
@@ -150,6 +157,7 @@ private:
         if constexpr (dump) {
             if (last) { CommitBlock(id, !failureSet_.Contains(tid)); }
         }
+        if constexpr (!dump) { RetireRead(task, expectedBytes); }
         w->Done();
     }
     template <bool dump>
@@ -159,13 +167,16 @@ private:
         const auto tid = task->id;
         const auto last = shard.index + 1 == nShardPerBlock_;
         const auto& id = shard.owner;
-        auto handleFailure = [this, task, tid, w, last, id](int32_t fd, Status status) {
+        const auto readBytes = task->desc.fullBlockRead ? ioConfig_.DiskBlockBytes()
+                                                       : ioConfig_.LayerBytes(shard.index);
+        auto handleFailure = [this, task, tid, w, last, id, readBytes](int32_t fd, Status status) {
             task->Fail(status);
             failureSet_.Insert(tid);
             if (fd >= 0) { ::close(fd); }
             if constexpr (dump) {
                 if (last) { CommitBlock(id, false); }
             }
+            if constexpr (!dump) { RetireRead(task, readBytes); }
             w->Done();
         };
         if (result.error != 0) {
@@ -180,6 +191,7 @@ private:
             if constexpr (dump) {
                 if (last) { CommitBlock(id, false); }
             }
+            if constexpr (!dump) { RetireRead(task, readBytes); }
             w->Done();
             return;
         }
@@ -193,29 +205,33 @@ private:
         if constexpr (!dump) {
             if (task->desc.fullBlockRead) {
                 io.length = ioConfig_.DiskBlockBytes();
-                const auto missing = std::count(shard.addrs.begin(), shard.addrs.end(), nullptr);
-                if (missing) {
-                    // Cached slices may be in use by H2D or a concurrent writer.
-                    // Read their file ranges into private scratch, never live L1.
-                    void* scratch = nullptr;
-                    if (posix_memalign(&scratch, 4096, missing * ioConfig_.shardSize) != 0) {
-                        handleFailure(result.fd, Status::OutOfMemory());
-                        return;
+                // A single destination is one physical L1 block: submit PREAD.
+                // Multiple destinations retain the existing scattered PREADV path.
+                if (shard.addrs.size() != 1 || !shard.addrs.front()) {
+                    const auto missing = std::count(shard.addrs.begin(), shard.addrs.end(), nullptr);
+                    if (missing) {
+                        // Cached slices may be in use by H2D or a concurrent writer.
+                        // Read their file ranges into private scratch, never live L1.
+                        void* scratch = nullptr;
+                        if (posix_memalign(&scratch, 4096, missing * ioConfig_.shardSize) != 0) {
+                            handleFailure(result.fd, Status::OutOfMemory());
+                            return;
+                        }
+                        discarded = std::shared_ptr<void>(scratch, std::free);
                     }
-                    discarded = std::shared_ptr<void>(scratch, std::free);
-                }
-                auto* scratch = static_cast<std::byte*>(discarded.get());
-                for (size_t index = 0; index < shard.addrs.size(); ++index) {
-                    auto* address = shard.addrs[index];
-                    const auto bytes = ioConfig_.LayerBytes(index);
-                    io.vectors.push_back({address ? address : scratch, bytes});
-                    if (!address) { scratch += bytes; }
+                    auto* scratch = static_cast<std::byte*>(discarded.get());
+                    for (size_t index = 0; index < shard.addrs.size(); ++index) {
+                        auto* address = shard.addrs[index];
+                        const auto bytes = ioConfig_.LayerBytes(index);
+                        io.vectors.push_back({address ? address : scratch, bytes});
+                        if (!address) { scratch += bytes; }
+                    }
                 }
             }
         }
         const auto expectedBytes = io.length;
         io.callback = [this, task, w, fd = result.fd, last, id, expectedBytes,
-                       discarded](AioImpl::Result ioResult) {
+                       discarded, writePermit = result.writePermit](AioImpl::Result ioResult) {
             OnIoCallback<dump>(task, w, fd, last, id, expectedBytes, ioResult);
         };
         auto status = dump ? aio_.WriteAsync(std::move(io)) : aio_.ReadAsync(std::move(io));

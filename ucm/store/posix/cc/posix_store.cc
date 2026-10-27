@@ -164,7 +164,8 @@ public:
                 return Status::InvalidParam("full-block reads require Posix AIO and a valid iovec size");
             }
             for (const auto& block : task) {
-                if (block.index != 0 || block.addrs.size() != shardsPerBlock_) {
+                const bool contiguous = block.addrs.size() == 1 && block.addrs.front();
+                if (block.index != 0 || (!contiguous && block.addrs.size() != shardsPerBlock_)) {
                     return Status::InvalidParam("invalid full-block read destinations");
                 }
             }
@@ -250,6 +251,7 @@ private:
         inConfig.GetNumber("posix_lookup_concurrency", config.lookupConcurrency);
         inConfig.GetNumber("posix_open_concurrency", config.openConcurrency);
         inConfig.GetNumber("posix_commit_concurrency", config.commitConcurrency);
+        inConfig.GetNumber("posix_write_inflight_limit", config.writeInflightLimit);
         inConfig.GetNumber("timeout_ms", config.timeoutMs);
         inConfig.GetNumber("data_dir_shard_bytes", config.dataDirShardBytes);
         inConfig.Get("posix_gc_enable", config.posixGcEnable);
@@ -354,6 +356,10 @@ private:
                 }
             }
         }
+        if (config.writeInflightLimit < 0 || config.writeInflightLimit > 4096 ||
+            (config.writeInflightLimit != 0 && config.ioEngine != "aio")) {
+            return Status::InvalidParam("posix_write_inflight_limit must be 0..4096 and requires aio when enabled");
+        }
         if (config.deviceId == -1) { return Status::OK(); }
         if (config.tensorSize == 0 || config.shardSize < config.tensorSize ||
             config.blockSize < config.shardSize || config.shardSize % config.tensorSize != 0 ||
@@ -395,6 +401,7 @@ private:
         UC_INFO("Set {}::DataTransConcurrency to {}.", ns, config.dataTransConcurrency);
         UC_INFO("Set {}::LookupConcurrency to {}.", ns, config.lookupConcurrency);
         UC_INFO("Set {}::OpenConcurrency to {}.", ns, config.openConcurrency);
+        UC_INFO("Set {}::WriteInflightLimit to {}.", ns, config.writeInflightLimit);
         UC_INFO("Set {}::CommitConcurrency to {}.", ns, config.commitConcurrency);
         UC_INFO("Set {}::TimeoutMs to {}.", ns, config.timeoutMs);
         UC_INFO("Set {}::DataDirShardBytes to {}.", ns, config.dataDirShardBytes);

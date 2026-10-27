@@ -175,6 +175,7 @@ private:
         config.Get("unique_id", param.uniqueId);
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
         config.Get("cache_full_block_load", param.cacheFullBlockLoad);
+        config.Get("cache_full_block_l1", param.cacheFullBlockL1);
         config.GetNumber("device_id", param.deviceId);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
@@ -224,13 +225,16 @@ private:
     Status CheckConfig(const Config& config)
     {
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
-        if (!EarlyLayoutEnabled() && (config.cacheFullBlockLoad ||
+        if (!EarlyLayoutEnabled() && (config.cacheFullBlockLoad || config.cacheFullBlockL1 ||
                                       config.storeBackend->PackedLayerBytes(0))) {
             return Status::InvalidParam("full-block and packed layouts require EarlyCache");
         }
         if (config.deviceId >= 0 && config.cacheFullBlockLoad &&
             !config.storeBackend->SupportsFullBlockRead()) {
             return Status::InvalidParam("cache_full_block_load requires a full-block read backend");
+        }
+        if (config.cacheFullBlockL1 && (!config.cacheFullBlockLoad || config.cacheLoadBackendOnly)) {
+            return Status::InvalidParam("whole-block L1 requires the Early full-block read path");
         }
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
@@ -270,14 +274,16 @@ private:
             return Status::InvalidParam("Cache SDMA Direct requires RUNTIME_ENVIRONMENT=ascend-a3");
         }
 #endif
-        auto bufferNumber = config.bufferCapacity / config.shardSize;
+        const auto nodeBytes = config.cacheFullBlockL1 ? config.storeBackend->FullBlockReadBytes() : config.shardSize;
+        if (!nodeBytes) { return Status::InvalidParam("invalid physical L1 node size"); }
+        auto bufferNumber = config.bufferCapacity / nodeBytes;
         const size_t minBufferNumber = std::max(size_t(1024), config.loadExclusiveBufferNumber * 2);
         if (bufferNumber < minBufferNumber) {
             const size_t minBufferCapacityGb =
-                (minBufferNumber * config.shardSize + (size_t(1) << 30) - 1) >> 30;
+                (minBufferNumber * nodeBytes + (size_t(1) << 30) - 1) >> 30;
             return Status::InvalidParam(
                 "too small buffer({}) on shard({}), please set cache_buffer_capacity_gb >= {}GB",
-                config.bufferCapacity, config.shardSize, minBufferCapacityGb);
+                config.bufferCapacity, nodeBytes, minBufferCapacityGb);
         }
         if (config.waitingQueueDepth <= 1 || config.runningQueueDepth <= 1) {
             return Status::InvalidParam("invalid queue depth({},{})", config.waitingQueueDepth,
@@ -315,6 +321,7 @@ private:
         }
         UC_INFO("Set {}::ShardSize to {}.", ns, config.shardSize);
         UC_INFO("Set {}::BlockSize to {}.", ns, config.blockSize);
+        UC_INFO("Set {}::CacheFullBlockL1 to {}.", ns, config.cacheFullBlockL1);
         UC_INFO("Set {}::IoDirect to {}.", ns, config.ioDirect);
         UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
         UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
@@ -348,6 +355,8 @@ class EarlyCacheStore final : public CacheStore, public Early::DomainProvider {
     std::unique_ptr<ReservedPrefetch> early_;
     std::unique_ptr<EarlyNativeTransfer> transfers_;
     size_t earlyBlockBytes_{0}, earlyShardBytes_{0}, diskBlockBytes_{0};
+    size_t consumerBlockBytes_{0}, consumerShardBytes_{0};
+    bool fullBlockL1_{false};
 
 protected:
     bool EarlyLayoutEnabled() const override { return true; }
@@ -359,13 +368,15 @@ public:
         if (status.Failure()) { return status; }
 
         const auto param = ParseConfig(config);
-        earlyBlockBytes_ = param.blockSize;
-        earlyShardBytes_ = param.shardSize;
+        earlyBlockBytes_ = consumerBlockBytes_ = param.blockSize;
+        earlyShardBytes_ = consumerShardBytes_ = param.shardSize;
+        fullBlockL1_ = param.cacheFullBlockL1;
         diskBlockBytes_ = param.storeBackend->FullBlockReadBytes();
         if (!diskBlockBytes_) { diskBlockBytes_ = earlyBlockBytes_; }
+        if (param.cacheFullBlockL1) { earlyBlockBytes_ = earlyShardBytes_ = diskBlockBytes_; }
         if (param.deviceId >= 0 && !param.cacheLoadBackendOnly) {
             early_ = std::make_unique<ReservedPrefetch>(
-                &bufferMgr_, param.storeBackend, param.blockSize, param.shardSize,
+                &bufferMgr_, param.storeBackend, earlyBlockBytes_, earlyShardBytes_,
                 param.timeoutMs, param.cacheFullBlockLoad);
             transfers_ = std::make_unique<EarlyNativeTransfer>(*param.storeBackend, transMgr_, param);
         }
@@ -381,6 +392,9 @@ public:
         result.blockBytes = earlyBlockBytes_;
         result.shardBytes = earlyShardBytes_;
         result.diskBlockBytes = diskBlockBytes_;
+        result.consumerBlockBytes = consumerBlockBytes_;
+        result.consumerShardBytes = consumerShardBytes_;
+        result.fullBlockL1 = fullBlockL1_;
         return result;
     }
 

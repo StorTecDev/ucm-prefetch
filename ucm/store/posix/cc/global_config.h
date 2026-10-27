@@ -60,6 +60,8 @@ struct Config {
     size_t lookupConcurrency{16};
     size_t openConcurrency{32};
     size_t commitConcurrency{4};
+    // 0 preserves the shared FIFO; positive values bound admitted writes.
+    int64_t writeInflightLimit{0};
     size_t timeoutMs{30000};
     size_t dataDirShardBytes{3};
     bool posixGcEnable{true};

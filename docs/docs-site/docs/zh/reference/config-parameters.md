@@ -9,7 +9,7 @@ ucm_connectors:
   - ucm_connector_name: UcmPipelineStore
     ucm_connector_config:
       store_pipeline: "Cache|Posix"
-      storage_backends: /mnt/ucm-cache
+      storage_backends: ./ucm-cache
 enable_metrics: true
 ```
 
@@ -22,6 +22,10 @@ enable_metrics: true
 | 配置项 | 是否必填 | 取值类型 | 取值范围 | 配置说明 |
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`，DeepSeek v4 系列模型推荐设置为 `false`。 |
+| `enable_early_prefetch` | 选填 | bool | 默认 `false` | 启用 Early 预取路径；整块读取和 Early 调度选项要求开启。 |
+| `early_prefetch_request_first` | 选填 | bool | 默认 `false` | 启用 Early 时优先读取最早可提交的请求，并利用空闲读取额度回填；关闭时保留 HRRN 轮转。 |
+| `early_prefetch_min_submit_reads` | 选填 | int | 默认 `1`；1–64 | 补充提交所需的最小空闲读取单元数，自动限制在 owner 窗口内。`1` 不合批；I/O 窗口为空时立即补充。 |
+| `early_prefetch_submit_max_wait_ms` | 选填 | number | 默认 `2`；(0, 10] | 合批等待的毫秒上限，到期后在下一次执行器调度提交可用读取；不提供实时保证。 |
 | `enable_event_sync` | 选填 | bool | 默认 `true` | 性能优化开关，推荐开启。 |
 | `persist_token_threshold` | 选填 | int | `0` | 当请求长度小于 `persist_token_threshold` 时，UCM 软件不对该请求进行处理。 |
 | `wa_dump_block_wise` | 选填 | bool | `true` | 仅在 FAWA connector 中使用。`true`: 每个 block 的 WA cache 都会被 dump（高频 dump）；`false`: 只 dump 每个 chunk prefill 最后 block 的 WA cache（低频 dump）。 |
@@ -52,6 +56,7 @@ enable_metrics: true
 | `posix_data_trans_concurrency` | 选填 | int | 默认 `128` | `psync` 模式下单卡对存储的读写线程数。NFS over RDMA 下推荐单卡 128 线程。`aio` 下不读取该值。 |
 | `posix_open_concurrency` | 选填 | int | 默认 `32` | `aio` 下对文件进行 open 操作的线程数。`psync` 下不感知。 |
 | `posix_commit_concurrency` | 选填 | int | 默认 `4` | `aio` 下对文件进行 rename 操作的线程数。`psync` 下不感知。 |
+| `posix_write_inflight_limit` | 选填 | int | 默认 `0`；0–4096 | 当前引擎的并发写操作上限，额度保留到物理完成。`0` 保留 FIFO；正值要求 AIO，读取可绕过受限写入。见[写入窗口](../developer-guide/cache-configuration/pipeline.md#bounded-background-aio-writes)。 |
 | `posix_lookup_concurrency` | 选填 | int | 默认 `16` | 在挂载点中查找文件是否存在的线程数。 |
 
 ## Cache 主机缓冲阶段
@@ -64,7 +69,8 @@ enable_metrics: true
 | `cache_sdma_direct` | 选填 | bool | 依据编译环境变量决定，`PLATFORM=ascend-a3` 时默认 `true`，其他默认 `false` | 启用 SDMA H2D/D2H 传输路径，仅在 A3 设备生效，推荐关闭。 |
 | `cache_load_backend_only` | 选填 | bool | 默认 `false` | 即使在 cache 层命中还是会强制从 SSD 上加载，仅供测试使用。 |
 | `cache_full_block_load` | 选填 | bool | 默认 `false` | 仅限 Early：通过 Posix AIO 整块读入 L1，保留逐层设备搬运。普通 Cache/Posix 拒绝此选项。详见 [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers)。 |
-| `posix_packed_layer_bytes` | 选填 | list[int] | 不设置：均匀磁盘布局 | 仅限 Early 逐层整块管线。按层指定精确的 4096 字节对齐物理长度，并按真实张量验证；L1 仍采用均匀布局。详见[紧凑布局](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout)。 |
+| `cache_full_block_l1` | 选填 | bool | 默认 `false` | 仅限 Early 整块读取，要求 `cache_full_block_load: true`。使用连续整块 L1 与单次 PREAD，保留逐层 H2D。见[整块 L1](../developer-guide/cache-configuration/pipeline.md#whole-block-l1-with-layerwise-h2d)。 |
+| `posix_packed_layer_bytes` | 选填 | list[int] | 不设置：均匀磁盘布局 | 仅限 Early 逐层整块管线。按层指定精确的 4096 字节对齐物理长度，并按真实张量验证；默认 L1 采用均匀布局，整块 L1 使用 packed 偏移。详见[紧凑布局](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout)。 |
 | `cache_io_aggregation` | 选填 | bool | 默认 `false`，仅在 `PLATFORM=ascend` 且模型为 V4 时自动开启 | 启用 IO 聚合 h2d 传输，仅在 A2 设备生效。 |
 | `share_buffer_enable` | 选填 | bool | MLA 默认启用，GQA 默认不启用 | 是否启用共享内存。MLA 如果不用 shm 或 GQA 用 shm 都会导致性能下降。 |
 

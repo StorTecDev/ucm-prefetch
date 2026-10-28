@@ -72,7 +72,10 @@ class ReservedPrefetch::Batch final : public Early::Batch {
             auto& pin = r.Pin(cursor_ + j, shards);
             if (pin) { continue; }
             ++stats_->shards;
-            if (protectionLimitBytes) { pin = owner_.buffer_->TryGet(block, j); }
+            if (protectionLimitBytes) {
+                const bool leasedCopy = r.lease && r.inL2[cursor_ / shards];
+                pin = owner_.buffer_->TryGetForPrefetch(block, j, leasedCopy);
+            }
             if (!pin) {
                 // No part of this block has been submitted. Roll back its new
                 // owners so capacity pressure cannot leave a pinned partial tail.
@@ -194,7 +197,11 @@ class ReservedPrefetch::Batch final : public Early::Batch {
                         ++stats_->shards;
                         const auto epoch = EarlyBufferPins::ReleaseEpoch(*owner_.buffer_);
                         // Native zero reservable slots must not reach FetchNode's modulo.
-                        if (protectionLimitBytes) { pin = owner_.buffer_->TryGet(block, shard); }
+                        if (protectionLimitBytes) {
+                            const bool leasedCopy = r->lease &&
+                                r->inL2[cursor_ / owner_.shardsPerBlock_];
+                            pin = owner_.buffer_->TryGetForPrefetch(block, shard, leasedCopy);
+                        }
                         if (!pin) {
                             if (r->deferred && !cutoff_) {
                                 progress_.waitingCapacity = true;
@@ -355,8 +362,14 @@ public:
             auto hit = owner_.backend_->LookupOnPrefix(uncertain.data(), uncertain.size());
             if (!hit) { return hit.Error(); }
             const auto miss = static_cast<size_t>(hit.Value() + 1);
+            // Deferred L1 hits can disappear before activation. Retain newly
+            // verified positives under the lease so region recovery can reread.
+            for (size_t i = 0; i < std::min(miss, indices.size()); ++i) {
+                r->inL2[indices[i]] = true;
+            }
             if (miss < indices.size()) {
                 groups.resize(indices[miss]); r->blocks.resize(indices[miss]);
+                r->inL2.resize(indices[miss]);
             }
         }
         if (r->cancelled.load()) { return Status::Error("reservation cancelled"); }

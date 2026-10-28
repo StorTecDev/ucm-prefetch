@@ -2973,3 +2973,88 @@ def test_pipeline_dashboard_contains_only_performance_panels_with_chinese_hints(
         any("\u4e00" <= char <= "\u9fff" for char in panel["description"])
         for panel in all_panels
     )
+
+
+def _block_dump_connector(monkeypatch, *, fail_wait=False):
+    connector = object.__new__(UCMLayerWiseConnector)
+    connector._block_dump_finalized = False
+    connector._dump_ready_layers = {0, 2}
+    connector._block_dump_enabled = True
+    connector.first_layer_id = 0
+    connector.tp_rank = 0
+    connector.tp_size = 1
+    connector.enable_event_sync = True
+    connector._get_connector_metadata = lambda: SimpleNamespace(
+        request_meta={"req": SimpleNamespace(dump_block_ids=([b"block"], [7]))}
+    )
+    connector.kv_cache_layout = SimpleNamespace(
+        extract_block_addrs=lambda *args, **kwargs: [[[10]], [[20]], [[30]]]
+    )
+    calls = []
+    connector._flush_pending_dump_tasks = lambda: calls.append("drain_stages")
+    connector._get_dump_event_handle = lambda: 42
+    connector._record_counter = lambda *args: None
+    connector.device = SimpleNamespace(destroy_event_handle=lambda event: calls.append(("destroy", event)))
+    task = object()
+
+    def submit(store, context, blocks, layers, ptrs, event, *, finalize):
+        calls.append((context, blocks, layers, ptrs, event, finalize))
+        return task
+
+    def wait(pending):
+        assert pending.task is task
+        calls.append("wait_final_before_hbm_release")
+        connector._release_dump_event_handle(pending)
+        if fail_wait:
+            raise RuntimeError("controlled incomplete block")
+
+    connector._rank_consistency = SimpleNamespace(submit_dump=submit)
+    connector.store = object()
+    connector._wait_pending_dump_task = wait
+    monkeypatch.setattr(ucm_connector_module.np, "ascontiguousarray", lambda x: x, raising=False)
+    return connector, calls
+
+
+def test_block_dump_finalizer_retries_only_visited_layers_before_hbm_release(monkeypatch):
+    connector, calls = _block_dump_connector(monkeypatch)
+    connector._finalize_block_dumps()
+    assert calls[0] == "drain_stages"
+    assert calls[1] == ({"req": {b"block"}}, [b"block", b"block"], [0, 2], [[10], [30]], 42, True)
+    assert calls[2:] == ["wait_final_before_hbm_release", ("destroy", 42)]
+    connector._finalize_block_dumps()
+    assert len(calls) == 4
+
+
+def test_block_dump_finalizer_drains_failed_completion_and_releases_event(monkeypatch):
+    connector, calls = _block_dump_connector(monkeypatch, fail_wait=True)
+    connector._finalize_block_dumps()
+    assert calls[-2:] == ["wait_final_before_hbm_release", ("destroy", 42)]
+    assert connector._block_dump_finalized
+
+
+def test_block_dump_finalizer_does_not_invent_sources_for_unvisited_batch(monkeypatch):
+    connector, calls = _block_dump_connector(monkeypatch)
+    connector._dump_ready_layers.clear()
+    connector._finalize_block_dumps()
+    assert calls == []
+
+
+def test_rank_consistency_tracks_explicit_block_dump_finalization():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    calls = []
+    stage, final = object(), object()
+    store = SimpleNamespace(
+        dump_data=lambda *args: (calls.append("stage"), stage)[1],
+        finalize_dump_data=lambda *args: (calls.append("final"), final)[1],
+        wait=lambda task: calls.append(task),
+    )
+    assert manager.submit_dump(store, {"r": {b"x"}}, [b"x"], [0], [[1]], 0) is stage
+    manager.wait_dump(stage)
+    assert manager.submit_dump(
+        store, {"r": {b"x"}}, [b"x"], [0], [[1]], 0, finalize=True
+    ) is final
+    manager.wait_dump(final)
+    assert calls == ["stage", stage, "final", final]
+    assert manager._dump_task_contexts == {}

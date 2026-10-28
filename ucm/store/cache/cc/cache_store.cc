@@ -30,6 +30,7 @@
 #include "trans_manager.h"
 #include "reserved_prefetch.h"
 #include "early_native_transfer.h"
+#include "block_dump_queue.h"
 
 #ifndef UCM_RUNTIME_ASCEND_IO_AGGREGATION
 #define UCM_RUNTIME_ASCEND_IO_AGGREGATION 0
@@ -49,6 +50,7 @@ class CacheStore : public StoreV1 {
     std::vector<size_t> packedLayerBytes_;
     std::vector<size_t> tensorSizes_;
     TransManager transMgr_;
+    std::unique_ptr<BlockDumpQueue> blockDumps_;
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
 
 public:
@@ -84,6 +86,11 @@ public:
         if (transEnable_) {
             s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer());
             if (s.Failure()) [[unlikely]] { return s; }
+        }
+        if (transEnable_ && config.cacheFullBlockDump) {
+            blockDumps_ = std::make_unique<BlockDumpQueue>();
+            s = blockDumps_->Setup(config, bufferMgr_.GetTransBuffer());
+            if (s.Failure()) { return s; }
         }
         ShowConfig(config);
         return Status::OK();
@@ -176,6 +183,8 @@ private:
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
         config.Get("cache_full_block_load", param.cacheFullBlockLoad);
         config.Get("cache_full_block_l1", param.cacheFullBlockL1);
+        config.Get("cache_full_block_dump", param.cacheFullBlockDump);
+        config.GetNumber("cache_dump_reserved_blocks", param.cacheDumpReservedBlocks);
         config.GetNumber("device_id", param.deviceId);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
@@ -235,6 +244,11 @@ private:
         }
         if (config.cacheFullBlockL1 && (!config.cacheFullBlockLoad || config.cacheLoadBackendOnly)) {
             return Status::InvalidParam("whole-block L1 requires the Early full-block read path");
+        }
+        if (config.cacheFullBlockDump && (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 ||
+            !config.storeBackend->SupportsFullBlockWrite() || !config.cacheDumpReservedBlocks ||
+            config.useGdr || config.cacheIOAggregation || config.cacheSdmaDirect)) {
+            return Status::InvalidParam("block dump requires Early whole L1 / POSIX AIO and normal DMA");
         }
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
@@ -327,6 +341,8 @@ private:
         UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
         UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
+        UC_INFO("Set {}::CacheFullBlockDump to {}.", ns, config.cacheFullBlockDump);
+        UC_INFO("Set {}::CacheDumpReservedBlocks to {}.", ns, config.cacheDumpReservedBlocks);
         if (config.cacheIOAggregation) {
             UC_INFO("Set {}::AggregationObject to CacheStoreShard.", ns);
         }
@@ -430,14 +446,31 @@ public:
     }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
+        if (blockDumps_) {
+            auto status = CheckPackedTask(task);
+            if (status.Failure()) { return status; }
+            for (const auto& shard : task) {
+                if (shard.index >= bufferMgr_.GetTransBuffer()->LayerCount()) {
+                    return Status::InvalidParam("invalid block dump layer");
+                }
+            }
+            return blockDumps_->Submit({TransTask::Type::DUMP, std::move(task)});
+        }
+        if (task.finalizeBlockDump) { return Status::InvalidParam("block dump is disabled"); }
         if (!early_) { return CacheStore::Dump(std::move(task)); }
         return SubmitBounded(TransTask::Type::DUMP, std::move(task));
     }
 
     Expected<bool> Check(Detail::TaskHandle task) override
-    { return transfers_ ? transfers_->Check(task) : CacheStore::Check(task); }
+    {
+        if (blockDumps_ && blockDumps_->Owns(task)) { return blockDumps_->Check(task); }
+        return transfers_ ? transfers_->Check(task) : CacheStore::Check(task);
+    }
     Status Wait(Detail::TaskHandle task) override
-    { return transfers_ ? transfers_->Wait(task) : CacheStore::Wait(task); }
+    {
+        if (blockDumps_ && blockDumps_->Owns(task)) { return blockDumps_->Wait(task); }
+        return transfers_ ? transfers_->Wait(task) : CacheStore::Wait(task);
+    }
 
 private:
     Expected<Detail::TaskHandle> SubmitBounded(TransTask::Type type, Detail::TaskDesc task)

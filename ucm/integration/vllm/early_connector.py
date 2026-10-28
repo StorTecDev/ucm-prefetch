@@ -40,6 +40,11 @@ class _EarlyConnectorMixin:
         from .early_storage_layout import validate_packed_config, validate_packed_layers
 
         config = self.connector_configs[0]["ucm_connector_config"]
+        if config.get("cache_full_block_dump", False):
+            if not self.launch_config.get("use_layerwise", True) or self.blocks_per_chunk != 1:
+                raise ValueError("cache_full_block_dump requires layerwise mode and one block per chunk")
+            if kv_cache_layout is not None and kv_cache_layout.pp_size != 1:
+                raise ValueError("cache_full_block_dump does not support pipeline parallelism")
         lengths = validate_packed_config(config)
         self._early_disk_block_bytes = sum(lengths) if lengths is not None else None
         if lengths is not None and kv_cache_layout is not None:

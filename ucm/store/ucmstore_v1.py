@@ -209,6 +209,29 @@ class UcmKVStoreBaseV1(ABC):
         """
         pass
 
+    def finalize_dump_data(
+        self,
+        block_ids: List[bytes],
+        shard_index: List[int],
+        src_addr: List[List[int]] | np.ndarray,
+        prerequisite_handle: int = 0,
+    ) -> Task:
+        """Close optional block write transactions while their HBM is valid.
+
+        Args:
+            block_ids: Block identities for the supplied layer address rows.
+            shard_index: Indices of layers whose computation has completed.
+            src_addr: Device addresses kept valid until the returned task is waited.
+            prerequisite_handle: Event recorded after the supplied layers completed.
+
+        Returns:
+            A task that completes after missing-layer copies and backend writes drain.
+
+        Raises:
+            NotImplementedError: This store does not implement block write finalization.
+        """
+        raise NotImplementedError("block write finalization is unsupported by this store")
+
     @abstractmethod
     def wait(self, task: Task) -> None:
         """Block until the given transfer task completes.

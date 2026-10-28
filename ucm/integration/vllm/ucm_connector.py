@@ -2598,6 +2598,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         # (for example by speculative decoding). Persist the first visit only.
         # This state is reset at the start of every connector batch.
         self._dumped_layer_ids: set[int] = set()
+        self._block_dump_enabled = bool(
+            self.connector_configs[0]["ucm_connector_config"].get("cache_full_block_dump", False)
+        )
+        self._dump_ready_layers: set[int] = set()
+        self._block_dump_finalized = False
         self._layerwise_load_start_by_layer: dict[int, float] = {}
         self._layerwise_layer_load_duration_sum_ms = 0.0
         self._layerwise_load_bytes = 0
@@ -2715,6 +2720,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self._dumped_layer_ids.clear()
+        self._dump_ready_layers.clear()
+        self._block_dump_finalized = False
         first_layer_load_start = time.perf_counter()
         metadata = self._get_connector_metadata()
         self.load_tasks.clear()
@@ -2847,6 +2854,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             total_vllm_block_ids.extend(vllm_block_ids)
 
         if dump_request_ids:
+            if getattr(self, "_block_dump_enabled", False):
+                # Visited means compute-ready; submission success alone does not.
+                self._dump_ready_layers.add(layer_id)
             submitted = self._submit_layerwise_dump_task(
                 layer_id,
                 total_ucm_block_ids,
@@ -2856,8 +2866,56 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             if submitted:
                 self._dumped_layer_ids.add(layer_id)
 
+    def _finalize_block_dumps(self) -> None:
+        """Backfill visited layers and drain writes before this batch releases HBM.
+
+        Unvisited layers are never guessed to be valid. Native finalization spills
+        the available layers but reports an incomplete block instead of publishing it.
+        """
+        if self._block_dump_finalized or not self._dump_ready_layers:
+            return
+        self._block_dump_finalized = True
+        self._flush_pending_dump_tasks()
+        metadata = self._get_connector_metadata()
+        block_ids, device_ids = [], []
+        context = {}
+        for request_id, request in metadata.request_meta.items():
+            ids, hbm = request.dump_block_ids
+            if not ids:
+                continue
+            context[request_id] = set(ids)
+            block_ids.extend(
+                ids if self.tp_rank % self.tp_size == 0 else
+                [self.request_hasher(block_id) for block_id in ids]
+            )
+            device_ids.extend(hbm)
+        if not block_ids:
+            return
+        ptrs = self.kv_cache_layout.extract_block_addrs(device_ids, layer_first=True)
+        layers = sorted(self._dump_ready_layers)
+        rows = [ptrs[layer - self.first_layer_id] for layer in layers]
+        event = self._get_dump_event_handle()
+        pending = None
+        try:
+            task = self._rank_consistency.submit_dump(
+                self.store, context, block_ids * len(layers),
+                [layer for layer in layers for _ in block_ids],
+                np.ascontiguousarray(np.concatenate(rows, axis=0)), event,
+                finalize=True,
+            )
+            pending = PendingDumpTask(task=task, request_ids=set(context), event_handle=event)
+            self._wait_pending_dump_task(pending)
+        except Exception as error:
+            logger.error(f"finalize block dump failed: {type(error).__name__}: {error}")
+            self._record_counter("connector_dump_submit_errors_total")
+        finally:
+            if pending is None and self.enable_event_sync and event and self.device is not None:
+                self.device.destroy_event_handle(event)
+
     def wait_for_save(self) -> None:
         wait_for_save_start_ms = time.perf_counter() * 1000
+        if getattr(self, "_block_dump_enabled", False):
+            self._finalize_block_dumps()
         for pending_dump_task in self._pending_dump_tasks:
             if pending_dump_task.wait_for_save_start_ms <= 0:
                 pending_dump_task.wait_for_save_start_ms = wait_for_save_start_ms

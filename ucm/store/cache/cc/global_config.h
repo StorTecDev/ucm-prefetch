@@ -60,6 +60,8 @@ struct Config {
     bool cacheLoadBackendOnly{false};
     bool cacheFullBlockLoad{false};
     bool cacheFullBlockL1{false};
+    bool cacheFullBlockDump{false};
+    size_t cacheDumpReservedBlocks{16};
     std::vector<uintptr_t> gpuKvBufferAddrs{};
     std::vector<size_t> gpuKvBufferSizes{};
     bool useGdr{false};

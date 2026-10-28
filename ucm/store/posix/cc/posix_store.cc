@@ -106,6 +106,19 @@ public:
     std::string Readme() const override { return "PosixStore"; }
     bool SupportsFullBlockRead() const override { return fullBlockReadSupported_; }
     bool SupportsFullBlockWrite() const override { return fullBlockReadSupported_; }
+    Expected<std::shared_ptr<void>> AcquireWriteLease(const Detail::BlockId& block) override
+    {
+        if (!SupportsFullBlockWrite()) { return Status::InvalidParam("write leases unsupported"); }
+        return PosixReadLease::AcquireWriteGuard(*spaceMgr_.GetLayout(), block);
+    }
+    Status CommitDump(const Detail::BlockId& block) override
+    {
+        if (!SupportsFullBlockWrite()) { return Status::InvalidParam("explicit commit unsupported"); }
+        const auto* layout = spaceMgr_.GetLayout();
+        // A failed rename must retain the only persisted copy for a later retry.
+        return PosixFile{layout->DataFilePath(block, true)}.Rename(
+            layout->DataFilePath(block, false));
+    }
     size_t FullBlockReadBytes() const override { return diskBlockBytes_; }
     size_t PackedLayerBytes(size_t index) const override
     { return index < packedLayerBytes_.size() ? packedLayerBytes_[index] : 0; }
@@ -161,7 +174,9 @@ public:
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
-        if (task.fullBlockWrite) { return Status::InvalidParam("full-block write used for load"); }
+        if (task.fullBlockWrite || task.deferWriteCommit || task.finalizeBlockDump) {
+            return Status::InvalidParam("write options used for load");
+        }
         if (task.fullBlockRead) {
             if (!SupportsFullBlockRead()) {
                 return Status::InvalidParam("full-block reads require Posix AIO and a valid iovec size");
@@ -182,7 +197,12 @@ public:
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
-        if (task.fullBlockRead) { return Status::InvalidParam("full-block read used for dump"); }
+        if (task.fullBlockRead || task.finalizeBlockDump) {
+            return Status::InvalidParam("invalid POSIX dump options");
+        }
+        if (task.deferWriteCommit && !SupportsFullBlockWrite()) {
+            return Status::InvalidParam("deferred commit requires EarlyPosix AIO");
+        }
         if (task.fullBlockWrite) {
             if (!SupportsFullBlockWrite()) {
                 return Status::InvalidParam("full-block writes require EarlyPosix AIO");

@@ -175,7 +175,8 @@ private:
                         const BlockOperator::OpenResult& result)
     {
         const auto tid = task->id;
-        const auto last = task->desc.fullBlockWrite || shard.index + 1 == nShardPerBlock_;
+        const auto last = !task->desc.deferWriteCommit &&
+            (task->desc.fullBlockWrite || shard.index + 1 == nShardPerBlock_);
         const auto& id = shard.owner;
         const auto readBytes = task->desc.fullBlockRead ? ioConfig_.DiskBlockBytes()
                                                        : ioConfig_.LayerBytes(shard.index);

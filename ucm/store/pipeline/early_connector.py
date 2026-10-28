@@ -102,13 +102,17 @@ UcmPipelineStoreBuilder.register(_EARLY_PIPELINE, _build_early_pipeline)
 
 
 class EarlyPipelineStore(UcmPipelineStore):
+
+    def wait_dump_sources(self, task):
+        ucmpipelinestore.EarlyWaitDumpSources(self._native_store, task.task_id)
+
     def finalize_dump_data(self, block_ids, shard_index, src_addr, prerequisite_handle=0):
         """Retry compute-ready layers while the connector still owns their HBM.
 
         Args:
             block_ids: Content identities, one per layer address row.
             shard_index: Corresponding layer indices.
-            src_addr: HBM tensor addresses that remain valid through wait().
+            src_addr: HBM tensor addresses valid through wait_dump_sources() or wait().
             prerequisite_handle: Event recorded after the supplied layers completed.
 
         Returns:
@@ -123,9 +127,11 @@ class EarlyPipelineStore(UcmPipelineStore):
         return UcmPipelineStoreTransTask(task)
 
     def __init__(self, config: dict[str, object]) -> None:
-        if config.get("cache_full_block_dump", False) and getattr(
-            ucmpipelinestore, "EARLY_BLOCK_DUMP_PROTOCOL_VERSION", None
-        ) != 1:
+        if (
+            config.get("cache_full_block_dump", False)
+            and getattr(ucmpipelinestore, "EARLY_BLOCK_DUMP_PROTOCOL_VERSION", None)
+            != 2
+        ):
             raise RuntimeError("Block writeback bindings are missing; rebuild UCM for this source")
         pipeline = config.get("store_pipeline")
         if pipeline != "Cache|Posix":

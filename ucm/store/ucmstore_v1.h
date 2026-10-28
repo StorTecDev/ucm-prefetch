@@ -216,6 +216,12 @@ public:
      */
     virtual Status Wait(Detail::TaskHandle taskId) = 0;
 
+    // Optional non-consuming source fence. OK permits HBM reuse, not L2 hits.
+    // All I/O errors must still be observed with the ordinary Wait().
+    virtual Status WaitDumpSources(Detail::TaskHandle)
+    { return Status::Unsupported(); }
+
+
 protected:
     /**
      * @brief Protected default constructor.

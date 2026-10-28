@@ -103,6 +103,9 @@ public:
         Handle WholeView() const
         { Handle result(*this); result.view_ = npos; return result; }
         void MarkFailed(const Status& status) { buf_->MarkFailed(pos_, status); }
+        // Only a layer writer whose DMA has drained may fail this layer alone.
+        void MarkLayerFailed(const Status& status)
+        { if (owner_) { buf_->MarkLayerFailed(pos_, view_, status); } }
 
     private:
         friend class TransBuffer;
@@ -159,6 +162,7 @@ private:
     Status FailureStatus(Index pos);
     void MarkReady(Index pos, size_t view = npos);
     void MarkFailed(Index pos, const Status& status);
+    void MarkLayerFailed(Index pos, size_t view, const Status& status);
     void MarkNotReady(Index pos);
 };
 

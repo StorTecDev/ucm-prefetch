@@ -232,6 +232,15 @@ class UcmKVStoreBaseV1(ABC):
         """
         raise NotImplementedError("block write finalization is unsupported by this store")
 
+    def wait_dump_sources(self, task: Task) -> None:
+        """Wait until accepted dump sources and their event can be released.
+
+        This does not consume the task or report cache publication. The caller
+        must still check/wait for final completion and errors. An exception means
+        source completion was not established, so HBM must not be recycled.
+        """
+        raise NotImplementedError("separate dump source completion is unsupported")
+
     @abstractmethod
     def wait(self, task: Task) -> None:
         """Block until the given transfer task completes.

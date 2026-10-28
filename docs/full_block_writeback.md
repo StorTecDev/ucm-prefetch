@@ -28,8 +28,9 @@ fallback pipeline.
 
 `cache_dump_reserved_blocks` bounds pinned incomplete/active L1 blocks per store,
 including a block whose backend write is being waited. The default is 16, separate
-from `early_owner_max_jobs` and `posix_write_inflight_limit`. Pending task descriptors
-and unfinished block bookkeeping are each bounded by `waiting_queue_depth`.
+from `early_owner_max_jobs` and `posix_write_inflight_limit`. Queued plus unfinished task descriptors, and unfinished block bookkeeping,
+are each bounded by `waiting_queue_depth`. The existing limit also covers background
+completions so separating I/O cannot create an unbounded queue.
 The write worker never waits indefinitely for an L1 slot held by a reader.
 
 ## Data and control flow
@@ -42,10 +43,23 @@ The write worker never waits indefinitely for an L1 slot held by a reader.
    the physical block size. Packed blocks use the sum of their physical layer sizes.
 4. Wait for physical I/O completion, then synchronously rename the temporary file
    into the archived namespace. A failed write or short write never publishes it.
-5. At `wait_for_save`, first drain stage tasks. Resubmit addresses of layers whose
-   save callbacks were actually visited, with a new compute event. Native finalization
-   copies missing layers and waits before HBM can be recycled. Never infer that an
-   unvisited layer is complete. The finalizer runs once per connector batch.
+5. At `wait_for_save`, first wait for stage **source** fences. Resubmit addresses of
+   layers whose save callbacks were actually visited, with a new compute event.
+   Native finalization copies missing layers. `wait_dump_sources()` releases the
+   source/event dependency without consuming the task; `check()`/`wait()` still
+   report final I/O and publication. Never infer that an unvisited layer is complete.
+   The finalizer runs once per connector batch. A failed source fence propagates:
+   logging it and allowing HBM reuse is unsafe.
+6. A drained D2H failure marks only the failed layer. Other READY layers remain
+   valid; a later valid-source submission retries missing/failed layers. Readers
+   waiting on that failed layer can observe FAILED, while the whole block remains
+   unavailable until every layer is READY. Unknown DMA completion retains both
+   endpoints until synchronization proves completion, potentially indefinitely.
+7. A timeout can remove a task still in the source queue. Once dequeued, accepted
+   DMA/I/O must drain before its buffers are released. This does not impose a hard
+   deadline on faulty hardware. L2 failures are observed by ordinary `wait()`, not
+   by the source-only fence. Finished sending to the scheduler refers to HBM safety;
+   successful-dump metadata is delayed until final storage completion.
 
 Worker success reporting treats a successful explicit finalization as repair of
 older dump failures for the same request, logical block and Store. Merely accepting
@@ -87,10 +101,12 @@ connector batch has ended.
 
 ## Performance and observability
 
-This first implementation uses one background write coordinator and waits for each
-backend task before proceeding. The caller can still enqueue layer saves asynchronously,
-but completion waiting provides backpressure and may reduce write parallelism or increase
-`wait_for_save` time. Fewer syscalls alone do not prove better TTFT or throughput. No
+One source worker owns layer state and one independent I/O worker drains L1-to-L2
+writes. With available reservations, another block's D2H can proceed while a disk
+write is pending. Source fences remove the unconditional L2 wait from forward exit
+and request completion. Reservation pressure or a dependency on the same block can
+still require a physical write to drain before source copying continues. The I/O
+worker remains serial; this change does not claim greater storage bandwidth. Fewer syscalls alone do not prove better TTFT or throughput. No
 GPU performance result is implied by the CPU regressions.
 
 Legacy DumpQueue-specific cache timing counters do not cover this separate coordinator;
@@ -102,6 +118,21 @@ write some layers and later rewrite a complete L1 block; include those additiona
 bytes when comparing implementations. The existing POSIX write window counts I/O
 operations, so its byte budget differs between layer writes and whole-block writes.
 
+## Compatibility and unresolved policies
+
+The source-fence binding requires `EARLY_BLOCK_DUMP_PROTOCOL_VERSION = 2`.
+Rebuild the complete native pipeline (StoreV1 gained an optional method), and
+restart all participants. The shared whole-block layout fingerprint also changes
+for the layer-local failure state; do not attach old binaries to a new live domain.
+Early lookup, reservation, and loading algorithms remain unchanged.
+
+Cross-batch HBM retention, durable partial-layer metadata, automatic orphan `.tmp`
+cleanup and cross-process duplicate-writer coalescing are not enabled by this change.
+Incomplete transactions still follow the existing finalization policy: available
+layers can be spilled as unpublished data, and a later valid complete source can
+retry. A failed spill can retain a bounded transaction/pin until retry or shutdown.
+There is no new promise of persistent recovery after a process or machine failure.
+
 ## Tests
 
 The default native test target includes `UCCacheBlockDumpTest.*` in
@@ -110,7 +141,11 @@ real Linux POSIX AIO, with controlled submit hooks. Coverage includes 14-layer u
 and packed blocks, exactly one complete write, missing-layer backfill, unpublished
 partial data, more blocks than L1 slots, failed writes and retries, write leases,
 shared L1, shape validation, factory routing and shutdown draining. The connector
-lifecycle cases live in `test/test_ucm_connector_metrics.py`.
+lifecycle cases live in `test/test_ucm_connector_metrics.py`. Additional regressions
+inject a rejected layer copy, verify retry does not copy READY layers, exercise the
+shared failed-layer state, hold an actual POSIX AIO completion while another source
+copy advances, cancel a queued task, and retain an active write lease through timeout.
+Python cases distinguish HBM source release from successful storage publication.
 
 Build and run in an independent source/build copy with the existing offline dependencies:
 

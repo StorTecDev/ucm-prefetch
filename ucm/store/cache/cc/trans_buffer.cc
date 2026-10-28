@@ -122,7 +122,8 @@ public:
 class LocalBufferStrategy : public BufferStrategy {
     struct BufferHeader {
         size_t buckets[nHashTableBucket];
-        size_t nodeCursor;
+        // Allocations under different bucket locks share this CLOCK cursor.
+        std::atomic<size_t> nodeCursor{0};
         size_t nodeSize;
         size_t nNode;
     };
@@ -254,7 +255,7 @@ public:
     {
         const auto total = header_.nNode - (allowReserved ? 0 : base_.reservedNumber);
         for (size_t i = 0; i < 2 * total; ++i) {
-            auto cur = header_.nodeCursor++ % total;
+            auto cur = header_.nodeCursor.fetch_add(1, std::memory_order_relaxed) % total;
             uint8_t expected = 1;
             if (accessed_[cur].compare_exchange_strong(expected, 0, std::memory_order_relaxed,
                                                        std::memory_order_relaxed)) {
@@ -262,7 +263,7 @@ public:
             }
             return cur;
         }
-        return header_.nodeCursor++ % total;
+        return header_.nodeCursor.fetch_add(1, std::memory_order_relaxed) % total;
     }
     void MarkAccessed(size_t iNode) override
     {
@@ -782,6 +783,19 @@ TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shar
 
 TransBuffer::Handle TransBuffer::TryGet(const Detail::BlockId& blockId, size_t shardIdx)
 {
+    return TryGetImpl(blockId, shardIdx, false);
+}
+
+TransBuffer::Handle TransBuffer::TryGetForPrefetch(const Detail::BlockId& blockId,
+                                                size_t shardIdx, bool hasLeasedL2Copy)
+{
+    return TryGetImpl(blockId, shardIdx, hasLeasedL2Copy);
+}
+
+TransBuffer::Handle TransBuffer::TryGetImpl(const Detail::BlockId& blockId, size_t shardIdx,
+                                          bool reloadReserved)
+{
+    if (wholeBlock_ && shardIdx >= LayerCount()) { return {}; }
     // Early's whole-block reservation uses one native key/pin per block.
     const auto key = wholeBlock_ ? 0 : shardIdx;
     auto bucket = Hash(blockId, key);
@@ -789,9 +803,17 @@ TransBuffer::Handle TransBuffer::TryGet(const Detail::BlockId& blockId, size_t s
     strategy_->BucketLock(bucket);
     auto node = FindAt(bucket, blockId, key, owner);
     if (node != invalidIndex && !strategy_->CanReserve(node)) {
-        Release(node);
-        strategy_->BucketUnlock(bucket);
-        return {};
+        if (reloadReserved) {
+            node = ReplaceReservedForPrefetch(node, bucket);
+        } else {
+            Release(node);
+            node = invalidIndex;
+        }
+        if (node == invalidIndex) {
+            strategy_->BucketUnlock(bucket);
+            return {};
+        }
+        owner = true;  // The caller must load the new ordinary destination.
     }
     if (node == invalidIndex && strategy_->CanReserve(0)) {
         node = Alloc(blockId, key, bucket, false, 2 * strategy_->NodeCount());
@@ -800,6 +822,42 @@ TransBuffer::Handle TransBuffer::TryGet(const Detail::BlockId& blockId, size_t s
     auto handle = MakeHandle(node, shardIdx, owner, true, wholeBlock_);
     strategy_->BucketUnlock(bucket);
     return handle;
+}
+
+TransBuffer::Index TransBuffer::ReplaceReservedForPrefetch(Index source, size_t bucket)
+{
+    // FindAt already acquired our private reference. The bucket serializes
+    // identity lookups; the reference prevents concurrent allocator reuse.
+    auto* src = strategy_->MetaAt(source);
+    strategy_->NodeLock(source);
+    const bool eligible = src->hash == bucket && src->reference == 1 &&
+                          src->state.load(std::memory_order_acquire) == State::READY &&
+                          !strategy_->CanReserve(source) && strategy_->CanReserve(0);
+    strategy_->NodeUnlock(source);
+    if (!eligible) {
+        Release(source);
+        return invalidIndex;
+    }
+    // Acquire capacity before discarding X. Alloc's old-bucket try-lock and
+    // finite scan bound are unchanged. Do not hold the source node lock here:
+    // hash-chain maintenance may lock it as the destination's neighbour.
+    const auto destination = Alloc(src->block, src->shard, bucket, false,
+                                   2 * strategy_->NodeCount());
+    if (destination == invalidIndex) {
+        Release(source);
+        return invalidIndex;
+    }
+    // The ordinary destination is already pinned and LOADING. Both temporary
+    // mappings are hidden behind this bucket lock. No data is copied or READY
+    // published here: the caller's leased L2 read must do that after completion.
+    strategy_->NodeLock(source);
+    Remove(bucket, source);
+    src->state.store(State::LOADING, std::memory_order_release);
+    src->errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
+    ResetBlockState(source);
+    strategy_->NodeUnlock(source);
+    Release(source);
+    return destination;
 }
 
 void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved)

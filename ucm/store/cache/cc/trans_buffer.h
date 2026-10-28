@@ -129,6 +129,10 @@ public:
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     Handle TryGet(const Detail::BlockId& blockId, size_t shardIdx);
+    // Only the Early reservation holding a lease and a positive L2 lookup may
+    // replace an idle READY load-exclusive entry with an ordinary read target.
+    Handle TryGetForPrefetch(const Detail::BlockId& blockId, size_t shardIdx,
+                             bool hasLeasedL2Copy);
     void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);
     bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
 
@@ -142,6 +146,10 @@ private:
     void Remove(size_t iBucket, size_t iNode);
     Handle MakeHandle(Index pos, size_t shard, bool owner, bool load, bool whole = false);
     void ResetBlockState(Index pos);
+    Handle TryGetImpl(const Detail::BlockId& blockId, size_t shardIdx, bool reloadReserved);
+    // Source bucket held, one source reference owned. Consumes that reference
+    // on every path; success returns one reference to an ordinary LOADING node.
+    Index ReplaceReservedForPrefetch(Index source, size_t bucket);
     void* DataAt(Index pos, size_t view = npos);
     void* DeviceDataAt(Index pos, size_t view = npos);
     void Acquire(Index pos);

@@ -69,7 +69,8 @@ protected:
     std::vector<std::array<char, kBytes>> source;
     std::vector<size_t> sizes;
 
-    void Start(size_t layers = 3, size_t budget = 16, bool packed = false, bool shared = false)
+    void Start(size_t layers = 3, size_t budget = 16, bool packed = false, bool shared = false,
+               std::string policy = "spill")
     {
         Detail::Dictionary config;
         config.Set("storage_backends", std::vector<std::string>{Path()});
@@ -104,6 +105,7 @@ protected:
         cache.streamNumber = 1;
         cache.cacheFullBlockL1 = cache.cacheFullBlockLoad = cache.cacheFullBlockDump = true;
         cache.cacheDumpReservedBlocks = budget;
+        cache.cacheDumpCapacityPolicy = std::move(policy);
         cache.storeBackend = backend.get();
         cache.timeoutMs = 3000;
         manager = std::make_unique<CacheStore::BufferManager>();
@@ -327,6 +329,8 @@ TEST_F(UCCacheBlockDumpTest, FactoryRoutesWriteCompletionWithoutChangingReadEntr
     config.Set("cache_full_block_load", true);
     config.Set("cache_full_block_l1", true);
     config.Set("cache_full_block_dump", true);
+    config.Set("cache_dump_capacity_policy", std::string{"wait"});
+    config.SetNumber("cache_dump_reserved_blocks", 1);
     std::unique_ptr<StoreV1> store{MakeEarlyCacheStore()};
     ASSERT_EQ(store->Setup(config), Status::OK());
     auto id = Id(32);
@@ -600,4 +604,269 @@ TEST_F(UCCacheBlockDumpTest, LaterFinalizationCompletesAnInFlightPartialSpill)
     EXPECT_EQ(queue->Wait(partial.Value()), Status::NotFound());
     EXPECT_EQ(queue->Wait(repaired.Value()), Status::OK());
     Verify(id);
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyCompletesInterleavedBlocksBeyondL1Capacity)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    std::vector<Detail::TaskHandle> tasks;
+    for (size_t layer = 0; layer < 3; ++layer) {
+        Detail::TaskDesc desc;
+        for (unsigned char block = 60; block < 68; ++block) {
+            auto part = Describe(Id(block), {layer}, false);
+            desc.insert(desc.end(), part.begin(), part.end());
+        }
+        auto task = queue->Submit({TransTask::Type::DUMP, std::move(desc)});
+        ASSERT_TRUE(task);
+        tasks.push_back(task.Value());
+    }
+    Detail::TaskDesc final;
+    final.finalizeBlockDump = true;
+    for (unsigned char block = 60; block < 68; ++block) {
+        auto part = Describe(Id(block), {0, 1, 2}, true);
+        final.insert(final.end(), part.begin(), part.end());
+    }
+    auto task = queue->Submit({TransTask::Type::DUMP, std::move(final)});
+    ASSERT_TRUE(task);
+    tasks.push_back(task.Value());
+    for (auto id : tasks) { EXPECT_EQ(queue->Wait(id), Status::OK()); }
+    ASSERT_EQ(trace.writes.size(), 8);
+    for (const auto& write : trace.writes) {
+        EXPECT_EQ(write, std::make_pair(size_t{0}, 3 * kBytes));
+    }
+    for (unsigned char block = 60; block < 68; ++block) { Verify(Id(block)); }
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyDoesNotReuseSlotBeforePhysicalWriteCompletes)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    std::atomic_bool once{false};
+    trace.beforeCompletion = [&] {
+        if (!once.exchange(true)) { entered.set_value(); releaseFuture.wait(); }
+    };
+    ASSERT_EQ(Send(Describe(Id(62), {0}, false)), Status::OK());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(63), {0}, false)});
+    ASSERT_TRUE(waiting);
+    auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(waiting.Value()); });
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    auto owner = queue->Submit({TransTask::Type::DUMP, Describe(Id(62), {1, 2}, true)});
+    ASSERT_TRUE(owner);
+    EXPECT_EQ(queue->WaitSources(owner.Value()), Status::OK());
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    EXPECT_FALSE(backend->AcquireWriteLease(Id(62)));
+    release.set_value();
+    EXPECT_EQ(fence.get(), Status::OK());
+    EXPECT_EQ(queue->Wait(owner.Value()), Status::OK());
+    EXPECT_EQ(queue->Wait(waiting.Value()), Status::OK());
+    EXPECT_EQ(Send(Describe(Id(63), {0, 1, 2}, true)), Status::OK());
+    ASSERT_EQ(trace.writes.size(), 2);
+    Verify(Id(62)); Verify(Id(63));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyAllowsConfiguredNumberOfResidentBlocks)
+{
+    Start(3, 2, false, false, "wait");
+    WriteTrace trace;
+    EXPECT_EQ(Send(Describe(Id(64), {0}, false)), Status::OK());
+    EXPECT_EQ(Send(Describe(Id(65), {0}, false)), Status::OK());
+    auto first = CacheStore::EarlyBufferPins::Acquire(*manager->GetTransBuffer(), Id(64), 0, false);
+    auto second = CacheStore::EarlyBufferPins::Acquire(*manager->GetTransBuffer(), Id(65), 0, false);
+    EXPECT_TRUE(first && first.Ready());
+    EXPECT_TRUE(second && second.Ready());
+    EXPECT_TRUE(trace.writes.empty());
+    first = {}; second = {};
+    EXPECT_EQ(Send(Describe(Id(64), {0, 1, 2}, true)), Status::OK());
+    EXPECT_EQ(Send(Describe(Id(65), {0, 1, 2}, true)), Status::OK());
+    EXPECT_EQ(trace.writes.size(), 2);
+    Verify(Id(64)); Verify(Id(65));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyFinalizationRepairsOwnerBeforeWaitingBlock)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    std::array<size_t, 3> copies{};
+    CacheStore::TestHooks::blockDumpCopyHook = [&](const auto& shard) {
+        if (shard.owner != Id(66)) { return Status::OK(); }
+        ++copies[shard.index];
+        return shard.index == 1 && copies[1] == 1 ? Status::Error("controlled copy failure") : Status::OK();
+    };
+    EXPECT_EQ(Send(Describe(Id(66), {0}, false)), Status::OK());
+    EXPECT_TRUE(Send(Describe(Id(66), {1}, false)).Failure());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(67), {0}, false)});
+    ASSERT_TRUE(waiting);
+    auto final = Describe(Id(66), {0, 1, 2}, true);
+    auto second = Describe(Id(67), {0, 1, 2}, true);
+    final.insert(final.end(), second.begin(), second.end());
+    auto task = queue->Submit({TransTask::Type::DUMP, std::move(final)});
+    ASSERT_TRUE(task);
+    EXPECT_EQ(queue->Wait(waiting.Value()), Status::OK());
+    EXPECT_EQ(queue->Wait(task.Value()), Status::OK());
+    CacheStore::TestHooks::blockDumpCopyHook = {};
+    EXPECT_EQ(copies, (std::array<size_t, 3>{1, 2, 1}));
+    EXPECT_EQ(trace.writes.size(), 2);
+    Verify(Id(66)); Verify(Id(67));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyIncompleteFinalizationUsesOnlyTerminalSpill)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    EXPECT_EQ(Send(Describe(Id(68), {0}, false)), Status::OK());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(69), {0, 1, 2}, true)});
+    ASSERT_TRUE(waiting);
+    auto closing = queue->Submit({TransTask::Type::DUMP, Describe(Id(68), {0}, true)});
+    ASSERT_TRUE(closing);
+    EXPECT_EQ(queue->Wait(closing.Value()), Status::NotFound());
+    EXPECT_EQ(queue->Wait(waiting.Value()), Status::OK());
+    ASSERT_EQ(trace.writes.size(), 2);
+    EXPECT_EQ(trace.writes[0], std::make_pair(size_t{0}, kBytes));
+    EXPECT_EQ(trace.writes[1], std::make_pair(size_t{0}, 3 * kBytes));
+    auto incomplete = Id(68);
+    EXPECT_EQ(backend->LookupOnPrefix(&incomplete, 1).Value(), -1);
+    Verify(Id(69));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyRetainsQueuedSourcesAcrossTimeoutAndExternalPressure)
+{
+    Start(3, 1, false, false, "wait");
+    queue.reset();
+    cache.timeoutMs = 80;
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    ASSERT_EQ(queue->Setup(cache, manager->GetTransBuffer()), Status::OK());
+    std::vector<CacheStore::TransBuffer::Handle> occupied;
+    for (unsigned char i = 70; i < 74; ++i) {
+        occupied.push_back(CacheStore::EarlyBufferPins::Acquire(*manager->GetTransBuffer(), Id(i), 0, false));
+        ASSERT_TRUE(occupied.back());
+    }
+    auto task = queue->Submit({TransTask::Type::DUMP, Describe(Id(74), {0, 1, 2}, true)});
+    ASSERT_TRUE(task);
+    auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(task.Value()); });
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(300)), std::future_status::timeout);
+    EXPECT_FALSE(queue->Check(task.Value()).Value());
+    occupied.clear();
+    EXPECT_EQ(fence.get(), Status::OK());
+    EXPECT_EQ(queue->Wait(task.Value()), Status::Timeout());
+    Verify(Id(74));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyReservesFinalizationAdmission)
+{
+    Start(3, 1, false, false, "wait");
+    queue.reset();
+    cache.waitingQueueDepth = 2;
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    ASSERT_EQ(queue->Setup(cache, manager->GetTransBuffer()), Status::OK());
+    EXPECT_EQ(Send(Describe(Id(75), {0}, false)), Status::OK());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(76), {0}, false)});
+    ASSERT_TRUE(waiting);
+    auto rejected = queue->Submit({TransTask::Type::DUMP, Describe(Id(77), {0}, false)});
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(queue->Wait(rejected.Value()), Status::NoSpace());
+    auto final = Describe(Id(75), {0, 1, 2}, true);
+    auto second = Describe(Id(76), {0, 1, 2}, true);
+    final.insert(final.end(), second.begin(), second.end());
+    auto task = queue->Submit({TransTask::Type::DUMP, std::move(final)});
+    ASSERT_TRUE(task);
+    EXPECT_EQ(queue->Wait(waiting.Value()), Status::OK());
+    EXPECT_EQ(queue->Wait(task.Value()), Status::OK());
+    Verify(Id(75)); Verify(Id(76));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyShutdownDrainsAcceptedPartialBlocks)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    EXPECT_EQ(Send(Describe(Id(78), {0}, false)), Status::OK());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(79), {0}, false)});
+    ASSERT_TRUE(waiting);
+    queue.reset();
+    EXPECT_EQ(trace.writes.size(), 2);
+    auto incomplete = Id(79);
+    EXPECT_EQ(backend->LookupOnPrefix(&incomplete, 1).Value(), -1);
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyFailedWriterReportsErrorInsteadOfHoldingWaitersForever)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    trace.fail = true;
+    EXPECT_TRUE(Send(Describe(Id(80), {0, 1, 2}, true)).Failure());
+    EXPECT_TRUE(Send(Describe(Id(81), {0, 1, 2}, true)).Failure());
+    trace.fail = false;
+    EXPECT_EQ(Send(Describe(Id(80), {0, 1, 2}, true)), Status::OK());
+    EXPECT_EQ(Send(Describe(Id(81), {0, 1, 2}, true)), Status::OK());
+    Verify(Id(80)); Verify(Id(81));
+}
+
+TEST_F(UCCacheBlockDumpTest, InvalidCapacityPolicyIsRejected)
+{
+    Start();
+    queue.reset();
+    cache.cacheDumpCapacityPolicy = "unknown";
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    EXPECT_TRUE(queue->Setup(cache, manager->GetTransBuffer()).Failure());
+    Detail::Dictionary config;
+    config.Set("store_backend", backend.get());
+    config.Set("cache_dump_capacity_policy", std::string{"unknown"});
+    std::unique_ptr<StoreV1> invalid{MakeEarlyCacheStore()};
+    EXPECT_TRUE(invalid->Setup(config).Failure());
+    config.Set("cache_dump_capacity_policy", std::string{"wait"});
+    std::unique_ptr<StoreV1> disabled{MakeEarlyCacheStore()};
+    EXPECT_TRUE(disabled->Setup(config).Failure());
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyObservesReadyWithoutRequiringForeignPinRelease)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    auto& buffer = *manager->GetTransBuffer();
+    auto reader = CacheStore::EarlyBufferPins::Acquire(buffer, Id(82), 0, true);
+    ASSERT_TRUE(reader && reader.Owner());
+    auto full = reader.WholeView();
+    auto task = queue->Submit({TransTask::Type::DUMP, Describe(Id(82), {0, 1, 2}, true)});
+    ASSERT_TRUE(task);
+    auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(task.Value()); });
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    const auto epoch = CacheStore::EarlyBufferPins::ReleaseEpoch(buffer);
+    for (size_t layer = 0; layer < 3; ++layer) {
+        std::memcpy(static_cast<char*>(full.Data()) + layer*kBytes, source[layer].data(), kBytes);
+    }
+    full.MarkReady();
+    EXPECT_EQ(CacheStore::EarlyBufferPins::ReleaseEpoch(buffer), epoch);
+    const bool completed = fence.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+    EXPECT_TRUE(completed);
+    if (!completed) { full = {}; reader = {}; }  // let a failed assertion still drain
+    EXPECT_EQ(fence.get(), Status::OK());
+    EXPECT_EQ(queue->Wait(task.Value()), Status::OK());
+    ASSERT_EQ(trace.writes.size(), 1);
+    Verify(Id(82));
+}
+
+TEST_F(UCCacheBlockDumpTest, WaitPolicyReportsForeignLoadFailureWithoutWaitingForPinRelease)
+{
+    Start(3, 1, false, false, "wait");
+    WriteTrace trace;
+    auto& buffer = *manager->GetTransBuffer();
+    auto reader = CacheStore::EarlyBufferPins::Acquire(buffer, Id(83), 0, true);
+    ASSERT_TRUE(reader && reader.Owner());
+    auto task = queue->Submit({TransTask::Type::DUMP, Describe(Id(83), {0, 1, 2}, true)});
+    ASSERT_TRUE(task);
+    auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(task.Value()); });
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    reader.MarkFailed(Status::Error("controlled foreign read failure"));
+    const bool completed = fence.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+    EXPECT_TRUE(completed);
+    if (!completed) { reader = {}; }
+    EXPECT_EQ(fence.get(), Status::OK());
+    EXPECT_TRUE(queue->Wait(task.Value()).Failure());
+    EXPECT_TRUE(trace.writes.empty());
+    auto missing = Id(83);
+    EXPECT_EQ(backend->LookupOnPrefix(&missing, 1).Value(), -1);
 }

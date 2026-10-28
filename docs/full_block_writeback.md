@@ -13,7 +13,7 @@ In the existing `ucm_connector_config`, use:
 cache_full_block_load: true
 cache_full_block_l1: true
 cache_full_block_dump: true
-cache_dump_reserved_blocks: 16
+cache_dump_reserved_blocks: 0
 cache_dump_capacity_policy: spill
 posix_io_engine: aio
 ```
@@ -34,11 +34,19 @@ not create a dump queue. A scheduler can query L2 or attach to existing shared L
 metadata without supplying worker tensor sizes. This does not relax worker backend
 capability checks or shared-layout validation.
 
-`cache_dump_reserved_blocks` bounds pinned incomplete/active L1 blocks per store,
-including a block whose backend write is being waited. The default is 16, separate
-from `early_owner_max_jobs` and `posix_write_inflight_limit`. Queued plus unfinished task descriptors, and unfinished block bookkeeping,
-are each bounded by `waiting_queue_depth`. The existing limit also covers background
-completions so separating I/O cannot create an unbounded queue.
+`cache_dump_reserved_blocks` defaults to **0**, meaning no additional limit on
+pinned incomplete/active writeback blocks per store. A positive value sets that
+holding limit, including blocks awaiting backend write completion. This setting
+never partitions or preallocates a physical write-only region; writers acquire
+ordinary L1 slots, shared with Early prefetch. Zero does not remove actual L1
+capacity, reference protection or queue backpressure. It is separate from
+`early_owner_max_jobs` and `posix_write_inflight_limit`, which are unchanged.
+Queued plus unfinished task descriptors, and unfinished block bookkeeping, are
+each bounded by `waiting_queue_depth`. The existing limit also covers background
+completions so separating I/O cannot create an unbounded queue. Configurations that
+omit this option now use zero; set an explicit positive value to retain a previous
+holding limit.
+
 `cache_dump_capacity_policy` accepts `spill` (the default) or `wait`. Unknown
 values fail configuration; `wait` requires `cache_full_block_dump`. Both policies
 use the same reservation budget, which is a per-store holding limit rather than a
@@ -105,16 +113,19 @@ must continue to refer to immutable KV data, as in the existing cache protocol.
 
 ## Capacity pressure and incomplete blocks
 
-With `cache_dump_capacity_policy: spill`, an exhausted reservation budget causes
-the READY layers of another incomplete block to be written using their original
-layer offsets. Wait for those writes before releasing its L1 reference. Track
-successfully persisted layers independently of L1 residency. This permits progress
+With `cache_dump_capacity_policy: spill`, an exhausted positive reservation budget
+or actual L1 allocation failure causes the READY layers of another incomplete block
+to be written using their original layer offsets. At budget zero, only actual L1
+allocation pressure triggers this capacity fallback. Wait for those writes before
+releasing its L1 reference. Track successfully persisted layers independently of
+L1 residency. This permits progress
 even when a batch contains more blocks than L1 can hold.
 
 With `cache_dump_capacity_policy: wait`, ordinary capacity pressure never causes a
 partial write. Defer the block needing a new slot while continuing later layer
-submissions for blocks that already hold one. For the order A0, B0, A1, B1, A2, B2
-and one reservation, B waits while A1/A2 complete A; A is written as one full block,
+submissions for blocks that already hold one. Budget zero removes quota-induced
+waiting; a block still waits when no physical L1 slot can be acquired. For the
+order A0, B0, A1, B1, A2, B2 and one reservation, B waits while A1/A2 complete A; A is written as one full block,
 and its slot becomes available to B only after physical I/O completion. Preserve
 submission order within each block, including finalization. The unit is a block,
 not a request, which may contain many blocks.
@@ -126,8 +137,9 @@ detected through the shared release epoch, checked on a 2 ms wait interval while
 Capacity-only waiters are rescanned on release or task/I/O progress. A follower of
 another loader also rechecks READY on that interval: the loader can finish while
 keeping a consumer pin, without changing the release epoch.
-Slot admission scans only resident writers, bounded by the reservation budget,
-rather than all blocks described by queued tasks.
+Wait-policy quota checks and physical-capacity failure checks scan only resident
+writers. Their number is bounded by actual L1 slots and any positive reservation
+budget, rather than all blocks described by queued tasks.
 A known failed writer is retained for a valid-source retry; blocked submissions
 report that storage failure instead of waiting forever for its pinned slot.
 
@@ -204,7 +216,12 @@ timeouts, reserved finalizer admission, and storage failure propagation. Schedul
 regressions cover initialization without worker KV dimensions, shared-L1 lookup,
 and rejection of invalid static configuration; workers still reject backends
 without full-block write capability. Both capacity policies are covered. Invalid
-policies and wait-without-block-dump are rejected.
+policies and wait-without-block-dump are rejected. Zero-budget regressions hold
+20 incomplete blocks without premature spill in both policies, then verify one
+full write per block. They also exhaust physical L1, retain pins through slow
+writes, preserve bounded queue/finalizer admission, and report a failed writer
+instead of waiting forever for its occupied slot. Existing positive-budget cases
+continue to exercise explicit holding limits.
 The connector
 lifecycle cases live in `test/test_ucm_connector_metrics.py`. Additional regressions
 inject a rejected layer copy, verify retry does not copy READY layers, exercise the

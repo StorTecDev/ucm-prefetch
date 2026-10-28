@@ -253,10 +253,10 @@ private:
             return Status::InvalidParam("wait capacity policy requires cache_full_block_dump");
         }
         if (config.cacheFullBlockDump &&
-            (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 || !config.cacheDumpReservedBlocks ||
-             config.useGdr || config.cacheIOAggregation || config.cacheSdmaDirect)) {
+            (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 || config.useGdr ||
+             config.cacheIOAggregation || config.cacheSdmaDirect)) {
             return Status::InvalidParam(
-                "block dump requires Early whole L1, positive reservations and normal DMA");
+                "block dump requires Early whole L1 and normal DMA");
         }
         // Scheduler stores may lack KV dimensions and never create a dump queue.
         if (config.deviceId >= 0 && config.cacheFullBlockDump &&

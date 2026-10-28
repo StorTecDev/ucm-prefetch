@@ -99,9 +99,8 @@ public:
 
     Status Setup(const Config& config, TransBuffer* buffer)
     {
-        if (!buffer->WholeBlock() || !config.storeBackend->SupportsFullBlockWrite() ||
-            config.cacheDumpReservedBlocks == 0) {
-            return Status::InvalidParam("block dump requires whole L1, a write backend and a budget");
+        if (!buffer->WholeBlock() || !config.storeBackend->SupportsFullBlockWrite()) {
+            return Status::InvalidParam("block dump requires whole L1 and a write backend");
         }
         if (config.cacheDumpCapacityPolicy != "spill" && config.cacheDumpCapacityPolicy != "wait") {
             return Status::InvalidParam("cache_dump_capacity_policy must be spill or wait");
@@ -454,16 +453,23 @@ private:
         return WaitWrite(block);
     }
 
+    Status ResidentWriteFailure() const
+    {
+        for (const auto* block : resident_) {
+            // A known failed writer needs a retry, not more capacity waiting.
+            if (block->writeFailure.Failure()) { return block->writeFailure; }
+        }
+        return Status::OK();
+    }
+
     Status MakeRoom(const Detail::BlockId& id)
     {
+        // Zero removes only the holding quota; Fill still acquires a real L1 slot.
+        if (config_.cacheDumpReservedBlocks == 0) { return Status::OK(); }
         if (WaitForCapacity()) {
             if (resident_.size() < config_.cacheDumpReservedBlocks) { return Status::OK(); }
-            for (const auto* block : resident_) {
-                // A known failed writer cannot release its slot by waiting.
-                // Preserve its data for retry and surface the failure to waiters.
-                if (block->writeFailure.Failure()) { return block->writeFailure; }
-            }
-            return Status::NoSpace();
+            auto failure = ResidentWriteFailure();
+            return failure.Failure() ? failure : Status::NoSpace();
         }
         size_t pins = 0;
         for (auto& [key, block] : blocks_) { ApplyWrite(block); pins += bool(block.pin); }
@@ -509,6 +515,10 @@ private:
         }
         if (!handle || (!handle.Owner() && !handle.Ready())) {
             if (WaitForCapacity()) {
+                if (!handle) {
+                    auto failure = ResidentWriteFailure();
+                    if (failure.Failure()) { return failure; }
+                }
                 if (handle && handle.GetState() == TransBuffer::State::FAILED) {
                     return handle.FailureStatus();
                 }

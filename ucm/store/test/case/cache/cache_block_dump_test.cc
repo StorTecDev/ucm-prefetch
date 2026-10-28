@@ -48,7 +48,6 @@ Detail::Dictionary BlockDumpConfig(StoreV1* backend)
     config.Set("cache_full_block_load", true);
     config.Set("cache_full_block_l1", true);
     config.Set("cache_full_block_dump", true);
-    config.SetNumber("cache_dump_reserved_blocks", 1);
     return config;
 }
 
@@ -95,8 +94,8 @@ protected:
     std::vector<std::array<char, kBytes>> source;
     std::vector<size_t> sizes;
 
-    void Start(size_t layers = 3, size_t budget = 16, bool packed = false, bool shared = false,
-               std::string policy = "spill")
+    void Start(size_t layers = 3, size_t budget = 0, bool packed = false, bool shared = false,
+               std::string policy = "spill", size_t slots = 4)
     {
         Detail::Dictionary config;
         config.Set("storage_backends", std::vector<std::string>{Path()});
@@ -123,7 +122,7 @@ protected:
         cache.tensorSizes = {4096, 4096};
         cache.shardSize = kBytes;
         cache.blockSize = kBytes * layers;
-        cache.bufferCapacity = cache.blockSize * 4;
+        cache.bufferCapacity = cache.blockSize * slots;
         cache.loadExclusiveBufferNumber = 0;
         cache.shareBufferEnable = shared;
         cache.localRankSize = 1;
@@ -178,6 +177,31 @@ protected:
         for (size_t i = 0; i < sizes.size(); ++i) {
             EXPECT_EQ(std::memcmp(result.data() + offset, source[i].data(), sizes[i]), 0);
             offset += sizes[i];
+        }
+    }
+
+    void CheckZeroBudgetResidency(const std::string& policy)
+    {
+        EXPECT_EQ(CacheStore::Config{}.cacheDumpReservedBlocks, size_t{0});
+        ASSERT_NO_FATAL_FAILURE(Start(3, 0, false, false, policy, 20));
+        WriteTrace trace;
+        for (unsigned char block = 100; block < 120; ++block) {
+            ASSERT_EQ(Send(Describe(Id(block), {0}, false)), Status::OK());
+        }
+        EXPECT_TRUE(trace.writes.empty());
+        for (unsigned char block = 100; block < 120; ++block) {
+            auto pin = CacheStore::EarlyBufferPins::Acquire(
+                *manager->GetTransBuffer(), Id(block), 0, false);
+            ASSERT_TRUE(pin && pin.Ready());
+            EXPECT_FALSE(pin.WholeView().Ready());
+        }
+        for (unsigned char block = 100; block < 120; ++block) {
+            ASSERT_EQ(Send(Describe(Id(block), {0, 1, 2}, true)), Status::OK());
+            Verify(Id(block));
+        }
+        ASSERT_EQ(trace.writes.size(), 20);
+        for (const auto& write : trace.writes) {
+            EXPECT_EQ(write, std::make_pair(size_t{0}, 3 * kBytes));
         }
     }
 
@@ -433,7 +457,6 @@ TEST_F(UCCacheBlockDumpTest, SchedulerStillRejectsInvalidBlockDumpConfiguration)
         {"missing full L1", [](auto& c) { c.Set("cache_full_block_l1", false); }},
         {"missing full load", [](auto& c) { c.Set("cache_full_block_load", false); }},
         {"backend only", [](auto& c) { c.Set("cache_load_backend_only", true); }},
-        {"zero reservations", [](auto& c) { c.SetNumber("cache_dump_reserved_blocks", 0); }},
         {"unknown policy", [](auto& c) {
              c.Set("cache_dump_capacity_policy", std::string{"unknown"});
          }},
@@ -997,4 +1020,109 @@ TEST_F(UCCacheBlockDumpTest, WaitPolicyReportsForeignLoadFailureWithoutWaitingFo
     EXPECT_TRUE(trace.writes.empty());
     auto missing = Id(83);
     EXPECT_EQ(backend->LookupOnPrefix(&missing, 1).Value(), -1);
+}
+
+TEST_F(UCCacheBlockDumpTest, ZeroBudgetSpillAllowsMoreThanSixteenResidentBlocks)
+{
+    CheckZeroBudgetResidency("spill");
+}
+
+TEST_F(UCCacheBlockDumpTest, ZeroBudgetWaitAllowsMoreThanSixteenResidentBlocks)
+{
+    CheckZeroBudgetResidency("wait");
+}
+
+TEST_F(UCCacheBlockDumpTest, ZeroBudgetSpillStillReclaimsAtPhysicalL1Capacity)
+{
+    ASSERT_NO_FATAL_FAILURE(Start(3, 0));
+    WriteTrace trace;
+    for (size_t layer = 0; layer < 3; ++layer) {
+        for (unsigned char block = 120; block < 128; ++block) {
+            ASSERT_EQ(Send(Describe(Id(block), {layer}, false)), Status::OK());
+        }
+    }
+    for (unsigned char block = 120; block < 128; ++block) {
+        ASSERT_EQ(Send(Describe(Id(block), {0, 1, 2}, true)), Status::OK());
+        Verify(Id(block));
+    }
+    EXPECT_GT(trace.writes.size(), 8);
+}
+
+TEST_F(UCCacheBlockDumpTest, ZeroBudgetWaitRetainsSlotUntilPhysicalWriteCompletes)
+{
+    ASSERT_NO_FATAL_FAILURE(Start(3, 0, false, false, "wait", 1));
+    WriteTrace trace;
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    std::atomic_bool once{false};
+    trace.beforeCompletion = [&] {
+        if (!once.exchange(true)) { entered.set_value(); releaseFuture.wait(); }
+    };
+    ASSERT_EQ(Send(Describe(Id(130), {0}, false)), Status::OK());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(131), {0}, false)});
+    ASSERT_TRUE(waiting);
+    auto fence = std::async(std::launch::async, [&] {
+        return queue->WaitSources(waiting.Value());
+    });
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    auto owner = queue->Submit({TransTask::Type::DUMP, Describe(Id(130), {1, 2}, true)});
+    EXPECT_TRUE(owner);
+    if (owner) { EXPECT_EQ(queue->WaitSources(owner.Value()), Status::OK()); }
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    EXPECT_FALSE(backend->AcquireWriteLease(Id(130)));
+    release.set_value();
+    EXPECT_EQ(fence.get(), Status::OK());
+    if (owner) { EXPECT_EQ(queue->Wait(owner.Value()), Status::OK()); }
+    EXPECT_EQ(queue->Wait(waiting.Value()), Status::OK());
+    EXPECT_EQ(Send(Describe(Id(131), {0, 1, 2}, true)), Status::OK());
+    ASSERT_EQ(trace.writes.size(), 2);
+    Verify(Id(130));
+    Verify(Id(131));
+}
+
+TEST_F(UCCacheBlockDumpTest, ZeroBudgetStillBoundsQueueAndReservesFinalizerAdmission)
+{
+    ASSERT_NO_FATAL_FAILURE(Start(3, 0, false, false, "wait", 1));
+    queue.reset();
+    cache.waitingQueueDepth = 2;
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    ASSERT_EQ(queue->Setup(cache, manager->GetTransBuffer()), Status::OK());
+    ASSERT_EQ(Send(Describe(Id(132), {0}, false)), Status::OK());
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(133), {0}, false)});
+    ASSERT_TRUE(waiting);
+    auto rejected = queue->Submit({TransTask::Type::DUMP, Describe(Id(134), {0}, false)});
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(queue->Wait(rejected.Value()), Status::NoSpace());
+    auto final = Describe(Id(132), {0, 1, 2}, true);
+    auto second = Describe(Id(133), {0, 1, 2}, true);
+    final.insert(final.end(), second.begin(), second.end());
+    auto task = queue->Submit({TransTask::Type::DUMP, std::move(final)});
+    ASSERT_TRUE(task);
+    EXPECT_EQ(queue->Wait(waiting.Value()), Status::OK());
+    EXPECT_EQ(queue->Wait(task.Value()), Status::OK());
+    Verify(Id(132));
+    Verify(Id(133));
+}
+
+TEST_F(UCCacheBlockDumpTest, ZeroBudgetWaitReportsFailedWriterAtPhysicalCapacity)
+{
+    ASSERT_NO_FATAL_FAILURE(Start(3, 0, false, false, "wait", 1));
+    WriteTrace trace;
+    trace.fail = true;
+    ASSERT_TRUE(Send(Describe(Id(135), {0, 1, 2}, true)).Failure());
+    trace.fail = false;
+    auto waiting = queue->Submit({TransTask::Type::DUMP, Describe(Id(136), {0, 1, 2}, true)});
+    ASSERT_TRUE(waiting);
+    auto result = std::async(std::launch::async, [&] { return queue->Wait(waiting.Value()); });
+    const bool reported =
+        result.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+    EXPECT_TRUE(reported);
+    // Repair frees the slot even if a regression left the other task waiting.
+    EXPECT_EQ(Send(Describe(Id(135), {0, 1, 2}, true)), Status::OK());
+    EXPECT_TRUE(result.get().Failure());
+    EXPECT_EQ(Send(Describe(Id(136), {0, 1, 2}, true)), Status::OK());
+    Verify(Id(135));
+    Verify(Id(136));
 }

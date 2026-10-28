@@ -459,7 +459,7 @@ TEST_F(UCCacheBlockDumpTest, SourceFenceAndAnotherCopyAdvanceBeforeSlowWriteComp
     EXPECT_TRUE(backend->AcquireWriteLease(Id(42)));
 }
 
-TEST_F(UCCacheBlockDumpTest, QueuedTimeoutCancelsBeforeAnySourceAccess)
+TEST_F(UCCacheBlockDumpTest, QueuedWaitTimeoutStillExecutesAndPublishes)
 {
     Start();
     queue.reset();
@@ -478,18 +478,54 @@ TEST_F(UCCacheBlockDumpTest, QueuedTimeoutCancelsBeforeAnySourceAccess)
     auto running = queue->Submit({TransTask::Type::DUMP, Describe(Id(44), {0}, false)});
     ASSERT_TRUE(running);
     EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    auto queued = queue->Submit({TransTask::Type::DUMP, Describe(Id(45), {0}, false)});
+    auto queued = queue->Submit({TransTask::Type::DUMP, Describe(Id(45), {0, 1, 2}, true)});
     ASSERT_TRUE(queued);
     auto wait = std::async(std::launch::async, [&] { return queue->Wait(queued.Value()); });
-    EXPECT_EQ(wait.wait_for(std::chrono::milliseconds(400)), std::future_status::ready);
+    EXPECT_EQ(wait.wait_for(std::chrono::milliseconds(400)), std::future_status::timeout);
+    EXPECT_EQ(laterCopies.load(), 0);
     release.set_value();
     EXPECT_EQ(wait.get(), Status::Timeout());
     EXPECT_EQ(queue->WaitSources(running.Value()), Status::OK());
     (void)queue->Wait(running.Value());
     CacheStore::TestHooks::blockDumpCopyHook = {};
+    EXPECT_EQ(laterCopies.load(), 3);
+    Verify(Id(45));
+}
+
+TEST_F(UCCacheBlockDumpTest, QueuedSourceFenceTimeoutStillExecutesAndReportsTimeout)
+{
+    Start();
+    queue.reset();
+    cache.timeoutMs = 80;
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    ASSERT_EQ(queue->Setup(cache, manager->GetTransBuffer()), Status::OK());
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    std::atomic<size_t> laterCopies{0};
+    CacheStore::TestHooks::blockDumpCopyHook = [&](const auto& shard) {
+        if (shard.owner == Id(49)) { entered.set_value(); releaseFuture.wait(); }
+        else { ++laterCopies; }
+        return Status::OK();
+    };
+    auto running = queue->Submit({TransTask::Type::DUMP, Describe(Id(49), {0}, false)});
+    ASSERT_TRUE(running);
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto queued = queue->Submit({TransTask::Type::DUMP, Describe(Id(50), {0, 1, 2}, true)});
+    ASSERT_TRUE(queued);
+    auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(queued.Value()); });
+    EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(400)), std::future_status::timeout);
     EXPECT_EQ(laterCopies.load(), 0);
-    auto cancelled = Id(45);
-    EXPECT_EQ(backend->LookupOnPrefix(&cancelled, 1).Value(), -1);
+    EXPECT_FALSE(queue->Check(queued.Value()).Value());
+    release.set_value();
+    // The source fence proves only that HBM is safe, while final Wait must
+    // preserve the expired deadline even though the write subsequently succeeds.
+    EXPECT_EQ(fence.get(), Status::OK());
+    EXPECT_EQ(queue->Wait(queued.Value()), Status::Timeout());
+    EXPECT_EQ(queue->Wait(running.Value()), Status::OK());
+    CacheStore::TestHooks::blockDumpCopyHook = {};
+    EXPECT_EQ(laterCopies.load(), 3);
+    Verify(Id(50));
 }
 
 TEST_F(UCCacheBlockDumpTest, SharedBufferFailedLayerCanRetryWithoutResettingReadyLayer)

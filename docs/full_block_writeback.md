@@ -55,11 +55,20 @@ The write worker never waits indefinitely for an L1 slot held by a reader.
    waiting on that failed layer can observe FAILED, while the whole block remains
    unavailable until every layer is READY. Unknown DMA completion retains both
    endpoints until synchronization proves completion, potentially indefinitely.
-7. A timeout can remove a task still in the source queue. Once dequeued, accepted
-   DMA/I/O must drain before its buffers are released. This does not impose a hard
-   deadline on faulty hardware. L2 failures are observed by ordinary `wait()`, not
-   by the source-only fence. Finished sending to the scheduler refers to HBM safety;
-   successful-dump metadata is delayed until final storage completion.
+7. A timeout does not remove accepted tasks from the source queue. Queued tasks
+   still execute, and their HBM addresses/events remain protected until source
+   copying drains. A source-fence timeout is retained in the final task result;
+   `wait_dump_sources()` returns OK only after HBM is safe. A final `wait()` timeout
+   also waits for task completion before returning Timeout, even if storage later
+   succeeds. The cancellation callback is a no-op, as in the legacy cache queue.
+   Unlike legacy DumpQueue's dispatch-time failure-set check, this coordinator
+   still executes a queued task after its deadline; timeout is an outcome, not a
+   reason to skip accepted work. The existing POSIX AIO backend timeout/cancellation
+   policy is unchanged.
+   Accepted DMA/I/O must drain before its buffers are released, so there is no hard
+   return deadline on faulty hardware. L2 failures are observed by ordinary `wait()`,
+   not by the source-only fence. Finished sending to the scheduler refers to HBM
+   safety; successful-dump metadata is delayed until final storage completion.
 
 Worker success reporting treats a successful explicit finalization as repair of
 older dump failures for the same request, logical block and Store. Merely accepting
@@ -144,7 +153,8 @@ shared L1, shape validation, factory routing and shutdown draining. The connecto
 lifecycle cases live in `test/test_ucm_connector_metrics.py`. Additional regressions
 inject a rejected layer copy, verify retry does not copy READY layers, exercise the
 shared failed-layer state, hold an actual POSIX AIO completion while another source
-copy advances, cancel a queued task, and retain an active write lease through timeout.
+copy advances, preserve queued writes through both source-fence and final-wait
+timeouts, and retain an active write lease through timeout.
 Python cases distinguish HBM source release from successful storage publication.
 
 Build and run in an independent source/build copy with the existing offline dependencies:

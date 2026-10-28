@@ -3058,3 +3058,201 @@ def test_rank_consistency_tracks_explicit_block_dump_finalization():
     manager.wait_dump(final)
     assert calls == ["stage", stage, "final", final]
     assert manager._dump_task_contexts == {}
+
+
+class _DumpAccountingStore:
+    def __init__(self):
+        self.submit_error = None
+        self.wait_errors = {}
+
+    def dump_data(self, *args):
+        if self.submit_error is not None:
+            raise self.submit_error
+        return object()
+
+    finalize_dump_data = dump_data
+
+    def wait(self, task):
+        error = self.wait_errors.pop(task, None)
+        if error is not None:
+            raise error
+
+
+def _accounting_dump(manager, store, context=None, *, finalize=False):
+    context = {"r": {b"a"}} if context is None else context
+    blocks = [block for values in context.values() for block in sorted(values)]
+    return manager.submit_dump(
+        store,
+        context,
+        blocks,
+        [0] * len(blocks),
+        [[1]] * len(blocks),
+        0,
+        finalize=finalize,
+    )
+
+
+def _accounting_finished(manager, requests):
+    manager.finish_dump(requests)
+    metadata = SimpleNamespace(
+        missing_reqs=set(), missing_blocks=set(), dump_succeeded_blocks=set()
+    )
+    manager.update_worker_meta(metadata)
+    return metadata.dump_succeeded_blocks
+
+
+@pytest.mark.parametrize("failure", ["submit", "wait", "unhealthy"])
+def test_dump_accounting_finalization_repairs_earlier_failure(failure):
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+    from ucm.store.pipeline.errors import StoreUnhealthyError
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    if failure == "submit":
+        store.submit_error = RuntimeError("controlled submit failure")
+        with pytest.raises(RuntimeError):
+            _accounting_dump(manager, store)
+        store.submit_error = None
+    else:
+        first = _accounting_dump(manager, store)
+        store.wait_errors[first] = (
+            StoreUnhealthyError("controlled unhealthy store")
+            if failure == "unhealthy"
+            else RuntimeError("controlled write failure")
+        )
+        if failure == "unhealthy":
+            manager.wait_dump(first)
+        else:
+            with pytest.raises(RuntimeError):
+                manager.wait_dump(first)
+    final = _accounting_dump(manager, store, finalize=True)
+    with pytest.raises(RuntimeError, match="still pending"):
+        manager.finish_dump({"r"})
+    manager.wait_dump(final)
+    assert _accounting_finished(manager, {"r"}) == {b"a"}
+
+
+def test_dump_accounting_layer_success_does_not_repair_failed_block():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    first = _accounting_dump(manager, store)
+    store.wait_errors[first] = RuntimeError("failed layer")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(first)
+    another_layer = _accounting_dump(manager, store)
+    manager.wait_dump(another_layer)
+    assert _accounting_finished(manager, {"r"}) == set()
+
+
+def test_dump_accounting_repair_is_scoped_to_covered_request_and_blocks():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    first = _accounting_dump(manager, store, {"r": {b"a", b"b"}, "s": {b"a"}})
+    store.wait_errors[first] = RuntimeError("failed batch")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(first)
+    manager.wait_dump(_accounting_dump(manager, store, {"r": {b"a"}}, finalize=True))
+    assert _accounting_finished(manager, {"r"}) == {b"a"}
+    assert _accounting_finished(manager, {"s"}) == set()
+
+
+@pytest.mark.parametrize("failure", ["submit", "wait", "unhealthy"])
+def test_dump_accounting_failed_finalization_does_not_clear_failure(failure):
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+    from ucm.store.pipeline.errors import StoreUnhealthyError
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    first = _accounting_dump(manager, store)
+    store.wait_errors[first] = RuntimeError("failed layer")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(first)
+    if failure == "submit":
+        store.submit_error = RuntimeError("failed final submit")
+        with pytest.raises(RuntimeError):
+            _accounting_dump(manager, store, finalize=True)
+    else:
+        final = _accounting_dump(manager, store, finalize=True)
+        store.wait_errors[final] = (
+            StoreUnhealthyError("unhealthy final")
+            if failure == "unhealthy"
+            else RuntimeError("failed final wait")
+        )
+        if failure == "unhealthy":
+            manager.wait_dump(final)
+        else:
+            with pytest.raises(RuntimeError):
+                manager.wait_dump(final)
+    assert _accounting_finished(manager, {"r"}) == set()
+    assert manager._dump_task_contexts == {}
+
+
+def test_dump_accounting_late_old_failure_does_not_undo_new_finalization():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    old = _accounting_dump(manager, store)
+    final = _accounting_dump(manager, store, finalize=True)
+    manager.wait_dump(final)
+    store.wait_errors[old] = RuntimeError("older failure observed late")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(old)
+    assert _accounting_finished(manager, {"r"}) == {b"a"}
+
+
+def test_dump_accounting_older_finalization_does_not_clear_new_failure():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    final = _accounting_dump(manager, store, finalize=True)
+    newer = _accounting_dump(manager, store)
+    store.wait_errors[newer] = RuntimeError("newer failure observed first")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(newer)
+    manager.wait_dump(final)
+    assert _accounting_finished(manager, {"r"}) == set()
+
+
+def test_dump_accounting_other_store_cannot_repair_failed_store():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    first_store, second_store = _DumpAccountingStore(), _DumpAccountingStore()
+    failed = _accounting_dump(manager, first_store)
+    first_store.wait_errors[failed] = RuntimeError("first store failed")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(failed)
+    manager.wait_dump(_accounting_dump(manager, second_store, finalize=True))
+    assert _accounting_finished(manager, {"r"}) == set()
+
+
+def test_dump_accounting_finished_request_releases_repair_state():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False)
+    store = _DumpAccountingStore()
+    manager.wait_dump(_accounting_dump(manager, store, finalize=True))
+    assert _accounting_finished(manager, {"r"}) == {b"a"}
+    assert manager._dump_outcomes_by_request == {}
+    reused = _accounting_dump(manager, store)
+    store.wait_errors[reused] = RuntimeError("new request with reused name")
+    with pytest.raises(RuntimeError):
+        manager.wait_dump(reused)
+    assert _accounting_finished(manager, {"r"}) == set()
+
+
+def test_dump_accounting_disabled_manager_does_not_retain_repair_state():
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    manager = RankConsistencyManager(is_scheduler=False, use_consistency_manager=False)
+    store = _DumpAccountingStore()
+    manager.wait_dump(_accounting_dump(manager, store, finalize=True))
+    assert _accounting_finished(manager, {"r"}) == set()
+    assert manager._dump_outcomes_by_request == {}
+    assert manager._dump_task_contexts == {}

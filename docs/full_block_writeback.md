@@ -47,6 +47,14 @@ The write worker never waits indefinitely for an L1 slot held by a reader.
    copies missing layers and waits before HBM can be recycled. Never infer that an
    unvisited layer is complete. The finalizer runs once per connector batch.
 
+Worker success reporting treats a successful explicit finalization as repair of
+older dump failures for the same request, logical block and Store. Merely accepting
+finalization, or successfully writing another layer, does not clear a failure.
+Submission order determines which failures are covered even if task waits occur
+out of order. Newer failures and failures in another Store remain visible; accounting
+is released when the request finishes. This reporting rule assumes finalization
+success means all layers were persisted and the block was published.
+
 An OFD write lease serializes participating processes for each content identity.
 It uses a separate persistent lock file, so it does not block the read lease.
 Lease contention defers a normal stage; finalization reports unresolved contention

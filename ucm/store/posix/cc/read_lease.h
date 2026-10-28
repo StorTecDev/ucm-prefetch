@@ -78,9 +78,20 @@ public:
         return AcquireRemoveGuard(layout.StorageBackend(block), block);
     }
 
-    Status Lock(const std::string& backend, const Detail::BlockId& block, bool writer = false)
+    static Expected<std::shared_ptr<void>> AcquireWriteGuard(
+        const SpaceLayout& layout, const Detail::BlockId& block)
     {
-        auto path = backend + ".ucm_read_leases";
+        auto guard = std::make_shared<PosixReadLease>();
+        auto status = guard->Lock(layout.StorageBackend(block), block, true,
+                                  ".ucm_write_leases");
+        if (status.Failure()) { return status; }
+        return std::static_pointer_cast<void>(guard);
+    }
+
+    Status Lock(const std::string& backend, const Detail::BlockId& block, bool writer = false,
+                const char* name = ".ucm_read_leases")
+    {
+        auto path = backend + name;
         auto it = files_.find(path);
         if (it == files_.end()) {
             auto file = std::make_unique<File>(path);

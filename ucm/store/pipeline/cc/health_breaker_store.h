@@ -56,6 +56,13 @@ public:
     { return store_ && store_->SupportsFullBlockRead(); }
     bool SupportsFullBlockWrite() const override
     { return store_ && store_->SupportsFullBlockWrite(); }
+    Expected<std::shared_ptr<void>> AcquireWriteLease(const Detail::BlockId& block) override
+    {
+        if (!Enabled()) { return Status::StoreUnhealthy(); }
+        return store_->AcquireWriteLease(block);
+    }
+    Status CommitDump(const Detail::BlockId& block) override
+    { return store_->CommitDump(block); }
     size_t FullBlockReadBytes() const override
     { return store_ ? store_->FullBlockReadBytes() : 0; }
     size_t PackedLayerBytes(size_t index) const override

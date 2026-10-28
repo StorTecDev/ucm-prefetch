@@ -88,6 +88,11 @@ public:
     virtual std::string Readme() const = 0;
     virtual bool SupportsFullBlockRead() const { return false; }
     virtual bool SupportsFullBlockWrite() const { return false; }
+    virtual Expected<std::shared_ptr<void>> AcquireWriteLease(const Detail::BlockId&)
+    { return Status::InvalidParam("write leases unsupported"); }
+    // Requires a write lease and successful Wait for every contributing write.
+    virtual Status CommitDump(const Detail::BlockId&)
+    { return Status::InvalidParam("explicit dump commit unsupported"); }
     // Zero preserves backends whose I/O layout is the caller's uniform L1 layout.
     virtual size_t FullBlockReadBytes() const { return 0; }
     virtual size_t PackedLayerBytes(size_t) const { return 0; }

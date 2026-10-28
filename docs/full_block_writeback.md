@@ -27,6 +27,13 @@ Existing archived blocks can be reused. Every participating writer must use the
 same mode. Unsupported configurations fail explicitly rather than selecting a
 fallback pipeline.
 
+Both scheduler and worker stores validate configuration dependencies, reservation
+limits and capacity policies. Runtime full-block write capability is checked only
+on workers (`device_id >= 0`): scheduler stores may not have KV dimensions and do
+not create a dump queue. A scheduler can query L2 or attach to existing shared L1
+metadata without supplying worker tensor sizes. This does not relax worker backend
+capability checks or shared-layout validation.
+
 `cache_dump_reserved_blocks` bounds pinned incomplete/active L1 blocks per store,
 including a block whose backend write is being waited. The default is 16, separate
 from `early_owner_max_jobs` and `posix_write_inflight_limit`. Queued plus unfinished task descriptors, and unfinished block bookkeeping,
@@ -193,7 +200,11 @@ shared L1, shape validation, factory routing and shutdown draining. Wait-policy
 regressions cover interleaved blocks sharing one slot, configurable slot counts,
 physical write completion, failed-layer repair, terminal incomplete blocks,
 external L1 pressure, READY publication without foreign pin release, queued
-timeouts, reserved finalizer admission, and storage failure propagation. Invalid policies and wait-without-block-dump are rejected.
+timeouts, reserved finalizer admission, and storage failure propagation. Scheduler
+regressions cover initialization without worker KV dimensions, shared-L1 lookup,
+and rejection of invalid static configuration; workers still reject backends
+without full-block write capability. Both capacity policies are covered. Invalid
+policies and wait-without-block-dump are rejected.
 The connector
 lifecycle cases live in `test/test_ucm_connector_metrics.py`. Additional regressions
 inject a rejected layer copy, verify retry does not copy READY layers, exercise the

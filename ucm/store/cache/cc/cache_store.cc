@@ -252,10 +252,17 @@ private:
         if (config.cacheDumpCapacityPolicy == "wait" && !config.cacheFullBlockDump) {
             return Status::InvalidParam("wait capacity policy requires cache_full_block_dump");
         }
-        if (config.cacheFullBlockDump && (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 ||
-            !config.storeBackend->SupportsFullBlockWrite() || !config.cacheDumpReservedBlocks ||
-            config.useGdr || config.cacheIOAggregation || config.cacheSdmaDirect)) {
-            return Status::InvalidParam("block dump requires Early whole L1 / POSIX AIO and normal DMA");
+        if (config.cacheFullBlockDump &&
+            (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 || !config.cacheDumpReservedBlocks ||
+             config.useGdr || config.cacheIOAggregation || config.cacheSdmaDirect)) {
+            return Status::InvalidParam(
+                "block dump requires Early whole L1, positive reservations and normal DMA");
+        }
+        // Scheduler stores may lack KV dimensions and never create a dump queue.
+        if (config.deviceId >= 0 && config.cacheFullBlockDump &&
+            !config.storeBackend->SupportsFullBlockWrite()) {
+            return Status::InvalidParam(
+                "cache_full_block_dump requires a full-block write backend");
         }
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);

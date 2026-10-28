@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from dataclasses import dataclass
 from typing import Any
 
 from ucm.logger import init_logger
@@ -86,6 +87,22 @@ class RankConsistencyTracker:
         return block_ids
 
 
+@dataclass(frozen=True)
+class _DumpTaskContext:
+    store: UcmKVStoreBaseV1
+    blocks_by_request: dict[str, set[bytes]]
+    sequence: int
+    finalize: bool
+
+
+@dataclass
+class _DumpOutcome:
+    # Keep the Store alive while its identity is used in the accounting key.
+    store: UcmKVStoreBaseV1
+    failed_at: int = 0
+    finalized_at: int = 0
+
+
 class RankConsistencyManager:
     """Adds cross-rank consistency handling around Store operations."""
 
@@ -106,11 +123,12 @@ class RankConsistencyManager:
         self._load_task_contexts: dict[
             int, tuple[UcmKVStoreBaseV1, dict[str, list[bytes]]]
         ] = {}
-        self._dump_task_contexts: dict[
-            int, tuple[UcmKVStoreBaseV1, dict[str, set[bytes]]]
-        ] = {}
+        self._dump_task_contexts: dict[int, _DumpTaskContext] = {}
+        self._dump_sequence = 0
         self._dump_blocks_by_request: dict[str, set[bytes]] = {}
-        self._dump_failed_blocks_by_request: dict[str, set[bytes]] = {}
+        self._dump_outcomes_by_request: dict[
+            str, dict[tuple[int, bytes], _DumpOutcome]
+        ] = {}
 
     def lookup_on_prefix(self, store: UcmKVStoreBaseV1, block_ids: list[bytes]) -> int:
         """Exclude known-missing blocks before forwarding a prefix lookup."""
@@ -232,13 +250,17 @@ class RankConsistencyManager:
             self._dump_blocks_by_request.setdefault(request_id, set()).update(
                 request_block_ids
             )
+        self._dump_sequence += 1
+        context = _DumpTaskContext(
+            store, request_context, self._dump_sequence, finalize
+        )
         try:
             submit = store.finalize_dump_data if finalize else store.dump_data
             task = submit(block_ids, shard_indices, ptrs, event_handle)
         except Exception:
-            self._record_dump_failure(request_context)
+            self._record_dump_outcome(context, success=False)
             raise
-        self._dump_task_contexts[id(task)] = (store, request_context)
+        self._dump_task_contexts[id(task)] = context
         return task
 
     def wait_dump(self, task: Any) -> None:
@@ -246,15 +268,17 @@ class RankConsistencyManager:
         task_key = id(task)
         if task_key not in self._dump_task_contexts:
             raise RuntimeError("Dump task was not submitted through submit_dump().")
-        store, request_context = self._dump_task_contexts.pop(task_key)
+        context = self._dump_task_contexts.pop(task_key)
         try:
-            store.wait(task)
+            context.store.wait(task)
         except StoreUnhealthyError:
-            self._record_dump_failure(request_context)
+            self._record_dump_outcome(context, success=False)
             return
         except Exception:
-            self._record_dump_failure(request_context)
+            self._record_dump_outcome(context, success=False)
             raise
+        if context.finalize:
+            self._record_dump_outcome(context, success=True)
 
     def finish_dump(self, request_ids: set[str]) -> None:
         """Queue successful blocks for reporting to scheduler."""
@@ -262,8 +286,8 @@ class RankConsistencyManager:
             return
         pending_request_ids = {
             request_id
-            for _, request_context in self._dump_task_contexts.values()
-            for request_id in request_context
+            for context in self._dump_task_contexts.values()
+            for request_id in context.blocks_by_request
         }
         unfinished = request_ids & pending_request_ids
         if unfinished:
@@ -272,9 +296,12 @@ class RankConsistencyManager:
             )
         for request_id in request_ids:
             block_ids = self._dump_blocks_by_request.pop(request_id, set())
-            failed_block_ids = self._dump_failed_blocks_by_request.pop(
-                request_id, set()
-            )
+            outcomes = self._dump_outcomes_by_request.pop(request_id, {})
+            failed_block_ids = {
+                block_id
+                for (_, block_id), outcome in outcomes.items()
+                if outcome.failed_at > outcome.finalized_at
+            }
             self._dump_succeeded_blocks.update(block_ids - failed_block_ids)
 
     def update_worker_meta(self, worker_meta: Any) -> None:
@@ -314,9 +341,22 @@ class RankConsistencyManager:
             self._missing_reqs.add(request_id)
             self._missing_blocks.update(block_ids)
 
-    def _record_dump_failure(self, block_ids_by_request: dict[str, set[bytes]]) -> None:
-        """Accumulate blocks covered by a failed dump task."""
-        for request_id, request_block_ids in block_ids_by_request.items():
-            self._dump_failed_blocks_by_request.setdefault(request_id, set()).update(
-                request_block_ids
-            )
+    def _record_dump_outcome(self, context: _DumpTaskContext, *, success: bool) -> None:
+        """Let a successful finalization supersede earlier covered failures.
+
+        Use submission order, not wait order: an older task's error can be
+        observed after finalization. A later failure or another Store's failure
+        must still prevent a success report. Ordinary layer success is not proof
+        that the full block was repaired.
+        """
+        for request_id, block_ids in context.blocks_by_request.items():
+            outcomes = self._dump_outcomes_by_request.setdefault(request_id, {})
+            for block_id in block_ids:
+                key = (id(context.store), block_id)
+                outcome = outcomes.get(key)
+                if outcome is None:
+                    outcome = outcomes[key] = _DumpOutcome(context.store)
+                if success:
+                    outcome.finalized_at = max(outcome.finalized_at, context.sequence)
+                else:
+                    outcome.failed_at = max(outcome.failed_at, context.sequence)

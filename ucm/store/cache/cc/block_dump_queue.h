@@ -139,8 +139,11 @@ public:
             work = it->second;
         }
         if (!work->sources.WaitFor(timeoutMs_)) {
-            Cancel(work->pair.first);
-            // A running DMA cannot be abandoned merely because a deadline elapsed.
+            // A deadline reports failure; it does not discard accepted work.
+            // Keep queued source addresses/events valid until their copies drain.
+            work->pair.first->Fail(Status::Timeout());
+            failureSet_.Insert(id);
+            UC_WARN("Block dump sources task={} timed out; retaining queued work and source protection", id);
             while (!work->sources.WaitForDuration(2000)) {
                 UC_WARN("Block dump sources task={} still draining", id);
             }
@@ -178,20 +181,11 @@ private:
         waiter->Done();
     }
 
-    void Cancel(TaskPtr task) override
+    void Cancel(TaskPtr) override
     {
-        std::lock_guard lock(queueMutex_);
-        auto it = std::find_if(pending_.begin(), pending_.end(),
-            [&](const Work& work) { return work->pair.first == task; });
-        if (it == pending_.end()) { return; }  // running sources/I/O must drain
-        auto work = *it;
-        pending_.erase(it);
-        work->sourceStatus = Status::Timeout();
-        task->Fail(work->sourceStatus);
-        failureSet_.Insert(task->id);
-        --admitted_;
-        work->sources.Done();
-        work->pair.second->Done();
+        // Match the legacy cache task cancellation policy: an expired wait does
+        // not remove accepted tasks. TaskWrapper::Wait keeps waiting for Done;
+        // pending source work and already accepted DMA/I/O must all drain.
     }
 
     Status Drain(CopyStream& stream)

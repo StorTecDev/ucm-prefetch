@@ -213,7 +213,6 @@ private:
         config.GetNumbers("gpu_kv_buffer_sizes", param.gpuKvBufferSizes);
         config.Get("use_gdr", param.useGdr);
         config.Get("cache_io_aggregation", param.cacheIOAggregation);
-        param.cacheIOAggregation = param.cacheIOAggregation && UCM_RUNTIME_ASCEND_IO_AGGREGATION;
         config.Get("cache_sdma_direct", param.cacheSdmaDirect);
         config.GetNumber("local_rank_size", param.localRankSize);
         return param;
@@ -235,6 +234,14 @@ private:
     Status CheckConfig(const Config& config)
     {
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
+#if !UCM_RUNTIME_ASCEND_IO_AGGREGATION
+        // Validate the requested value before role-specific setup. Masking it in
+        // ParseConfig hides incompatible options from both schedulers and workers.
+        if (config.cacheIOAggregation) {
+            return Status::InvalidParam(
+                "cache_io_aggregation is unsupported by this runtime build");
+        }
+#endif
         if (!EarlyLayoutEnabled() && (config.cacheFullBlockLoad || config.cacheFullBlockL1 ||
                                       config.storeBackend->PackedLayerBytes(0))) {
             return Status::InvalidParam("full-block and packed layouts require EarlyCache");

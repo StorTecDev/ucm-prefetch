@@ -25,7 +25,11 @@ supported. Do not mix legacy layerwise writers and the new transactional writers
 in one live storage namespace: legacy writers do not take the new writer lease.
 Existing archived blocks can be reused. Every participating writer must use the
 same mode. Unsupported configurations fail explicitly rather than selecting a
-fallback pipeline.
+fallback pipeline. In particular, an explicit `cache_io_aggregation: true`
+is rejected on builds without IO aggregation support, including scheduler-only
+stores and configurations with block dumping disabled. The requested value is
+not silently changed to false; omit the option or explicitly set it to false to
+use ordinary DMA on those builds.
 
 Both scheduler and worker stores validate configuration dependencies, reservation
 limits and capacity policies. Runtime full-block write capability is checked only
@@ -193,6 +197,15 @@ Rebuild the complete native pipeline (StoreV1 gained an optional method), and
 restart all participants. The shared whole-block layout fingerprint also changes
 for the layer-local failure state; do not attach old binaries to a new live domain.
 Early lookup, reservation, and loading algorithms remain unchanged.
+
+Native retry success does not yet establish recovery through the Early owner
+protocol. The Python wrapper currently treats a failed dump `Wait` as unproven I/O
+completion even when the native task has drained. An installed I/O failure handler,
+or an active consumer observing an unscoped failure, can fence the entire domain.
+This also occurs for missing-layer finalization and failed archive renames after
+successful writes. The native task can be retried with valid sources, but that does
+not clear the Python fence. Do not bypass the fence in a live service; distinguishing
+completed write errors from unknown completion remains unresolved.
 
 Cross-batch HBM retention, durable partial-layer metadata, automatic orphan `.tmp`
 cleanup and cross-process duplicate-writer coalescing are not enabled by this change.

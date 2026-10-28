@@ -476,6 +476,64 @@ TEST_F(UCCacheBlockDumpTest, SchedulerStillRejectsInvalidBlockDumpConfiguration)
     }
 }
 
+// Build valid worker dimensions too, so a rejection cannot be explained by
+// scheduler-only setup or missing KV layout rather than the requested option.
+Detail::Dictionary IoAggregationConfig(StoreV1* backend, int32_t device)
+{
+    auto config = BlockDumpConfig(backend);
+    config.SetNumber("device_id", device);
+    config.SetNumber("tensor_size", kBytes);
+    config.SetNumber("shard_size", kBytes);
+    config.SetNumber("block_size", 3 * kBytes);
+    config.SetNumber("cache_buffer_capacity_gb", 1);
+    config.SetNumber("cache_load_exclusive_buffer_number", 0);
+    config.SetNumber("cache_stream_number", 1);
+    config.Set("io_direct", false);
+    config.Set("cache_sdma_direct", false);
+    return config;
+}
+
+TEST_F(UCCacheBlockDumpTest, FullBlockDumpRejectsRequestedIoAggregationForBothRoles)
+{
+    ASSERT_NO_FATAL_FAILURE(Start());
+    for (int32_t device : {-1, 0}) {
+        SCOPED_TRACE(device);
+        auto config = IoAggregationConfig(backend.get(), device);
+        config.Set("cache_io_aggregation", true);
+        std::unique_ptr<StoreV1> store{MakeEarlyCacheStore()};
+        EXPECT_EQ(store->Setup(config), Status::InvalidParam());
+    }
+}
+
+#if !UCM_RUNTIME_ASCEND_IO_AGGREGATION
+TEST_F(UCCacheBlockDumpTest, UnsupportedIoAggregationIsNotSilentlyDisabledWithoutBlockDump)
+{
+    ASSERT_NO_FATAL_FAILURE(Start());
+    for (int32_t device : {-1, 0}) {
+        SCOPED_TRACE(device);
+        auto config = IoAggregationConfig(backend.get(), device);
+        config.Set("cache_full_block_dump", false);
+        config.Set("cache_io_aggregation", true);
+        std::unique_ptr<StoreV1> store{MakeEarlyCacheStore()};
+        auto status = store->Setup(config);
+        EXPECT_EQ(status, Status::InvalidParam());
+        EXPECT_NE(status.ToString().find("cache_io_aggregation"), std::string::npos);
+    }
+}
+#endif
+
+TEST_F(UCCacheBlockDumpTest, ExplicitlyDisabledIoAggregationSupportsBothRoles)
+{
+    ASSERT_NO_FATAL_FAILURE(Start());
+    for (int32_t device : {-1, 0}) {
+        SCOPED_TRACE(device);
+        auto config = IoAggregationConfig(backend.get(), device);
+        config.Set("cache_io_aggregation", false);
+        std::unique_ptr<StoreV1> store{MakeEarlyCacheStore()};
+        EXPECT_EQ(store->Setup(config), Status::OK());
+    }
+}
+
 TEST_F(UCCacheBlockDumpTest, WorkerStillRequiresFullBlockWriteCapability)
 {
     class ReadOnlyBackend : public testing::NiceMock<UC::Test::Detail::MockStore> {

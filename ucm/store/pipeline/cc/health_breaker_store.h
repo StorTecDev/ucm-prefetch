@@ -54,6 +54,8 @@ public:
     std::string Readme() const override;
     bool SupportsFullBlockRead() const override
     { return store_ && store_->SupportsFullBlockRead(); }
+    bool SupportsFullBlockWrite() const override
+    { return store_ && store_->SupportsFullBlockWrite(); }
     size_t FullBlockReadBytes() const override
     { return store_ ? store_->FullBlockReadBytes() : 0; }
     size_t PackedLayerBytes(size_t index) const override

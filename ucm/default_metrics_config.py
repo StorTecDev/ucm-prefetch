@@ -111,6 +111,18 @@ _COUNTER_METRICS = [
         "Successfully completed full-block POSIX vector reads.",
     ),
     (
+        "posix_dump_write_ops_total",
+        "Successfully completed POSIX AIO write operations.",
+    ),
+    (
+        "posix_dump_write_bytes_total",
+        "Bytes persisted by successful POSIX AIO write operations.",
+    ),
+    (
+        "posix_dump_full_block_ops_total",
+        "Successfully completed full-block POSIX writes.",
+    ),
+    (
         "posix_s2h_bytes_total",
         (
             "Total bytes transferred from posix storage to host buffer (load path, "

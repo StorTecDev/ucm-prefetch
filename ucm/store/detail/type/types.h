@@ -80,6 +80,8 @@ struct TaskDesc : std::vector<Shard> {
     // discard already cached/peer-owned slices without overwriting live data.
     // A single non-null address denotes a contiguous complete-file destination.
     bool fullBlockRead{false};
+    // Each entry owns one complete contiguous file image, never a partial layer.
+    bool fullBlockWrite{false};
     std::shared_ptr<ReadProgress> readProgress;
 };
 

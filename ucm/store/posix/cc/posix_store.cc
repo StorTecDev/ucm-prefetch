@@ -25,6 +25,7 @@
 #include <array>
 #include <limits.h>
 #include <cstdint>
+#include <unordered_set>
 #include <fmt/ranges.h>
 #include "logger/logger.h"
 #include "metrics_api.h"
@@ -104,6 +105,7 @@ public:
     }
     std::string Readme() const override { return "PosixStore"; }
     bool SupportsFullBlockRead() const override { return fullBlockReadSupported_; }
+    bool SupportsFullBlockWrite() const override { return fullBlockReadSupported_; }
     size_t FullBlockReadBytes() const override { return diskBlockBytes_; }
     size_t PackedLayerBytes(size_t index) const override
     { return index < packedLayerBytes_.size() ? packedLayerBytes_[index] : 0; }
@@ -159,6 +161,7 @@ public:
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        if (task.fullBlockWrite) { return Status::InvalidParam("full-block write used for load"); }
         if (task.fullBlockRead) {
             if (!SupportsFullBlockRead()) {
                 return Status::InvalidParam("full-block reads require Posix AIO and a valid iovec size");
@@ -180,6 +183,18 @@ public:
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
         if (task.fullBlockRead) { return Status::InvalidParam("full-block read used for dump"); }
+        if (task.fullBlockWrite) {
+            if (!SupportsFullBlockWrite()) {
+                return Status::InvalidParam("full-block writes require EarlyPosix AIO");
+            }
+            std::unordered_set<Detail::BlockId, Detail::BlockIdHasher> blocks;
+            for (const auto& block : task) {
+                if (block.index != 0 || block.addrs.size() != 1 || !block.addrs.front() ||
+                    !blocks.insert(block.owner).second) {
+                    return Status::InvalidParam("invalid full-block write sources");
+                }
+            }
+        }
         auto res = transMgr_.GetIoEngine()->Submit({TransTask::Type::DUMP, std::move(task)});
         if (!res) [[unlikely]] {
             UC_ERROR("Failed({}) to submit dump task({}).", res.Error(), task.brief);
@@ -213,7 +228,7 @@ protected:
 
     Status CheckPackedTask(const Detail::TaskDesc& task) const
     {
-        if (packedLayerBytes_.empty() || task.fullBlockRead) { return Status::OK(); }
+        if (packedLayerBytes_.empty() || task.fullBlockRead || task.fullBlockWrite) { return Status::OK(); }
         for (const auto& shard : task) {
             if (shard.index >= packedLayerBytes_.size() || shard.addrs.size() != 1 ||
                 !shard.addrs.front()) {

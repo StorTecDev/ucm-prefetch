@@ -153,6 +153,16 @@ private:
                 if (task->desc.fullBlockRead) { UC::Metrics::UpdateStats(fullOps, 1.0); }
             }
         }
+        if constexpr (dump) {
+            if (result.error == 0 && !shortIo) {
+                static UC::Metrics::CachedMetric writeOps{"posix_dump_write_ops_total"};
+                static UC::Metrics::CachedMetric writeBytes{"posix_dump_write_bytes_total"};
+                static UC::Metrics::CachedMetric fullOps{"posix_dump_full_block_ops_total"};
+                UC::Metrics::UpdateStats(writeOps, 1.0);
+                UC::Metrics::UpdateStats(writeBytes, static_cast<double>(expectedBytes));
+                if (task->desc.fullBlockWrite) { UC::Metrics::UpdateStats(fullOps, 1.0); }
+            }
+        }
         ::close(fd);
         if constexpr (dump) {
             if (last) { CommitBlock(id, !failureSet_.Contains(tid)); }
@@ -165,7 +175,7 @@ private:
                         const BlockOperator::OpenResult& result)
     {
         const auto tid = task->id;
-        const auto last = shard.index + 1 == nShardPerBlock_;
+        const auto last = task->desc.fullBlockWrite || shard.index + 1 == nShardPerBlock_;
         const auto& id = shard.owner;
         const auto readBytes = task->desc.fullBlockRead ? ioConfig_.DiskBlockBytes()
                                                        : ioConfig_.LayerBytes(shard.index);
@@ -200,6 +210,12 @@ private:
         io.offset = ioConfig_.LayerOffset(shard.index);
         io.length = ioConfig_.LayerBytes(shard.index);
         io.buffer = shard.addrs.front();
+        if constexpr (dump) {
+            if (task->desc.fullBlockWrite) {
+                io.offset = 0;
+                io.length = ioConfig_.DiskBlockBytes();
+            }
+        }
         io.tag = tid;
         std::shared_ptr<void> discarded;
         if constexpr (!dump) {
@@ -272,8 +288,8 @@ private:
         const auto num = t->desc.size();
         size_t size = 0;
         for (const auto& shard : t->desc) {
-            size += t->desc.fullBlockRead ? ioConfig_.DiskBlockBytes()
-                                         : ioConfig_.LayerBytes(shard.index);
+            size += t->desc.fullBlockRead || t->desc.fullBlockWrite
+                ? ioConfig_.DiskBlockBytes() : ioConfig_.LayerBytes(shard.index);
         }
         const auto tp = w->startTp;
         const auto isDump = (t->type == TransTask::Type::DUMP);

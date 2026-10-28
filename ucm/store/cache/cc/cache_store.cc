@@ -185,6 +185,7 @@ private:
         config.Get("cache_full_block_l1", param.cacheFullBlockL1);
         config.Get("cache_full_block_dump", param.cacheFullBlockDump);
         config.GetNumber("cache_dump_reserved_blocks", param.cacheDumpReservedBlocks);
+        config.Get("cache_dump_capacity_policy", param.cacheDumpCapacityPolicy);
         config.GetNumber("device_id", param.deviceId);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
@@ -244,6 +245,12 @@ private:
         }
         if (config.cacheFullBlockL1 && (!config.cacheFullBlockLoad || config.cacheLoadBackendOnly)) {
             return Status::InvalidParam("whole-block L1 requires the Early full-block read path");
+        }
+        if (config.cacheDumpCapacityPolicy != "spill" && config.cacheDumpCapacityPolicy != "wait") {
+            return Status::InvalidParam("cache_dump_capacity_policy must be spill or wait");
+        }
+        if (config.cacheDumpCapacityPolicy == "wait" && !config.cacheFullBlockDump) {
+            return Status::InvalidParam("wait capacity policy requires cache_full_block_dump");
         }
         if (config.cacheFullBlockDump && (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 ||
             !config.storeBackend->SupportsFullBlockWrite() || !config.cacheDumpReservedBlocks ||
@@ -343,6 +350,7 @@ private:
         UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
         UC_INFO("Set {}::CacheFullBlockDump to {}.", ns, config.cacheFullBlockDump);
         UC_INFO("Set {}::CacheDumpReservedBlocks to {}.", ns, config.cacheDumpReservedBlocks);
+        UC_INFO("Set {}::CacheDumpCapacityPolicy to {}.", ns, config.cacheDumpCapacityPolicy);
         if (config.cacheIOAggregation) {
             UC_INFO("Set {}::AggregationObject to CacheStoreShard.", ns);
         }

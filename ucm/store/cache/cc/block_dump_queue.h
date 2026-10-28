@@ -8,6 +8,7 @@
 #include <future>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include "copy_stream.h"
 #include "early_buffer_pins.h"
 #include "template/task_wrapper.h"
@@ -45,12 +46,21 @@ class BlockDumpQueue final : public Detail::TaskWrapper<TransTask, Detail::TaskH
         bool complete{false};
         bool closing{false};
         std::shared_ptr<WriteJob> write;
+        Status writeFailure{Status::OK()};
+    };
+    struct SourceGroup {
+        Detail::BlockId id;
+        std::vector<const Detail::Shard*> shards;
+        bool done{false};
     };
     struct SourceTask {
         TaskPair pair;
         Latch sources;
         Status sourceStatus{Status::OK()};
         std::vector<std::shared_ptr<WriteJob>> writes;
+        std::vector<SourceGroup> groups;
+        bool prepared{false};
+        bool eventQueued{false};
         explicit SourceTask(TaskPair value) : pair(std::move(value)) { sources.Set(1); }
     };
     using Work = std::shared_ptr<SourceTask>;
@@ -58,6 +68,9 @@ class BlockDumpQueue final : public Detail::TaskWrapper<TransTask, Detail::TaskH
     Config config_;
     TransBuffer* buffer_{};
     Blocks blocks_;  // source worker only
+    // Admission scans only pinned blocks, not all blocks in waiting tasks.
+    // unordered_map keeps these node addresses stable across rehashes.
+    std::unordered_set<Block*> resident_;
     std::vector<Work> finishing_;  // source worker only
     std::mutex queueMutex_;
     std::condition_variable wake_;
@@ -89,6 +102,12 @@ public:
         if (!buffer->WholeBlock() || !config.storeBackend->SupportsFullBlockWrite() ||
             config.cacheDumpReservedBlocks == 0) {
             return Status::InvalidParam("block dump requires whole L1, a write backend and a budget");
+        }
+        if (config.cacheDumpCapacityPolicy != "spill" && config.cacheDumpCapacityPolicy != "wait") {
+            return Status::InvalidParam("cache_dump_capacity_policy must be spill or wait");
+        }
+        if (config.cacheDumpCapacityPolicy == "wait" && config.waitingQueueDepth < 2) {
+            return Status::InvalidParam("wait policy needs queue space for finalization");
         }
         config_ = config;
         buffer_ = buffer;
@@ -161,6 +180,7 @@ public:
 
 private:
     Status FailureStatus(const TaskPtr& task) const override { return task->FailureStatus(); }
+    bool WaitForCapacity() const { return config_.cacheDumpCapacityPolicy == "wait"; }
 
     void Dispatch(TaskPtr task, WaiterPtr waiter) override
     {
@@ -168,7 +188,11 @@ private:
         auto work = std::make_shared<SourceTask>(TaskPair{task, waiter});
         std::lock_guard lock(queueMutex_);
         sources_.emplace(task->id, work);
-        if (!stopping_ && admitted_.load() < config_.waitingQueueDepth) {
+        // The batch finalizer may be the only source of a resident block's
+        // missing layer. Capacity waiters must not consume its admission slot.
+        const auto limit = config_.waitingQueueDepth -
+            size_t(WaitForCapacity() && !task->desc.finalizeBlockDump);
+        if (!stopping_ && admitted_.load() < limit) {
             ++admitted_;
             pending_.push_back(work);
             wake_.notify_one();
@@ -235,10 +259,11 @@ private:
     {
         auto job = block.write;
         if (!job || !job->done.load(std::memory_order_acquire)) { return; }
+        block.writeFailure = job->status;
         if (job->status.Success()) {
             for (auto layer : job->layers) { block.persisted[layer] = true; }
             if (job->commit) { block.complete = true; }
-            if (job->releasePin) { block.pin = {}; }
+            if (job->releasePin) { block.pin = {}; resident_.erase(&block); }
         } else {
             // Retain valid L1 data and the transaction for an explicit retry.
             block.closing = false;
@@ -263,8 +288,10 @@ private:
     {
         for (auto it = blocks_.begin(); it != blocks_.end();) {
             ApplyWrite(it->second);
-            if (it->second.closing && !it->second.write) { it = blocks_.erase(it); }
-            else { ++it; }
+            if (it->second.closing && !it->second.write) {
+                resident_.erase(&it->second);
+                it = blocks_.erase(it);
+            } else { ++it; }
         }
         for (auto it = finishing_.begin(); it != finishing_.end();) {
             const auto& work = *it;
@@ -291,6 +318,16 @@ private:
         auto status = stream.Setup(config_.deviceId, config_.EffectiveStreamNumber(), false);
         started.set_value(status);
         if (status.Failure()) { return; }
+        if (WaitForCapacity()) { RunWaiting(stream); }
+        else { RunSpilling(stream); }
+        for (auto& [id, block] : blocks_) {
+            auto saved = Spill(id, block);
+            if (saved.Failure()) { UC_ERROR("Block dump shutdown spill failed: {}", saved); }
+        }
+    }
+
+    void RunSpilling(CopyStream& stream)
+    {
         for (;;) {
             const auto epoch = ioEpoch_.load();
             Reap();
@@ -307,16 +344,77 @@ private:
                 }
                 work = std::move(pending_.front()); pending_.pop_front();
             }
-            status = Process(stream, *work);
-            if (status.Failure()) { work->pair.first->Fail(status); }
-            work->sourceStatus = status;
-            // All source copies have drained. Only pinned L1 is used from here.
-            work->sources.Done();
-            finishing_.push_back(std::move(work));
+            FinishSources(work, Process(stream, *work));
         }
-        for (auto& [id, block] : blocks_) {
-            auto saved = Spill(id, block);
-            if (saved.Failure()) { UC_ERROR("Block dump shutdown spill failed: {}", saved); }
+    }
+
+    void FinishSources(const Work& work, Status status)
+    {
+        if (status.Failure()) { work->pair.first->Fail(status); }
+        work->sourceStatus = status;
+        // All source copies have drained. Only pinned L1 is used from here.
+        work->sources.Done();
+        finishing_.push_back(work);
+    }
+
+    void RunWaiting(CopyStream& stream)
+    {
+        std::deque<Work> active;
+        for (;;) {
+            const auto epoch = ioEpoch_.load();
+            const auto released = EarlyBufferPins::ReleaseEpoch(*buffer_);
+            Reap();
+            bool stopping;
+            {
+                std::lock_guard lock(queueMutex_);
+                stopping = stopping_;
+                while (!pending_.empty()) {
+                    active.push_back(std::move(pending_.front())); pending_.pop_front();
+                }
+            }
+            if (stopping && active.empty() && finishing_.empty()) { break; }
+            bool advanced = false;
+            bool pollReadiness = false;
+            std::unordered_set<Detail::BlockId, Detail::BlockIdHasher> blocked;
+            for (auto it = active.begin(); it != active.end();) {
+                auto& work = *it;
+                PrepareGroups(*work);
+                for (auto& group : work->groups) {
+                    if (group.done || blocked.count(group.id)) { continue; }
+                    bool waiting = false;
+                    auto status = ProcessGroup(stream, *work, group, waiting, pollReadiness);
+                    if (waiting) { blocked.insert(group.id); continue; }
+                    if (status.Failure()) { work->pair.first->Fail(status); }
+                    group.done = true;
+                    advanced = true;
+                }
+                if (std::all_of(work->groups.begin(), work->groups.end(),
+                                [](const auto& group) { return group.done; })) {
+                    FinishSources(work, Drain(stream));
+                    it = active.erase(it);
+                    advanced = true;
+                } else { ++it; }
+            }
+            if (advanced) { continue; }
+            if (stopping && !active.empty()) {
+                // No future layers arrive after shutdown. Preserve partial data
+                // using the same terminal spill as ordinary finalization.
+                for (auto& [id, block] : blocks_) {
+                    if (!block.pin || block.write) { continue; }
+                    auto status = Spill(id, block);
+                    if (status.Failure()) { block.writeFailure = status; }
+                    else { advanced = true; }
+                }
+                if (advanced) { continue; }
+            }
+            std::unique_lock lock(queueMutex_);
+            // Other processes notify the shared L1 epoch, not this local CV.
+            // A foreign loader can also mark READY while retaining its pin;
+            // those followers must recheck readiness without waiting for release.
+            while (!wake_.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                return !pending_.empty() || ioEpoch_.load() != epoch ||
+                    EarlyBufferPins::ReleaseEpoch(*buffer_) != released || stopping_ != stopping;
+            }) && !pollReadiness) {}
         }
     }
 
@@ -342,6 +440,7 @@ private:
             }
         }
         block.write = job;
+        block.writeFailure = Status::OK();
         { std::lock_guard lock(ioMutex_); ioPending_.push_back(job); }
         ioWake_.notify_one();
         return job;
@@ -357,6 +456,15 @@ private:
 
     Status MakeRoom(const Detail::BlockId& id)
     {
+        if (WaitForCapacity()) {
+            if (resident_.size() < config_.cacheDumpReservedBlocks) { return Status::OK(); }
+            for (const auto* block : resident_) {
+                // A known failed writer cannot release its slot by waiting.
+                // Preserve its data for retry and surface the failure to waiters.
+                if (block->writeFailure.Failure()) { return block->writeFailure; }
+            }
+            return Status::NoSpace();
+        }
         size_t pins = 0;
         for (auto& [key, block] : blocks_) { ApplyWrite(block); pins += bool(block.pin); }
         if (pins < config_.cacheDumpReservedBlocks) { return Status::OK(); }
@@ -366,21 +474,30 @@ private:
         return Status::NoSpace();
     }
 
-    Status Fill(CopyStream& stream, const Detail::Shard& shard, Block& block)
+    Status Fill(CopyStream& stream, const Detail::Shard& shard, Block& block,
+                bool& waiting, bool& pollReadiness)
     {
         ApplyWrite(block);
         if (block.complete || block.persisted[shard.index]) { return Status::OK(); }
         if (block.pin && block.pin.LayerView(shard.index).Ready()) { return Status::OK(); }
         if (block.write) {
+            if (WaitForCapacity() && !block.write->done.load(std::memory_order_acquire)) {
+                waiting = true;
+                return Status::OK();
+            }
             auto status = WaitWrite(block);
             if (status.Failure()) { return status; }
         }
         if (!block.pin) {
             auto status = MakeRoom(shard.owner);
+            if (WaitForCapacity() && status == Status::NoSpace()) {
+                waiting = true;
+                return Status::OK();
+            }
             if (status.Failure()) { return status; }
         }
         auto handle = EarlyBufferPins::Acquire(*buffer_, shard.owner, shard.index, false);
-        if (!handle) {
+        if (!handle && !WaitForCapacity()) {
             for (auto& [key, other] : blocks_) {
                 if (key != shard.owner && other.pin) {
                     auto status = Spill(key, other);
@@ -390,8 +507,18 @@ private:
                 }
             }
         }
-        if (!handle || (!handle.Owner() && !handle.Ready())) { return Status::NoSpace(); }
-        if (!block.pin) { block.pin = handle.WholeView(); }
+        if (!handle || (!handle.Owner() && !handle.Ready())) {
+            if (WaitForCapacity()) {
+                if (handle && handle.GetState() == TransBuffer::State::FAILED) {
+                    return handle.FailureStatus();
+                }
+                waiting = true;
+                pollReadiness = pollReadiness || bool(handle);
+                return Status::OK();
+            }
+            return Status::NoSpace();
+        }
+        if (!block.pin) { block.pin = handle.WholeView(); resident_.insert(&block); }
         if (handle.Ready()) { return Status::OK(); }
         const auto packed = config_.storeBackend->PackedLayerBytes(shard.index);
         std::memset(handle.Data(), 0, packed ? packed : config_.shardSize);
@@ -435,68 +562,84 @@ private:
         return Status::OK();
     }
 
-    Status Process(CopyStream& stream, SourceTask& work)
+    void PrepareGroups(SourceTask& work)
+    {
+        if (work.prepared) { return; }
+        std::unordered_map<Detail::BlockId, size_t, Detail::BlockIdHasher> positions;
+        for (const auto& shard : work.pair.first->desc) {
+            auto [it, inserted] = positions.emplace(shard.owner, work.groups.size());
+            if (inserted) { work.groups.push_back({shard.owner, {}, false}); }
+            work.groups[it->second].shards.push_back(&shard);
+        }
+        work.prepared = true;
+    }
+
+    Status ProcessGroup(CopyStream& stream, SourceTask& work, const SourceGroup& group,
+                        bool& waiting, bool& pollReadiness)
     {
         const auto& desc = work.pair.first->desc;
-        if (desc.prerequisiteHandle) {
+        const auto& id = group.id;
+        auto it = blocks_.find(id);
+        if (it == blocks_.end()) {
+            if (blocks_.size() >= config_.waitingQueueDepth) {
+                if (WaitForCapacity()) { waiting = true; return Status::OK(); }
+                return desc.finalizeBlockDump ? Status::NoSpace() : Status::OK();
+            }
+            auto lease = config_.storeBackend->AcquireWriteLease(id);
+            if (!lease) {
+                return desc.finalizeBlockDump || lease.Error() != Status::Retry()
+                    ? lease.Error() : Status::OK();
+            }
+            it = blocks_.emplace(id, Block{{}, std::move(lease.Value()),
+                std::vector<bool>(buffer_->LayerCount()), false, false, {}}).first;
+        }
+        auto& block = it->second;
+        // A later submission can join an immutable block's pending final write.
+        // Do not reap its state before this submission has finished with it.
+        block.closing = false;
+        if (desc.prerequisiteHandle && !work.eventQueued) {
             auto status = stream.WaitEvent(Trans::Event{desc.prerequisiteHandle});
             if (status.Failure()) { Drain(stream); return status; }
+            work.eventQueued = true;
         }
-        std::vector<Detail::BlockId> order;
-        std::unordered_map<Detail::BlockId, std::vector<const Detail::Shard*>,
-                           Detail::BlockIdHasher> grouped;
-        for (const auto& shard : desc) {
-            if (!grouped.count(shard.owner)) { order.push_back(shard.owner); }
-            grouped[shard.owner].push_back(&shard);
+        auto status = Status::OK();
+        for (const auto* shard : group.shards) {
+            auto copied = Fill(stream, *shard, block, waiting, pollReadiness);
+            if (waiting) { return status; }
+            // A failed layer must not suppress other independent valid layers.
+            if (copied.Failure() && status.Success()) { status = copied; }
         }
+        if (status.Success()) {
+            status = Publish(id, block, work);
+            if (status == Status::NotFound() && !desc.finalizeBlockDump) { status = Status::OK(); }
+        }
+        if (desc.finalizeBlockDump) {
+            if (!block.complete && !block.write) {
+                work.writes.push_back(Schedule(id, block, false, true, false));
+                if (status.Success()) { status = Status::NotFound(); }
+            } else if (block.write) {
+                work.writes.push_back(block.write);
+            }
+            block.closing = true;
+        } else if (status == Status::NoSpace() && !WaitForCapacity()) {
+            status = Status::OK();  // finalization supplies still-valid missing layers
+        }
+        return status;
+    }
+
+    Status Process(CopyStream& stream, SourceTask& work)
+    {
+        PrepareGroups(work);
         auto result = Status::OK();
-        for (const auto& id : order) {
-            auto it = blocks_.find(id);
-            if (it == blocks_.end()) {
-                if (blocks_.size() >= config_.waitingQueueDepth) {
-                    if (desc.finalizeBlockDump) { result = Status::NoSpace(); }
-                    continue;
-                }
-                auto lease = config_.storeBackend->AcquireWriteLease(id);
-                if (!lease) {
-                    if (desc.finalizeBlockDump || lease.Error() != Status::Retry()) {
-                        result = lease.Error();
-                    }
-                    continue;
-                }
-                it = blocks_.emplace(id, Block{{}, std::move(lease.Value()),
-                    std::vector<bool>(buffer_->LayerCount()), false, false, {}}).first;
-            }
-            auto& block = it->second;
-            // A later submission can join the same immutable block while its
-            // previous final write is pending. Do not reap its new layer state.
-            block.closing = false;
-            auto status = Status::OK();
-            for (const auto* shard : grouped[id]) {
-                auto copied = Fill(stream, *shard, block);
-                // A failed layer does not suppress other independent valid layers.
-                if (copied.Failure() && status.Success()) { status = copied; }
-            }
-            if (status.Success()) {
-                status = Publish(id, block, work);
-                if (status == Status::NotFound() && !desc.finalizeBlockDump) { status = Status::OK(); }
-            }
-            if (desc.finalizeBlockDump) {
-                if (!block.complete && !block.write) {
-                    work.writes.push_back(Schedule(id, block, false, true, false));
-                    if (status.Success()) { status = Status::NotFound(); }
-                } else if (block.write) {
-                    work.writes.push_back(block.write);
-                }
-                block.closing = true;
-            } else if (status == Status::NoSpace()) {
-                status = Status::OK();  // finalization supplies still-valid missing layers
-            }
+        for (const auto& group : work.groups) {
+            bool waiting = false, pollReadiness = false;
+            auto status = ProcessGroup(stream, work, group, waiting, pollReadiness);
             if (status.Failure() && result.Success()) { result = status; }
         }
         auto drained = Drain(stream);
         return result.Failure() ? result : drained;
     }
+
 };
 }  // namespace UC::CacheStore
 #endif

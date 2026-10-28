@@ -14,6 +14,7 @@ cache_full_block_load: true
 cache_full_block_l1: true
 cache_full_block_dump: true
 cache_dump_reserved_blocks: 16
+cache_dump_capacity_policy: spill
 posix_io_engine: aio
 ```
 
@@ -31,7 +32,16 @@ including a block whose backend write is being waited. The default is 16, separa
 from `early_owner_max_jobs` and `posix_write_inflight_limit`. Queued plus unfinished task descriptors, and unfinished block bookkeeping,
 are each bounded by `waiting_queue_depth`. The existing limit also covers background
 completions so separating I/O cannot create an unbounded queue.
-The write worker never waits indefinitely for an L1 slot held by a reader.
+`cache_dump_capacity_policy` accepts `spill` (the default) or `wait`. Unknown
+values fail configuration; `wait` requires `cache_full_block_dump`. Both policies
+use the same reservation budget, which is a per-store holding limit rather than a
+physically isolated region. Other L1 users can reduce the slots actually available.
+`wait` relies on those users eventually releasing capacity; it does not forcibly
+reclaim reader pins or reserve physical slots away from Early. Persistent external
+L1 occupation can therefore keep a writer and its HBM source waiting.
+In `wait` mode, one task admission slot is reserved for batch finalization; ordinary
+queued plus unfinished tasks use at most `waiting_queue_depth - 1` slots. A rejected
+submission is reported as NoSpace and never reported as saved data.
 
 ## Data and control flow
 
@@ -43,8 +53,10 @@ The write worker never waits indefinitely for an L1 slot held by a reader.
    the physical block size. Packed blocks use the sum of their physical layer sizes.
 4. Wait for physical I/O completion, then synchronously rename the temporary file
    into the archived namespace. A failed write or short write never publishes it.
-5. At `wait_for_save`, first wait for stage **source** fences. Resubmit addresses of
-   layers whose save callbacks were actually visited, with a new compute event.
+5. At `wait_for_save`, resubmit addresses of layers whose save callbacks were
+   actually visited, with a new compute event. `spill` waits for previous source
+   fences first. `wait` submits finalization before those fences: a waiting block
+   may depend on this repair to release another block's slot.
    Native finalization copies missing layers. `wait_dump_sources()` releases the
    source/event dependency without consuming the task; `check()`/`wait()` still
    report final I/O and publication. Never infer that an unvisited layer is complete.
@@ -86,10 +98,38 @@ must continue to refer to immutable KV data, as in the existing cache protocol.
 
 ## Capacity pressure and incomplete blocks
 
-If the reservation budget is exhausted, spill the READY layers of another incomplete
-block using the original layer offsets. Wait for those writes before releasing its
-L1 reference. Track successfully persisted layers independently of L1 residency.
-This permits progress even when a batch contains more blocks than L1 can hold.
+With `cache_dump_capacity_policy: spill`, an exhausted reservation budget causes
+the READY layers of another incomplete block to be written using their original
+layer offsets. Wait for those writes before releasing its L1 reference. Track
+successfully persisted layers independently of L1 residency. This permits progress
+even when a batch contains more blocks than L1 can hold.
+
+With `cache_dump_capacity_policy: wait`, ordinary capacity pressure never causes a
+partial write. Defer the block needing a new slot while continuing later layer
+submissions for blocks that already hold one. For the order A0, B0, A1, B1, A2, B2
+and one reservation, B waits while A1/A2 complete A; A is written as one full block,
+and its slot becomes available to B only after physical I/O completion. Preserve
+submission order within each block, including finalization. The unit is a block,
+not a request, which may contain many blocks.
+
+Waiting tasks retain their HBM addresses/events, including across an expired wait;
+the source fence cannot return before their copies drain. New work and local I/O
+completion wake the coordinator immediately. Releases by other shared-L1 users are
+detected through the shared release epoch, checked on a 2 ms wait interval while idle.
+Capacity-only waiters are rescanned on release or task/I/O progress. A follower of
+another loader also rechecks READY on that interval: the loader can finish while
+keeping a consumer pin, without changing the release epoch.
+Slot admission scans only resident writers, bounded by the reservation budget,
+rather than all blocks described by queued tasks.
+A known failed writer is retained for a valid-source retry; blocked submissions
+report that storage failure instead of waiting forever for its pinned slot.
+
+`wait` changes normal capacity handling only. Explicit finalization with genuinely
+missing layers and shutdown still preserve available layers through the existing
+terminal spill path below. No incomplete block is advertised as a full cache hit.
+Callbacks must be submitted asynchronously before waiting for a whole mixed-block
+task; synchronously waiting on B0 before supplying A1/A2 cannot make progress with
+one slot. The connector enforces the required finalization/source-fence ordering.
 
 These layer writes suppress the legacy "last layer means publish" rule. Publication
 requires every layer to have completed successfully, even when L1 was evicted and
@@ -149,7 +189,12 @@ The default native test target includes `UCCacheBlockDumpTest.*` in
 real Linux POSIX AIO, with controlled submit hooks. Coverage includes 14-layer uniform
 and packed blocks, exactly one complete write, missing-layer backfill, unpublished
 partial data, more blocks than L1 slots, failed writes and retries, write leases,
-shared L1, shape validation, factory routing and shutdown draining. The connector
+shared L1, shape validation, factory routing and shutdown draining. Wait-policy
+regressions cover interleaved blocks sharing one slot, configurable slot counts,
+physical write completion, failed-layer repair, terminal incomplete blocks,
+external L1 pressure, READY publication without foreign pin release, queued
+timeouts, reserved finalizer admission, and storage failure propagation. Invalid policies and wait-without-block-dump are rejected.
+The connector
 lifecycle cases live in `test/test_ucm_connector_metrics.py`. Additional regressions
 inject a rejected layer copy, verify retry does not copy READY layers, exercise the
 shared failed-layer state, hold an actual POSIX AIO completion while another source

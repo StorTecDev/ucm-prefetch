@@ -62,6 +62,7 @@ struct Config {
     bool cacheFullBlockL1{false};
     bool cacheFullBlockDump{false};
     size_t cacheDumpReservedBlocks{16};
+    std::string cacheDumpCapacityPolicy{"spill"};
     std::vector<uintptr_t> gpuKvBufferAddrs{};
     std::vector<size_t> gpuKvBufferSizes{};
     bool useGdr{false};

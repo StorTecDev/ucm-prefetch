@@ -3312,3 +3312,25 @@ def test_block_dump_preemption_waits_only_for_sources(monkeypatch):
     connector.handle_preemptions({"req"})
     assert connector._pending_dump_tasks == [pending]
     assert calls.count("sources_released_before_l2") == 1
+
+
+def test_wait_capacity_finalizer_submits_repair_before_waiting_for_pending_sources(
+    monkeypatch,
+):
+    connector, calls = _block_dump_connector(monkeypatch)
+    connector._block_dump_wait_capacity = True
+    pending = ucm_connector_module.PendingDumpTask(task=object(), request_ids={"req"})
+    connector._pending_dump_tasks.append(pending)
+    original_sources = connector.store.wait_dump_sources
+
+    def wait_sources(task):
+        if task is pending.task:
+            assert calls and calls[0][-1] is True
+            calls.append("waiting_writer_released_after_repair_submission")
+        else:
+            original_sources(task)
+
+    connector.store.wait_dump_sources = wait_sources
+    connector._finalize_block_dumps()
+    assert calls[1] == "waiting_writer_released_after_repair_submission"
+    assert all(task.sources_released for task in connector._pending_dump_tasks)

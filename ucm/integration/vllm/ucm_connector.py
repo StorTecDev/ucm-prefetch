@@ -2634,6 +2634,12 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._block_dump_enabled = bool(
             self.connector_configs[0]["ucm_connector_config"].get("cache_full_block_dump", False)
         )
+        self._block_dump_wait_capacity = (
+            self.connector_configs[0]["ucm_connector_config"].get(
+                "cache_dump_capacity_policy", "spill"
+            )
+            == "wait"
+        )
         self._dump_ready_layers: set[int] = set()
         self._block_dump_finalized = False
         self._layerwise_load_start_by_layer: dict[int, float] = {}
@@ -2911,7 +2917,10 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         if not self._dump_ready_layers:
             return
         self._block_dump_finalized = True
-        self._wait_pending_dump_sources()
+        # Waiting writers may depend on this finalization to repair a resident
+        # block and free its slot. Submit it before fencing their HBM sources.
+        if not getattr(self, "_block_dump_wait_capacity", False):
+            self._wait_pending_dump_sources()
         metadata = self._get_connector_metadata()
         block_ids, device_ids = [], []
         context = {}
@@ -2921,8 +2930,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 continue
             context[request_id] = set(ids)
             block_ids.extend(
-                ids if self.tp_rank % self.tp_size == 0 else
-                [self.request_hasher(block_id) for block_id in ids]
+                ids
+                if self.tp_rank % self.tp_size == 0
+                else [self.request_hasher(block_id) for block_id in ids]
             )
             device_ids.extend(hbm)
         if not block_ids:

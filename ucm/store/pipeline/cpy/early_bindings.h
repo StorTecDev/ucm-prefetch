@@ -76,6 +76,7 @@ template <class Pipeline, class NotFoundError, class UnhealthyError>
 void BindOperations(pybind11::module_& module)
 {
     namespace py = pybind11;
+    module.attr("EARLY_BLOCK_DUMP_PROTOCOL_VERSION") = 1;
     py::register_exception<CapacityRejected>(module, "EarlyCapacityRejected",
                                              module.attr("StoreNotFoundError").ptr());
     module.def("EarlyDomainInfo", [](Pipeline& pipeline) {
@@ -179,9 +180,10 @@ void BindOperations(pybind11::module_& module)
 
     module.def("EarlyDump", [](Pipeline& pipeline, const py::buffer& ids,
                                 const py::buffer& indexes, const py::buffer& addrs,
-                                uintptr_t prerequisite) {
+                                uintptr_t prerequisite, bool finalize) {
         auto task = LoadBinding::Describe<Pipeline>(ids, indexes, addrs);
         task.brief = "EarlyDump";
+        task.finalizeBlockDump = finalize;
         task.prerequisiteHandle = prerequisite;
         auto* store = reinterpret_cast<StoreV1*>(pipeline.Self());
         py::gil_scoped_release release;
@@ -193,7 +195,7 @@ void BindOperations(pybind11::module_& module)
         return ValueOrThrow<NotFoundError, UnhealthyError>(std::move(result));
     }, py::arg("pipeline"), py::arg("ids").noconvert(),
        py::arg("indexes").noconvert(), py::arg("addrs").noconvert(),
-       py::arg("prerequisite") = 0);
+       py::arg("prerequisite") = 0, py::arg("finalize") = false);
 
     // The synchronous binding keeps the Python Pipeline argument alive. Self()
     // returns its existing entry, including the native health wrapper.

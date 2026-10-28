@@ -76,3 +76,10 @@ Shared cases use fresh whole-block domains and release only their own backing.
 The legacy shared layer-storage cases are not added here because their setup can
 clean unrelated domains. These tests control storage completion; they do not
 model disk latency or replace GPU/end-to-end validation.
+
+## Whole-block writeback
+
+`UCCacheBlockDumpTest.*` exercises the opt-in write coordinator with CPU DMA and real
+POSIX AIO, including full-block byte identity, missing layers, pressure-driven layer
+spills, failure recovery and shutdown. Configuration, publication semantics and Python
+lifecycle coverage are described in [full_block_writeback.md](../../../docs/full_block_writeback.md).

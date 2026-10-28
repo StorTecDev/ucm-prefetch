@@ -7,6 +7,7 @@
 #include <mutex>
 #include "cache/cc/block_dump_queue.h"
 #include "cache/cc/buffer_manager.h"
+#include "detail/mock_store.h"
 #include "detail/path_base.h"
 #include "posix/cc/aio_impl.h"
 #include "posix/cc/space_layout.h"
@@ -24,6 +25,31 @@ Detail::BlockId Id(unsigned char value)
     Detail::BlockId id{};
     id[0] = std::byte{value};
     return id;
+}
+
+Detail::Dictionary SchedulerBackendConfig(const std::string& path)
+{
+    Detail::Dictionary config;
+    config.Set("storage_backends", std::vector<std::string>{path});
+    config.SetNumber("device_id", -1);
+    config.SetNumber("data_dir_shard_bytes", 1);
+    config.SetNumber("posix_lookup_concurrency", 1);
+    config.Set("posix_io_engine", std::string{"aio"});
+    return config;
+}
+
+Detail::Dictionary BlockDumpConfig(StoreV1* backend)
+{
+    Detail::Dictionary config;
+    config.Set("store_backend", backend);
+    config.Set("unique_id", UC::Test::Detail::Random().RandomString(16));
+    config.SetNumber("device_id", -1);
+    config.Set("share_buffer_enable", false);
+    config.Set("cache_full_block_load", true);
+    config.Set("cache_full_block_l1", true);
+    config.Set("cache_full_block_dump", true);
+    config.SetNumber("cache_dump_reserved_blocks", 1);
+    return config;
 }
 
 class WriteTrace {
@@ -347,6 +373,108 @@ TEST_F(UCCacheBlockDumpTest, FactoryRoutesWriteCompletionWithoutChangingReadEntr
     EXPECT_EQ(std::memcmp(first.data(), source[1].data(), 4096), 0);
     EXPECT_EQ(std::memcmp(second.data(), source[1].data() + 4096, 4096), 0);
 }
+
+TEST_F(UCCacheBlockDumpTest, SchedulerStartsWithoutWorkerKvLayout)
+{
+    backend.reset(MakeEarlyPosixStore());
+    ASSERT_EQ(backend->Setup(SchedulerBackendConfig(Path())), Status::OK());
+    ASSERT_FALSE(backend->SupportsFullBlockRead());
+    ASSERT_FALSE(backend->SupportsFullBlockWrite());
+    for (const std::string policy : {"spill", "wait"}) {
+        SCOPED_TRACE(policy);
+        auto config = BlockDumpConfig(backend.get());
+        config.Set("cache_dump_capacity_policy", policy);
+        std::unique_ptr<StoreV1> scheduler{MakeEarlyCacheStore()};
+        ASSERT_EQ(scheduler->Setup(config), Status::OK());
+        const auto id = Id(90);
+        auto hit = scheduler->LookupOnPrefix(&id, 1);
+        ASSERT_TRUE(hit);
+        EXPECT_EQ(hit.Value(), -1);
+    }
+}
+
+TEST_F(UCCacheBlockDumpTest, SchedulerAttachesSharedBlockL1WithoutWorkerKvLayout)
+{
+    Start(3, 1, false, true);
+    const auto id = Id(91);
+    auto pin = CacheStore::EarlyBufferPins::Acquire(*manager->GetTransBuffer(), id, 0, true);
+    ASSERT_TRUE(pin && pin.Owner());
+    auto full = pin.WholeView();
+    std::memset(full.Data(), 'x', 3 * kBytes);
+    full.MarkReady();
+    ASSERT_EQ(backend->LookupOnPrefix(&id, 1).Value(), -1);
+    std::unique_ptr<StoreV1> schedulerBackend{MakeEarlyPosixStore()};
+    auto backendConfig = SchedulerBackendConfig(Path());
+    // GC shares the disk block size even without the worker's tensor layout.
+    backendConfig.SetNumber("block_size", 3 * kBytes);
+    auto setup = schedulerBackend->Setup(backendConfig);
+    ASSERT_EQ(setup, Status::OK()) << setup.ToString();
+    ASSERT_FALSE(schedulerBackend->SupportsFullBlockWrite());
+    for (const std::string policy : {"spill", "wait"}) {
+        SCOPED_TRACE(policy);
+        auto config = BlockDumpConfig(schedulerBackend.get());
+        config.Set("unique_id", cache.uniqueId);
+        config.Set("share_buffer_enable", true);
+        config.Set("cache_dump_capacity_policy", policy);
+        std::unique_ptr<StoreV1> scheduler{MakeEarlyCacheStore()};
+        ASSERT_EQ(scheduler->Setup(config), Status::OK());
+        auto hit = scheduler->LookupOnPrefix(&id, 1);
+        ASSERT_TRUE(hit);
+        EXPECT_EQ(hit.Value(), 0);
+    }
+    EXPECT_TRUE(full.Ready());
+}
+
+TEST_F(UCCacheBlockDumpTest, SchedulerStillRejectsInvalidBlockDumpConfiguration)
+{
+    backend.reset(MakeEarlyPosixStore());
+    ASSERT_EQ(backend->Setup(SchedulerBackendConfig(Path())), Status::OK());
+    const std::vector<std::pair<std::string, std::function<void(Detail::Dictionary&)>>> invalid = {
+        {"missing full L1", [](auto& c) { c.Set("cache_full_block_l1", false); }},
+        {"missing full load", [](auto& c) { c.Set("cache_full_block_load", false); }},
+        {"backend only", [](auto& c) { c.Set("cache_load_backend_only", true); }},
+        {"zero reservations", [](auto& c) { c.SetNumber("cache_dump_reserved_blocks", 0); }},
+        {"unknown policy", [](auto& c) {
+             c.Set("cache_dump_capacity_policy", std::string{"unknown"});
+         }},
+        {"wait without dump", [](auto& c) {
+             c.Set("cache_dump_capacity_policy", std::string{"wait"});
+             c.Set("cache_full_block_dump", false);
+         }},
+        {"GDR", [](auto& c) { c.Set("use_gdr", true); }},
+        {"SDMA direct", [](auto& c) { c.Set("cache_sdma_direct", true); }},
+    };
+    for (const auto& [name, mutate] : invalid) {
+        SCOPED_TRACE(name);
+        auto config = BlockDumpConfig(backend.get());
+        mutate(config);
+        std::unique_ptr<StoreV1> scheduler{MakeEarlyCacheStore()};
+        EXPECT_EQ(scheduler->Setup(config), Status::InvalidParam());
+    }
+}
+
+TEST_F(UCCacheBlockDumpTest, WorkerStillRequiresFullBlockWriteCapability)
+{
+    class ReadOnlyBackend : public testing::NiceMock<UC::Test::Detail::MockStore> {
+    public:
+        bool SupportsFullBlockRead() const override { return true; }
+    } readOnly;
+    ASSERT_FALSE(readOnly.SupportsFullBlockWrite());
+    for (const std::string policy : {"spill", "wait"}) {
+        SCOPED_TRACE(policy);
+        auto config = BlockDumpConfig(&readOnly);
+        config.SetNumber("device_id", 0);
+        config.SetNumber("tensor_size", kBytes);
+        config.SetNumber("shard_size", kBytes);
+        config.SetNumber("block_size", 3 * kBytes);
+        config.Set("cache_dump_capacity_policy", policy);
+        std::unique_ptr<StoreV1> worker{MakeEarlyCacheStore()};
+        auto status = worker->Setup(config);
+        EXPECT_EQ(status, Status::InvalidParam());
+        EXPECT_NE(status.ToString().find("full-block write backend"), std::string::npos);
+    }
+}
+
 TEST_F(UCCacheBlockDumpTest, ShortWriteIsNotPublishedAsACompleteBlock)
 {
     Start();

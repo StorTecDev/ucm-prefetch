@@ -76,7 +76,7 @@ template <class Pipeline, class NotFoundError, class UnhealthyError>
 void BindOperations(pybind11::module_& module)
 {
     namespace py = pybind11;
-    module.attr("EARLY_BLOCK_DUMP_PROTOCOL_VERSION") = 1;
+    module.attr("EARLY_BLOCK_DUMP_PROTOCOL_VERSION") = 2;
     py::register_exception<CapacityRejected>(module, "EarlyCapacityRejected",
                                              module.attr("StoreNotFoundError").ptr());
     module.def("EarlyDomainInfo", [](Pipeline& pipeline) {
@@ -196,6 +196,14 @@ void BindOperations(pybind11::module_& module)
     }, py::arg("pipeline"), py::arg("ids").noconvert(),
        py::arg("indexes").noconvert(), py::arg("addrs").noconvert(),
        py::arg("prerequisite") = 0, py::arg("finalize") = false);
+
+    module.def("EarlyWaitDumpSources", [](Pipeline& pipeline, Detail::TaskHandle task) {
+        if (task == 0) { return; }  // unhealthy submit accepted no source addresses
+        auto* store = reinterpret_cast<StoreV1*>(pipeline.Self());
+        py::gil_scoped_release release;
+        auto status = store->WaitDumpSources(task);
+        if (status.Failure()) { throw std::runtime_error(status.ToString()); }
+    });
 
     // The synchronous binding keeps the Python Pipeline argument alive. Self()
     // returns its existing entry, including the native health wrapper.

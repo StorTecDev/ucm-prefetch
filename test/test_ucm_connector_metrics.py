@@ -2980,6 +2980,7 @@ def _block_dump_connector(monkeypatch, *, fail_wait=False):
     connector._block_dump_finalized = False
     connector._dump_ready_layers = {0, 2}
     connector._block_dump_enabled = True
+    connector._pending_dump_tasks = []
     connector.first_layer_id = 0
     connector.tp_rank = 0
     connector.tp_size = 1
@@ -2991,7 +2992,6 @@ def _block_dump_connector(monkeypatch, *, fail_wait=False):
         extract_block_addrs=lambda *args, **kwargs: [[[10]], [[20]], [[30]]]
     )
     calls = []
-    connector._flush_pending_dump_tasks = lambda: calls.append("drain_stages")
     connector._get_dump_event_handle = lambda: 42
     connector._record_counter = lambda *args: None
     connector.device = SimpleNamespace(destroy_event_handle=lambda event: calls.append(("destroy", event)))
@@ -3001,16 +3001,17 @@ def _block_dump_connector(monkeypatch, *, fail_wait=False):
         calls.append((context, blocks, layers, ptrs, event, finalize))
         return task
 
-    def wait(pending):
-        assert pending.task is task
-        calls.append("wait_final_before_hbm_release")
-        connector._release_dump_event_handle(pending)
+    def sources(received):
+        assert received is task
+        calls.append("sources_released_before_l2")
         if fail_wait:
-            raise RuntimeError("controlled incomplete block")
+            raise RuntimeError("source completion not proven")
 
     connector._rank_consistency = SimpleNamespace(submit_dump=submit)
-    connector.store = object()
-    connector._wait_pending_dump_task = wait
+    connector.store = SimpleNamespace(wait_dump_sources=sources)
+    connector._wait_pending_dump_task = lambda pending: pytest.fail(
+        "unexpected L2 wait"
+    )
     monkeypatch.setattr(ucm_connector_module.np, "ascontiguousarray", lambda x: x, raising=False)
     return connector, calls
 
@@ -3018,18 +3019,31 @@ def _block_dump_connector(monkeypatch, *, fail_wait=False):
 def test_block_dump_finalizer_retries_only_visited_layers_before_hbm_release(monkeypatch):
     connector, calls = _block_dump_connector(monkeypatch)
     connector._finalize_block_dumps()
-    assert calls[0] == "drain_stages"
-    assert calls[1] == ({"req": {b"block"}}, [b"block", b"block"], [0, 2], [[10], [30]], 42, True)
-    assert calls[2:] == ["wait_final_before_hbm_release", ("destroy", 42)]
+    assert calls[0] == (
+        {"req": {b"block"}},
+        [b"block", b"block"],
+        [0, 2],
+        [[10], [30]],
+        42,
+        True,
+    )
+    assert calls[1:] == ["sources_released_before_l2", ("destroy", 42)]
+    assert len(connector._pending_dump_tasks) == 1
+    assert connector._pending_dump_tasks[0].sources_released
     connector._finalize_block_dumps()
-    assert len(calls) == 4
+    assert len(calls) == 3
 
 
-def test_block_dump_finalizer_drains_failed_completion_and_releases_event(monkeypatch):
+def test_block_dump_finalizer_propagates_unproven_sources_and_keeps_event(monkeypatch):
     connector, calls = _block_dump_connector(monkeypatch, fail_wait=True)
-    connector._finalize_block_dumps()
-    assert calls[-2:] == ["wait_final_before_hbm_release", ("destroy", 42)]
-    assert connector._block_dump_finalized
+    with pytest.raises(RuntimeError, match="source completion not proven"):
+        connector._finalize_block_dumps()
+    assert ("destroy", 42) not in calls
+    pending = connector._pending_dump_tasks[0]
+    assert pending.event_handle == 42
+    assert not pending.sources_released
+    with pytest.raises(RuntimeError, match="source completion not proven"):
+        connector._finalize_block_dumps()
 
 
 def test_block_dump_finalizer_does_not_invent_sources_for_unvisited_batch(monkeypatch):
@@ -3256,3 +3270,45 @@ def test_dump_accounting_disabled_manager_does_not_retain_repair_state():
     assert _accounting_finished(manager, {"r"}) == set()
     assert manager._dump_outcomes_by_request == {}
     assert manager._dump_task_contexts == {}
+
+
+def test_block_dump_finished_sending_does_not_report_early_l2_success(monkeypatch):
+    from ucm.integration.vllm.rank_consistency import RankConsistencyManager
+
+    connector, calls = _block_dump_connector(monkeypatch)
+    manager = RankConsistencyManager(is_scheduler=False)
+    connector._rank_consistency = manager
+    store = _DumpAccountingStore()
+    source_waits = []
+    store.wait_dump_sources = lambda task: source_waits.append(task)
+    store.done = False
+    store.check = lambda task: store.done
+    connector.store = store
+    task = _accounting_dump(manager, store, {"req": {b"block"}}, finalize=True)
+    pending = PendingDumpTask(task=task, request_ids={"req"}, event_handle=42)
+    connector._pending_dump_tasks = [pending]
+    connector._async_dump_req_ids = {"req"}
+    connector._poll_pending_load_tasks = lambda: set()
+    connector._wait_pending_dump_task = lambda pending: manager.wait_dump(pending.task)
+    assert connector.get_finished({"req"}) == ({"req"}, None)
+    assert source_waits == [task]
+    assert connector._pending_dump_tasks == [pending]
+    assert manager._dump_succeeded_blocks == set()
+    assert connector._block_dump_finished_req_ids == {"req"}
+    store.done = True
+    assert connector.get_finished(set()) == (None, None)
+    assert connector._pending_dump_tasks == []
+    assert connector._block_dump_finished_req_ids == set()
+    assert manager._dump_succeeded_blocks == {b"block"}
+
+
+def test_block_dump_preemption_waits_only_for_sources(monkeypatch):
+    connector, calls = _block_dump_connector(monkeypatch)
+    connector._finalize_block_dumps()
+    pending = connector._pending_dump_tasks[0]
+    connector._flush_pending_dump_tasks = lambda *args: pytest.fail(
+        "unexpected L2 wait"
+    )
+    connector.handle_preemptions({"req"})
+    assert connector._pending_dump_tasks == [pending]
+    assert calls.count("sources_released_before_l2") == 1

@@ -1315,6 +1315,7 @@ class PendingDumpTask:
     request_ids: set[str]
     event_handle: int = 0
     wait_for_save_start_ms: float = 0.0
+    sources_released: bool = False
 
 
 @dataclass
@@ -2299,6 +2300,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
             self.device.destroy_event_handle(pending_dump_task.event_handle)
             pending_dump_task.event_handle = 0
 
+    def _wait_pending_dump_sources(
+        self, request_ids: Optional[set[str]] = None
+    ) -> None:
+        for pending in self._pending_dump_tasks:
+            if pending.sources_released or (
+                request_ids is not None and not (pending.request_ids & request_ids)
+            ):
+                continue
+            # Failure here is fatal to this forward: do not recycle unproven HBM.
+            self.store.wait_dump_sources(pending.task)
+            pending.sources_released = True
+            self._release_dump_event_handle(pending)
+
     def _poll_pending_dump_tasks(self) -> None:
         remaining_tasks: list[PendingDumpTask] = []
         for pending_dump_task in self._pending_dump_tasks:
@@ -2350,7 +2364,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
             else getattr(kv_connector_metadata, "preempted_req_ids", None)
         )
         if preempted_req_ids:
-            self._flush_pending_dump_tasks(preempted_req_ids)
+            if getattr(self, "_block_dump_enabled", False):
+                self._wait_pending_dump_sources(preempted_req_ids)
+            else:
+                self._flush_pending_dump_tasks(preempted_req_ids)
 
     def wait_for_save(self) -> None:
         # TODO support PP
@@ -2551,6 +2568,22 @@ class UCMDirectConnector(KVConnectorBase_V1):
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         finished_recving = self._poll_pending_load_tasks()
         async_finished_req_ids = finished_req_ids & self._async_dump_req_ids
+
+        if getattr(self, "_block_dump_enabled", False):
+            self._wait_pending_dump_sources(async_finished_req_ids)
+            self._poll_pending_dump_tasks()
+            retired = getattr(self, "_block_dump_finished_req_ids", set())
+            retired.update(async_finished_req_ids)
+            pending_ids = {
+                request_id
+                for pending in self._pending_dump_tasks
+                for request_id in pending.request_ids
+            }
+            accounted = retired - pending_ids
+            self._rank_consistency.finish_dump(accounted)
+            self._block_dump_finished_req_ids = retired - accounted
+            self._async_dump_req_ids.difference_update(async_finished_req_ids)
+            return async_finished_req_ids or None, finished_recving or None
 
         if async_finished_req_ids:
             remaining_tasks: list[PendingDumpTask] = []
@@ -2867,15 +2900,18 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self._dumped_layer_ids.add(layer_id)
 
     def _finalize_block_dumps(self) -> None:
-        """Backfill visited layers and drain writes before this batch releases HBM.
+        """Backfill visited layers and drain source copies before releasing HBM.
 
         Unvisited layers are never guessed to be valid. Native finalization spills
         the available layers but reports an incomplete block instead of publishing it.
         """
-        if self._block_dump_finalized or not self._dump_ready_layers:
+        if self._block_dump_finalized:
+            self._wait_pending_dump_sources()
+            return
+        if not self._dump_ready_layers:
             return
         self._block_dump_finalized = True
-        self._flush_pending_dump_tasks()
+        self._wait_pending_dump_sources()
         metadata = self._get_connector_metadata()
         block_ids, device_ids = [], []
         context = {}
@@ -2904,13 +2940,16 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 finalize=True,
             )
             pending = PendingDumpTask(task=task, request_ids=set(context), event_handle=event)
-            self._wait_pending_dump_task(pending)
+            self._pending_dump_tasks.append(pending)
         except Exception as error:
             logger.error(f"finalize block dump failed: {type(error).__name__}: {error}")
             self._record_counter("connector_dump_submit_errors_total")
         finally:
             if pending is None and self.enable_event_sync and event and self.device is not None:
                 self.device.destroy_event_handle(event)
+        # This fence must propagate unproven-source errors rather than log and
+        # release HBM. L2 completion remains in _pending_dump_tasks for polling.
+        self._wait_pending_dump_sources()
 
     def wait_for_save(self) -> None:
         wait_for_save_start_ms = time.perf_counter() * 1000

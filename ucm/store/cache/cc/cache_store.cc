@@ -472,6 +472,12 @@ public:
         return transfers_ ? transfers_->Wait(task) : CacheStore::Wait(task);
     }
 
+    Status WaitDumpSources(Detail::TaskHandle task) override
+    {
+        return blockDumps_ ? blockDumps_->WaitSources(task) :
+            Status::Unsupported();
+    }
+
 private:
     Expected<Detail::TaskHandle> SubmitBounded(TransTask::Type type, Detail::TaskDesc task)
     {

@@ -15,34 +15,73 @@
 
 namespace UC::CacheStore {
 
-// A write-only coordinator. The read queues and reservation protocol are unchanged.
-// The worker serializes D2H and L2 completion; submitters retain HBM through Wait.
+#ifdef UCM_ENABLE_TEST_HOOKS
+namespace TestHooks {
+// Set/clear only while no test task is running. A failure models rejected D2H.
+inline std::function<Status(const Detail::Shard&)> blockDumpCopyHook;
+}
+#endif
+
+// One source worker owns block bookkeeping. The independent I/O worker only
+// touches pinned, immutable L1 views; it never receives HBM addresses.
 class BlockDumpQueue final : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> {
+    struct WriteJob {
+        Detail::BlockId id;
+        Detail::TaskDesc desc;
+        TransBuffer::Handle pin;
+        std::shared_ptr<void> lease;
+        std::vector<size_t> layers;
+        bool commit{false};
+        bool releasePin{false};
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::atomic_bool done{false};
+        Status status{Status::OK()};
+    };
     struct Block {
         TransBuffer::Handle pin;
         std::shared_ptr<void> lease;
         std::vector<bool> persisted;
         bool complete{false};
+        bool closing{false};
+        std::shared_ptr<WriteJob> write;
     };
+    struct SourceTask {
+        TaskPair pair;
+        Latch sources;
+        Status sourceStatus{Status::OK()};
+        std::vector<std::shared_ptr<WriteJob>> writes;
+        explicit SourceTask(TaskPair value) : pair(std::move(value)) { sources.Set(1); }
+    };
+    using Work = std::shared_ptr<SourceTask>;
     using Blocks = std::unordered_map<Detail::BlockId, Block, Detail::BlockIdHasher>;
     Config config_;
     TransBuffer* buffer_{};
-    Blocks blocks_;
+    Blocks blocks_;  // source worker only
+    std::vector<Work> finishing_;  // source worker only
     std::mutex queueMutex_;
     std::condition_variable wake_;
-    std::deque<TaskPair> pending_;
+    std::deque<Work> pending_;
+    std::unordered_map<Detail::TaskHandle, Work> sources_;
+    std::atomic<size_t> admitted_{0};
+    std::atomic<size_t> ioEpoch_{0};
     bool stopping_{false};
     std::thread worker_;
+    std::mutex ioMutex_;
+    std::condition_variable ioWake_;
+    std::deque<std::shared_ptr<WriteJob>> ioPending_;
+    bool ioStopping_{false};
+    std::thread ioWorker_;
 
 public:
     ~BlockDumpQueue()
     {
-        {
-            std::lock_guard lock(queueMutex_);
-            stopping_ = true;
-        }
+        { std::lock_guard lock(queueMutex_); stopping_ = true; }
         wake_.notify_one();
         if (worker_.joinable()) { worker_.join(); }
+        { std::lock_guard lock(ioMutex_); ioStopping_ = true; }
+        ioWake_.notify_one();
+        if (ioWorker_.joinable()) { ioWorker_.join(); }
     }
 
     Status Setup(const Config& config, TransBuffer* buffer)
@@ -54,6 +93,7 @@ public:
         config_ = config;
         buffer_ = buffer;
         timeoutMs_ = config.timeoutMs;
+        ioWorker_ = std::thread([this] { RunIo(); });
         std::promise<Status> started;
         auto ready = started.get_future();
         worker_ = std::thread([this, &started] { Run(started); });
@@ -85,9 +125,35 @@ public:
     }
 
     bool Owns(Detail::TaskHandle id)
+    { std::shared_lock lock(mutex_); return tasks_.count(id) != 0; }
+
+    // Non-consuming: caller must still Check/Wait for successful cache publication.
+    // OK proves HBM is no longer accessed; copy/I/O errors remain on the final task.
+    Status WaitSources(Detail::TaskHandle id)
     {
-        std::shared_lock lock(mutex_);
-        return tasks_.count(id) != 0;
+        Work work;
+        {
+            std::lock_guard lock(queueMutex_);
+            auto it = sources_.find(id);
+            if (it == sources_.end()) { return Status::NotFound(); }
+            work = it->second;
+        }
+        if (!work->sources.WaitFor(timeoutMs_)) {
+            Cancel(work->pair.first);
+            // A running DMA cannot be abandoned merely because a deadline elapsed.
+            while (!work->sources.WaitForDuration(2000)) {
+                UC_WARN("Block dump sources task={} still draining", id);
+            }
+        }
+        return Status::OK();
+    }
+
+    Status Wait(Detail::TaskHandle id)
+    {
+        auto status = Detail::TaskWrapper<TransTask, Detail::TaskHandle>::Wait(id);
+        std::lock_guard lock(queueMutex_);
+        sources_.erase(id);
+        return status;
     }
 
 private:
@@ -96,17 +162,133 @@ private:
     void Dispatch(TaskPtr task, WaiterPtr waiter) override
     {
         waiter->Set(1);
-        {
-            std::lock_guard lock(queueMutex_);
-            if (!stopping_ && pending_.size() < config_.waitingQueueDepth) {
-                pending_.emplace_back(task, waiter);
-                wake_.notify_one();
-                return;
-            }
+        auto work = std::make_shared<SourceTask>(TaskPair{task, waiter});
+        std::lock_guard lock(queueMutex_);
+        sources_.emplace(task->id, work);
+        if (!stopping_ && admitted_.load() < config_.waitingQueueDepth) {
+            ++admitted_;
+            pending_.push_back(work);
+            wake_.notify_one();
+            return;
         }
-        task->Fail(Status::NoSpace());
+        work->sourceStatus = Status::NoSpace();
+        task->Fail(work->sourceStatus);
         failureSet_.Insert(task->id);
+        work->sources.Done();
         waiter->Done();
+    }
+
+    void Cancel(TaskPtr task) override
+    {
+        std::lock_guard lock(queueMutex_);
+        auto it = std::find_if(pending_.begin(), pending_.end(),
+            [&](const Work& work) { return work->pair.first == task; });
+        if (it == pending_.end()) { return; }  // running sources/I/O must drain
+        auto work = *it;
+        pending_.erase(it);
+        work->sourceStatus = Status::Timeout();
+        task->Fail(work->sourceStatus);
+        failureSet_.Insert(task->id);
+        --admitted_;
+        work->sources.Done();
+        work->pair.second->Done();
+    }
+
+    Status Drain(CopyStream& stream)
+    {
+        auto first = stream.Synchronize();
+        if (first.Success()) { return first; }
+        // Do not release either DMA endpoint on an unproven stream error.
+        while (stream.Synchronize().Failure()) {
+            UC_ERROR("Block dump DMA completion unknown; retaining source and L1 pins");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return first;
+    }
+
+    void RunIo()
+    {
+        for (;;) {
+            std::shared_ptr<WriteJob> job;
+            {
+                std::unique_lock lock(ioMutex_);
+                ioWake_.wait(lock, [&] { return ioStopping_ || !ioPending_.empty(); });
+                if (ioPending_.empty()) { return; }
+                job = std::move(ioPending_.front()); ioPending_.pop_front();
+            }
+            auto status = Status::OK();
+            if (!job->desc.empty()) {
+                job->desc.deferWriteCommit = true;
+                auto task = config_.storeBackend->Dump(std::move(job->desc));
+                status = task ? config_.storeBackend->Wait(task.Value()) : task.Error();
+            }
+            if (status.Success() && job->commit) {
+                status = config_.storeBackend->CommitDump(job->id);
+            }
+            job->pin = {}; job->lease.reset();
+            {
+                std::lock_guard lock(job->mutex);
+                job->status = status;
+                job->done.store(true, std::memory_order_release);
+            }
+            job->cv.notify_all();
+            { std::lock_guard lock(queueMutex_); ++ioEpoch_; }
+            wake_.notify_one();
+        }
+    }
+
+    void ApplyWrite(Block& block)
+    {
+        auto job = block.write;
+        if (!job || !job->done.load(std::memory_order_acquire)) { return; }
+        if (job->status.Success()) {
+            for (auto layer : job->layers) { block.persisted[layer] = true; }
+            if (job->commit) { block.complete = true; }
+            if (job->releasePin) { block.pin = {}; }
+        } else {
+            // Retain valid L1 data and the transaction for an explicit retry.
+            block.closing = false;
+        }
+        block.write.reset();
+    }
+
+    Status WaitWrite(Block& block)
+    {
+        auto job = block.write;
+        if (!job) { return Status::OK(); }
+        {
+            std::unique_lock lock(job->mutex);
+            job->cv.wait(lock, [&] { return job->done.load(std::memory_order_acquire); });
+        }
+        auto status = job->status;
+        ApplyWrite(block);
+        return status;
+    }
+
+    void Reap()
+    {
+        for (auto it = blocks_.begin(); it != blocks_.end();) {
+            ApplyWrite(it->second);
+            if (it->second.closing && !it->second.write) { it = blocks_.erase(it); }
+            else { ++it; }
+        }
+        for (auto it = finishing_.begin(); it != finishing_.end();) {
+            const auto& work = *it;
+            if (!std::all_of(work->writes.begin(), work->writes.end(),
+                [](const auto& job) { return job->done.load(std::memory_order_acquire); })) {
+                ++it; continue;
+            }
+            auto& task = work->pair.first;
+            for (const auto& job : work->writes) {
+                if (job->status.Failure()) { task->Fail(job->status); }
+            }
+            if (task->failureStatus.load() != Status::OK().Underlying()) {
+                failureSet_.Insert(task->id);
+            }
+            --admitted_;
+            work->pair.second->Done();
+            it = finishing_.erase(it);
+        }
     }
 
     void Run(std::promise<Status>& started)
@@ -116,68 +298,73 @@ private:
         started.set_value(status);
         if (status.Failure()) { return; }
         for (;;) {
-            TaskPair pair;
+            const auto epoch = ioEpoch_.load();
+            Reap();
+            Work work;
             {
                 std::unique_lock lock(queueMutex_);
-                wake_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
-                if (pending_.empty()) { break; }
-                pair = std::move(pending_.front());
-                pending_.pop_front();
+                if (pending_.empty() && stopping_ && finishing_.empty()) { break; }
+                if (pending_.empty()) {
+                    wake_.wait(lock, [&] {
+                        return !pending_.empty() || ioEpoch_.load() != epoch ||
+                            (stopping_ && finishing_.empty());
+                    });
+                    continue;
+                }
+                work = std::move(pending_.front()); pending_.pop_front();
             }
-            auto& task = pair.first;
-            // Even a timed-out caller must retain its HBM until this worker drains.
-            status = Process(stream, task->desc);
-            if (status.Failure()) {
-                task->Fail(status);
-                failureSet_.Insert(task->id);
-            }
-            pair.second->Done();
+            status = Process(stream, *work);
+            if (status.Failure()) { work->pair.first->Fail(status); }
+            work->sourceStatus = status;
+            // All source copies have drained. Only pinned L1 is used from here.
+            work->sources.Done();
+            finishing_.push_back(std::move(work));
         }
-        // On shutdown, preserve available layers as unpublished L2 data. Every
-        // accepted backend task is waited before releasing its L1 source/lease.
         for (auto& [id, block] : blocks_) {
-            if (!block.complete) {
-                auto saved = Spill(id, block);
-                if (saved.Failure()) { UC_ERROR("Block dump shutdown spill failed: {}", saved); }
-            }
+            auto saved = Spill(id, block);
+            if (saved.Failure()) { UC_ERROR("Block dump shutdown spill failed: {}", saved); }
         }
     }
 
-    Status Write(Detail::TaskDesc desc)
+    std::shared_ptr<WriteJob> Schedule(const Detail::BlockId& id, Block& block,
+                                      bool full, bool releasePin, bool commit)
     {
-        desc.deferWriteCommit = true;
-        auto task = config_.storeBackend->Dump(std::move(desc));
-        if (!task) { return task.Error(); }
-        // POSIX Wait drains cancellations as well as successful I/O. Thus a
-        // released pin can never still be referenced by the kernel.
-        return config_.storeBackend->Wait(task.Value());
+        auto job = std::make_shared<WriteJob>();
+        job->id = id; job->pin = block.pin; job->lease = block.lease;
+        job->releasePin = releasePin; job->commit = commit;
+        if (full) {
+            job->desc.fullBlockWrite = true;
+            job->desc.push_back({id, 0, {block.pin.Data()}});
+            for (size_t layer = 0; layer < buffer_->LayerCount(); ++layer) {
+                job->layers.push_back(layer);
+            }
+        } else if (block.pin) {
+            for (size_t layer = 0; layer < buffer_->LayerCount(); ++layer) {
+                auto view = block.pin.LayerView(layer);
+                if (view.Ready() && !block.persisted[layer]) {
+                    job->desc.push_back({id, layer, {view.Data()}});
+                    job->layers.push_back(layer);
+                }
+            }
+        }
+        block.write = job;
+        { std::lock_guard lock(ioMutex_); ioPending_.push_back(job); }
+        ioWake_.notify_one();
+        return job;
     }
 
     Status Spill(const Detail::BlockId& id, Block& block)
     {
-        if (!block.pin) { return Status::OK(); }
-        Detail::TaskDesc desc;
-        std::vector<size_t> layers;
-        for (size_t layer = 0; layer < buffer_->LayerCount(); ++layer) {
-            auto view = block.pin.LayerView(layer);
-            if (view.Ready() && !block.persisted[layer]) {
-                desc.push_back({id, layer, {view.Data()}});
-                layers.push_back(layer);
-            }
-        }
-        if (!desc.empty()) {
-            auto status = Write(std::move(desc));
-            if (status.Failure()) { return status; }
-            for (auto layer : layers) { block.persisted[layer] = true; }
-        }
-        block.pin = {};
-        return Status::OK();
+        auto status = WaitWrite(block);
+        if (status.Failure() || !block.pin) { return status; }
+        Schedule(id, block, false, true, false);
+        return WaitWrite(block);
     }
 
     Status MakeRoom(const Detail::BlockId& id)
     {
         size_t pins = 0;
-        for (const auto& [key, block] : blocks_) { pins += bool(block.pin); }
+        for (auto& [key, block] : blocks_) { ApplyWrite(block); pins += bool(block.pin); }
         if (pins < config_.cacheDumpReservedBlocks) { return Status::OK(); }
         for (auto& [key, block] : blocks_) {
             if (key != id && block.pin) { return Spill(key, block); }
@@ -187,14 +374,19 @@ private:
 
     Status Fill(CopyStream& stream, const Detail::Shard& shard, Block& block)
     {
+        ApplyWrite(block);
         if (block.complete || block.persisted[shard.index]) { return Status::OK(); }
+        if (block.pin && block.pin.LayerView(shard.index).Ready()) { return Status::OK(); }
+        if (block.write) {
+            auto status = WaitWrite(block);
+            if (status.Failure()) { return status; }
+        }
         if (!block.pin) {
             auto status = MakeRoom(shard.owner);
             if (status.Failure()) { return status; }
         }
         auto handle = EarlyBufferPins::Acquire(*buffer_, shard.owner, shard.index, false);
         if (!handle) {
-            // A reservation of ours may be the only reclaimable ordinary slot.
             for (auto& [key, other] : blocks_) {
                 if (key != shard.owner && other.pin) {
                     auto status = Spill(key, other);
@@ -205,51 +397,56 @@ private:
             }
         }
         if (!handle || (!handle.Owner() && !handle.Ready())) { return Status::NoSpace(); }
-        // Acquiring a layer reserves a complete physical L1 block before any DMA.
         if (!block.pin) { block.pin = handle.WholeView(); }
         if (handle.Ready()) { return Status::OK(); }
         const auto packed = config_.storeBackend->PackedLayerBytes(shard.index);
-        const auto bytes = packed ? packed : config_.shardSize;
-        // Null tensor slots and alignment padding must not publish stale bytes.
-        std::memset(handle.Data(), 0, bytes);
+        std::memset(handle.Data(), 0, packed ? packed : config_.shardSize);
         auto addresses = shard.addrs;
-        auto status = stream.DeviceToHostAsync(addresses.data(), handle.Data(), config_.tensorSizes);
-        auto drained = stream.Synchronize();
+        auto status = Status::OK();
+#ifdef UCM_ENABLE_TEST_HOOKS
+        if (TestHooks::blockDumpCopyHook) { status = TestHooks::blockDumpCopyHook(shard); }
+#endif
+        if (status.Success()) {
+            status = stream.DeviceToHostAsync(addresses.data(), handle.Data(), config_.tensorSizes);
+        }
+        auto drained = Drain(stream);
         if (status.Failure() || drained.Failure()) {
             auto error = status.Failure() ? status : drained;
-            handle.MarkFailed(error);
+            handle.MarkLayerFailed(error);
             return error;
         }
         handle.MarkReady();
         return Status::OK();
     }
 
-    Status Publish(const Detail::BlockId& id, Block& block)
+    Status Publish(const Detail::BlockId& id, Block& block, SourceTask& task)
     {
         if (block.complete) { return Status::OK(); }
-        if (block.pin && block.pin.Ready()) {
-            Detail::TaskDesc desc;
-            desc.fullBlockWrite = true;
-            desc.push_back({id, 0, {block.pin.Data()}});
-            auto status = Write(std::move(desc));
+        if (block.write) {
+            if (block.write->commit) { task.writes.push_back(block.write); return Status::OK(); }
+            auto status = WaitWrite(block);
             if (status.Failure()) { return status; }
-            std::fill(block.persisted.begin(), block.persisted.end(), true);
         }
-        if (!std::all_of(block.persisted.begin(), block.persisted.end(), [](bool x) { return x; })) {
-            return Status::NotFound();
+        const bool full = block.pin && block.pin.Ready();
+        const bool persisted = std::all_of(block.persisted.begin(), block.persisted.end(),
+                                         [](bool ready) { return ready; });
+        for (size_t layer = 0; layer < buffer_->LayerCount(); ++layer) {
+            if (!block.persisted[layer] && (!block.pin || !block.pin.LayerView(layer).Ready())) {
+                return Status::NotFound();
+            }
         }
-        auto status = config_.storeBackend->CommitDump(id);
-        if (status.Failure()) { return status; }
-        block.complete = true;
-        block.pin = {};
+        // Earlier spills may already cover some layers; persist the remaining
+        // READY views and publish only after their physical writes succeed.
+        task.writes.push_back(Schedule(id, block, full && !persisted, true, true));
         return Status::OK();
     }
 
-    Status Process(CopyStream& stream, const Detail::TaskDesc& desc)
+    Status Process(CopyStream& stream, SourceTask& work)
     {
+        const auto& desc = work.pair.first->desc;
         if (desc.prerequisiteHandle) {
             auto status = stream.WaitEvent(Trans::Event{desc.prerequisiteHandle});
-            if (status.Failure()) { stream.Synchronize(); return status; }
+            if (status.Failure()) { Drain(stream); return status; }
         }
         std::vector<Detail::BlockId> order;
         std::unordered_map<Detail::BlockId, std::vector<const Detail::Shard*>,
@@ -274,33 +471,36 @@ private:
                     continue;
                 }
                 it = blocks_.emplace(id, Block{{}, std::move(lease.Value()),
-                                               std::vector<bool>(buffer_->LayerCount()), false}).first;
+                    std::vector<bool>(buffer_->LayerCount()), false, false, {}}).first;
             }
             auto& block = it->second;
+            // A later submission can join the same immutable block while its
+            // previous final write is pending. Do not reap its new layer state.
+            block.closing = false;
             auto status = Status::OK();
             for (const auto* shard : grouped[id]) {
-                status = Fill(stream, *shard, block);
-                if (status.Failure()) { break; }
+                auto copied = Fill(stream, *shard, block);
+                // A failed layer does not suppress other independent valid layers.
+                if (copied.Failure() && status.Success()) { status = copied; }
             }
             if (status.Success()) {
-                status = Publish(id, block);
-                if (status == Status::NotFound()) { status = Status::OK(); }
+                status = Publish(id, block, work);
+                if (status == Status::NotFound() && !desc.finalizeBlockDump) { status = Status::OK(); }
             }
             if (desc.finalizeBlockDump) {
-                // Retrying supplied layers is safe only because the connector
-                // keeps this batch's HBM valid and supplied a compute event.
-                auto spilled = block.complete ? Status::OK() : Spill(id, block);
-                if (status.Success()) { status = spilled; }
-                if (status.Success()) { status = Publish(id, block); }
-                if (spilled.Success()) { blocks_.erase(it); }
+                if (!block.complete && !block.write) {
+                    work.writes.push_back(Schedule(id, block, false, true, false));
+                    if (status.Success()) { status = Status::NotFound(); }
+                } else if (block.write) {
+                    work.writes.push_back(block.write);
+                }
+                block.closing = true;
             } else if (status == Status::NoSpace()) {
-                // No DMA occurred for the missing layer. Finish supplies it again
-                // before the connector allows HBM reuse; never spin on readers.
-                status = Status::OK();
+                status = Status::OK();  // finalization supplies still-valid missing layers
             }
             if (status.Failure() && result.Success()) { result = status; }
         }
-        auto drained = stream.Synchronize();
+        auto drained = Drain(stream);
         return result.Failure() ? result : drained;
     }
 };

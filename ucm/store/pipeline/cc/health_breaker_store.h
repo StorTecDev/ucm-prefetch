@@ -97,6 +97,9 @@ public:
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
     Expected<bool> Check(Detail::TaskHandle taskId) override;
     Status Wait(Detail::TaskHandle taskId) override;
+    Status WaitDumpSources(Detail::TaskHandle taskId) override
+    { return store_->WaitDumpSources(taskId); }  // accepted tasks drain even when unhealthy
+
 
 private:
     void UpdateState(bool changed, const char* source);

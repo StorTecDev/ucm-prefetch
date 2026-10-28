@@ -659,7 +659,7 @@ Status TransBuffer::Setup(const Config& config)
     bypassHitOnLoad_ = config.cacheLoadBackendOnly;
     wholeBlock_ = config.cacheFullBlockL1;
     size_t nodeBytes = config.shardSize;
-    uint64_t layoutTag = 1469598103934665603ULL;
+    uint64_t layoutTag = 1469598103934665603ULL ^ 3ULL;  // layer-local failure protocol
     if (wholeBlock_ && config.deviceId >= 0) {
         if (!config.storeBackend || !config.shardSize || config.blockSize % config.shardSize) {
             return Status::InvalidParam("invalid block L1 layout");
@@ -720,12 +720,14 @@ TransBuffer::Handle TransBuffer::MakeHandle(Index pos, size_t shard, bool owner,
                 // it stops between layers that reference would prevent a safe
                 // full read forever. Retry after existing writers/views drain.
                 unavailable = fill.mode == BlockFillState::Mode::Layers &&
-                    (whole || strategy_->LayerAt(pos, shard)->load(std::memory_order_relaxed) == 0);
+                    (whole || strategy_->LayerAt(pos, shard)->load(std::memory_order_relaxed) == 0 ||
+                     strategy_->LayerAt(pos, shard)->load(std::memory_order_relaxed) == 3);
             }
         } else {
             auto& layer = *strategy_->LayerAt(pos, shard);
             if (fill.mode != BlockFillState::Mode::FullRead &&
-                (layer.load(std::memory_order_relaxed) == 0 || owner)) {
+                (layer.load(std::memory_order_relaxed) == 0 ||
+                 layer.load(std::memory_order_relaxed) == 3 || owner)) {
                 fill.mode = BlockFillState::Mode::Layers;
                 if (layer.load(std::memory_order_relaxed) != 2) {
                     layer.store(1, std::memory_order_relaxed);
@@ -1034,9 +1036,10 @@ bool TransBuffer::Ready(Index pos) { return GetState(pos) == State::READY; }
 TransBuffer::State TransBuffer::GetState(Index pos, size_t view)
 {
     const auto state = strategy_->MetaAt(pos)->state.load(std::memory_order_acquire);
-    if (wholeBlock_ && view != npos && state == State::LOADING &&
-        strategy_->LayerAt(pos, view)->load(std::memory_order_acquire) == 2) {
-        return State::READY;
+    if (wholeBlock_ && view != npos && state == State::LOADING) {
+        const auto layer = strategy_->LayerAt(pos, view)->load(std::memory_order_acquire);
+        if (layer == 2) { return State::READY; }
+        if (layer == 3) { return State::FAILED; }
     }
     return state;
 }
@@ -1081,6 +1084,20 @@ void TransBuffer::MarkFailed(Index pos, const Status& status)
     meta->errorCode.store(status.Underlying(), std::memory_order_release);
     meta->state.store(State::FAILED, std::memory_order_release);
     if (wholeBlock_) { strategy_->NodeUnlock(pos); }
+}
+
+void TransBuffer::MarkLayerFailed(Index pos, size_t view, const Status& status)
+{
+    if (!wholeBlock_ || view == npos) { MarkFailed(pos, status); return; }
+    strategy_->NodeLock(pos);
+    auto* meta = strategy_->MetaAt(pos);
+    auto& layer = *strategy_->LayerAt(pos, view);
+    if (meta->state.load(std::memory_order_relaxed) == State::LOADING &&
+        layer.load(std::memory_order_relaxed) == 1) {
+        meta->errorCode.store(status.Underlying(), std::memory_order_release);
+        layer.store(3, std::memory_order_release);  // failed, retryable after drained DMA
+    }
+    strategy_->NodeUnlock(pos);
 }
 
 void TransBuffer::MarkNotReady(Index pos)

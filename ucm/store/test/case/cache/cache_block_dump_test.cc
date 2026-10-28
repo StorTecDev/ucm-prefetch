@@ -227,7 +227,8 @@ TEST_F(UCCacheBlockDumpTest, OneReservationMakesProgressWithMoreBlocksThanL1Slot
         }
     }
     for (unsigned char block = 10; block < 18; ++block) {
-        ASSERT_EQ(Send(Describe(Id(block), {0, 1, 2}, true)), Status::OK());
+        auto status = Send(Describe(Id(block), {0, 1, 2}, true));
+        ASSERT_EQ(status, Status::OK()) << "block=" << unsigned(block) << " " << status.ToString();
         Verify(Id(block));
     }
     EXPECT_GT(trace.writes.size(), 8);
@@ -379,3 +380,188 @@ TEST_F(UCCacheBlockDumpTest, FailedRenameRetainsUnpublishedDataForRetry)
     Verify(id);
 }
 }  // namespace
+
+TEST_F(UCCacheBlockDumpTest, FailedLayerKeepsReadyLayersAndOnlyMissingLayerIsRetried)
+{
+    Start();
+    WriteTrace trace;
+    auto id = Id(40);
+    std::array<size_t, 3> copies{};
+    CacheStore::TestHooks::blockDumpCopyHook = [&](const auto& shard) {
+        ++copies[shard.index];
+        return shard.index == 1 && copies[1] == 1 ? Status::Error("controlled D2H failure") : Status::OK();
+    };
+    EXPECT_EQ(Send(Describe(id, {0}, false)), Status::OK());
+    EXPECT_TRUE(Send(Describe(id, {1}, false)).Failure());
+    auto ready = CacheStore::EarlyBufferPins::Acquire(*manager->GetTransBuffer(), id, 0, false);
+    auto failed = CacheStore::EarlyBufferPins::Acquire(*manager->GetTransBuffer(), id, 1, true);
+    EXPECT_TRUE(ready && ready.Ready());
+    if (ready) { EXPECT_FALSE(ready.WholeView().Ready()); }
+    EXPECT_FALSE(failed);  // a new reader must not pin an unfillable failed layer
+    ready = {};
+    EXPECT_EQ(Send(Describe(id, {2}, false)), Status::OK());
+    EXPECT_EQ(Send(Describe(id, {0, 1, 2}, true)), Status::OK());
+    CacheStore::TestHooks::blockDumpCopyHook = {};
+    EXPECT_EQ(copies, (std::array<size_t, 3>{1, 2, 1}));
+    EXPECT_EQ(trace.writes.size(), 1);
+    Verify(id);
+}
+
+TEST_F(UCCacheBlockDumpTest, CopyFailureDoesNotSkipLaterIndependentLayers)
+{
+    Start();
+    WriteTrace trace;
+    std::array<size_t, 3> copies{};
+    CacheStore::TestHooks::blockDumpCopyHook = [&](const auto& shard) {
+        ++copies[shard.index];
+        return shard.index == 1 ? Status::Error("controlled D2H failure") : Status::OK();
+    };
+    auto id = Id(41);
+    EXPECT_TRUE(Send(Describe(id, {0, 1, 2}, true)).Failure());
+    CacheStore::TestHooks::blockDumpCopyHook = {};
+    EXPECT_EQ(copies, (std::array<size_t, 3>{1, 1, 1}));
+    EXPECT_EQ(backend->LookupOnPrefix(&id, 1).Value(), -1);
+    EXPECT_EQ(trace.writes.size(), 2);
+    EXPECT_EQ(Send(Describe(id, {0, 1, 2}, true)), Status::OK());
+    Verify(id);
+}
+
+TEST_F(UCCacheBlockDumpTest, SourceFenceAndAnotherCopyAdvanceBeforeSlowWriteCompletes)
+{
+    Start();
+    WriteTrace trace;
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    std::atomic_bool once{false};
+    trace.beforeCompletion = [&] {
+        if (!once.exchange(true)) { entered.set_value(); releaseFuture.wait(); }
+    };
+    auto first = queue->Submit({TransTask::Type::DUMP, Describe(Id(42), {0, 1, 2}, true)});
+    ASSERT_TRUE(first);
+    EXPECT_EQ(queue->WaitSources(first.Value()), Status::OK());
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_FALSE(queue->Check(first.Value()).Value());
+    EXPECT_FALSE(backend->AcquireWriteLease(Id(42)));
+    auto second = queue->Submit({TransTask::Type::DUMP, Describe(Id(43), {0, 1, 2}, true)});
+    EXPECT_TRUE(second);
+    auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(second.Value()); });
+    auto advanced = fence.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
+    EXPECT_TRUE(advanced);
+    auto original = source;
+    if (advanced) { for (auto& layer : source) { layer.fill('z'); } }
+    release.set_value();
+    EXPECT_EQ(fence.get(), Status::OK());
+    EXPECT_EQ(queue->Wait(first.Value()), Status::OK());
+    EXPECT_EQ(queue->Wait(second.Value()), Status::OK());
+    source = original;
+    Verify(Id(42)); Verify(Id(43));
+    EXPECT_TRUE(backend->AcquireWriteLease(Id(42)));
+}
+
+TEST_F(UCCacheBlockDumpTest, QueuedTimeoutCancelsBeforeAnySourceAccess)
+{
+    Start();
+    queue.reset();
+    cache.timeoutMs = 80;
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    ASSERT_EQ(queue->Setup(cache, manager->GetTransBuffer()), Status::OK());
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    std::atomic<size_t> laterCopies{0};
+    CacheStore::TestHooks::blockDumpCopyHook = [&](const auto& shard) {
+        if (shard.owner == Id(44)) { entered.set_value(); releaseFuture.wait(); }
+        else { ++laterCopies; }
+        return Status::OK();
+    };
+    auto running = queue->Submit({TransTask::Type::DUMP, Describe(Id(44), {0}, false)});
+    ASSERT_TRUE(running);
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto queued = queue->Submit({TransTask::Type::DUMP, Describe(Id(45), {0}, false)});
+    ASSERT_TRUE(queued);
+    auto wait = std::async(std::launch::async, [&] { return queue->Wait(queued.Value()); });
+    EXPECT_EQ(wait.wait_for(std::chrono::milliseconds(400)), std::future_status::ready);
+    release.set_value();
+    EXPECT_EQ(wait.get(), Status::Timeout());
+    EXPECT_EQ(queue->WaitSources(running.Value()), Status::OK());
+    (void)queue->Wait(running.Value());
+    CacheStore::TestHooks::blockDumpCopyHook = {};
+    EXPECT_EQ(laterCopies.load(), 0);
+    auto cancelled = Id(45);
+    EXPECT_EQ(backend->LookupOnPrefix(&cancelled, 1).Value(), -1);
+}
+
+TEST_F(UCCacheBlockDumpTest, SharedBufferFailedLayerCanRetryWithoutResettingReadyLayer)
+{
+    Start(3, 16, false, true);
+    auto& buffer = *manager->GetTransBuffer();
+    auto first = CacheStore::EarlyBufferPins::Acquire(buffer, Id(46), 0, false);
+    ASSERT_TRUE(first && first.Owner());
+    first.MarkReady();
+    auto bad = CacheStore::EarlyBufferPins::Acquire(buffer, Id(46), 1, false);
+    ASSERT_TRUE(bad && bad.Owner());
+    auto follower = bad;
+    bad.MarkLayerFailed(Status::Error("drained simulated failure"));
+    EXPECT_TRUE(first.Ready());
+    EXPECT_EQ(follower.GetState(), CacheStore::TransBuffer::State::FAILED);
+    auto retry = CacheStore::EarlyBufferPins::Acquire(buffer, Id(46), 1, false);
+    ASSERT_TRUE(retry && retry.Owner());
+    retry.MarkReady();
+    EXPECT_TRUE(first.Ready());
+    EXPECT_FALSE(first.WholeView().Ready());
+    auto last = CacheStore::EarlyBufferPins::Acquire(buffer, Id(46), 2, false);
+    ASSERT_TRUE(last && last.Owner());
+    last.MarkReady();
+    EXPECT_TRUE(first.WholeView().Ready());
+}
+
+TEST_F(UCCacheBlockDumpTest, StartedWriteTimeoutRetainsLeaseUntilPhysicalCompletion)
+{
+    Start();
+    queue.reset();
+    cache.timeoutMs = 80;
+    queue = std::make_unique<CacheStore::BlockDumpQueue>();
+    ASSERT_EQ(queue->Setup(cache, manager->GetTransBuffer()), Status::OK());
+    WriteTrace trace;
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    trace.beforeCompletion = [&] { entered.set_value(); releaseFuture.wait(); };
+    auto id = Id(47);
+    auto task = queue->Submit({TransTask::Type::DUMP, Describe(id, {0, 1, 2}, true)});
+    ASSERT_TRUE(task);
+    EXPECT_EQ(queue->WaitSources(task.Value()), Status::OK());
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto wait = std::async(std::launch::async, [&] { return queue->Wait(task.Value()); });
+    EXPECT_EQ(wait.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    EXPECT_FALSE(backend->AcquireWriteLease(id));
+    release.set_value();
+    EXPECT_EQ(wait.get(), Status::Timeout());
+    EXPECT_TRUE(backend->AcquireWriteLease(id));
+    Verify(id);
+}
+
+TEST_F(UCCacheBlockDumpTest, LaterFinalizationCompletesAnInFlightPartialSpill)
+{
+    Start();
+    WriteTrace trace;
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    std::atomic_bool once{false};
+    trace.beforeCompletion = [&] {
+        if (!once.exchange(true)) { entered.set_value(); releaseFuture.wait(); }
+    };
+    auto id = Id(48);
+    auto partial = queue->Submit({TransTask::Type::DUMP, Describe(id, {0}, true)});
+    ASSERT_TRUE(partial);
+    EXPECT_EQ(queue->WaitSources(partial.Value()), Status::OK());
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto repaired = queue->Submit({TransTask::Type::DUMP, Describe(id, {0, 1, 2}, true)});
+    EXPECT_TRUE(repaired);
+    release.set_value();
+    EXPECT_EQ(queue->Wait(partial.Value()), Status::NotFound());
+    EXPECT_EQ(queue->Wait(repaired.Value()), Status::OK());
+    Verify(id);
+}

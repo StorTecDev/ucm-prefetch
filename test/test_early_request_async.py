@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from ucm.integration.vllm import early_connector, ucm_connector
+from ucm.integration.vllm import early_connector, early_scheduling, ucm_connector
 from ucm.integration.vllm.early_connector import (
     EarlyDirectConnector,
     EarlyLayerWiseConnector,
@@ -42,6 +42,7 @@ def constructor_config(monkeypatch):
             data_parallel_index=0,
         ),
         cache_config=SimpleNamespace(block_size=16),
+        scheduler_config=SimpleNamespace(),
         model_config=SimpleNamespace(
             is_deepseek_mla=True,
             dtype=torch.float16,
@@ -87,8 +88,10 @@ def constructor_config(monkeypatch):
     monkeypatch.setattr(UCMFAWAConnector, "_create_store", Mock())
     monkeypatch.setattr(UCMConnector, "_setup_ucm_metrics", lambda *a: None)
     monkeypatch.setattr(early_connector, "EarlyScheduler", Mock())
+    monkeypatch.setattr(early_scheduling, "install_scheduler_policy", Mock())
     monkeypatch.setattr(ucm_connector, "logger", Mock())
     monkeypatch.setenv("VLLM_CPU_AFFINITY", "0")
+    monkeypatch.setenv("ENABLE_UCM_PATCH", "0")
     return config, launch, ucm_connector.logger
 
 

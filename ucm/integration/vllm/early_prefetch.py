@@ -53,6 +53,9 @@ class EarlyScheduler:
         self.sequence = 0
         self.owner_domain_active = False
         launch = getattr(connector, "launch_config", {})
+        from .early_scheduling import ReadyPriority
+
+        self.scheduling = ReadyPriority(launch)
         admission_limits = {}
         for name, default in (
             ("max_waiting_jobs", 256),

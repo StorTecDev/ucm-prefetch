@@ -23,6 +23,8 @@ enable_metrics: true
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`，DeepSeek v4 系列模型推荐设置为 `false`。 |
 | `enable_early_prefetch` | 选填 | bool | 默认 `false` | 启用 Early 预取路径；整块读取和 Early 调度选项要求开启。 |
+| `early_ready_max_candidates` | 选填 | int | 默认 `64`；正整数 | vLLM 0.28.0 每轮等待调度的原生匹配、分配尝试上限。有效命中的 READY 请求可跨原生优先级优先尝试。 |
+| `early_ready_max_bypasses` | 选填 | int | 默认 `8`；正整数 | 被较晚到达的请求成功越过达到此次数后，给予优先尝试；仍放不下时让后续请求推进，不为其预留 HBM。 |
 | `early_owner_max_waiting_jobs` | 选填 | int | 默认 `256`；正整数 | 整个 broker 等待 owner 准入的请求数上限。已进入等待的请求不因资源等待时长而失败。 |
 | `early_owner_max_waiting_candidate_blocks` | 选填 | int | 默认 `65536`；正整数 | 整个 broker 准入等待队列中的候选 ID 总数上限。限制元数据而非 L1 预留；新请求超过队列上限时回退。 |
 | `early_prefetch_request_first` | 选填 | bool | 默认 `false` | 启用 Early 时优先读取最早可提交的请求，并利用空闲读取额度回填；关闭时保留 HRRN 轮转。 |

@@ -471,7 +471,8 @@ C++ Batch 仍遵守所选原生 backend 的 Load/Wait 契约：仅成功返回�
 `references_acquired_by_ns` 是 dispatch 结束的上界，非逐 shard 获取的精确时间。
 取消时 wasted_read_upper_bound 是已完成读取的保守上界；submitted 与 completed
 分开。没有记录不计零；跨进程阶段差值需要同 boot/time namespace 的时钟证据，
-不以两个分位数相减推导阶段耗时。构建、测试和实测结果另见操作文档。
+不以两个分位数相减推导阶段耗时。通用构建和回归入口见
+[Cache and POSIX lifecycle regressions](../ucm/store/test/REGRESSIONS.md)。
 
 详细 reserve/prefetch/load-handle 阶段记录及逐 native task 提交/完成记录使用原生 DEBUG 级别；
 格式化前检查是否启用。INFO 保留 job/batch 关联、额度、READY、消费完成和释放摘要。

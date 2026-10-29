@@ -2,7 +2,7 @@
 
 适用范围是协议 5 已确认共享同一原生 L1、block identity、布局及成员的 MLA owner 域。
 原生 L1 是 CPU buffer，HBM 是各 rank 的设备 KV；不把二者混称。非 owner/private
-路径保留 c50 行为，没有本轮共享域等待保证。
+路径保留既有行为，不提供共享 owner 域的容量等待保证。
 
 ## 状态和所有权
 
@@ -33,7 +33,7 @@
 真实超容量才允许发布有限安全前缀或零命中，不把一次 NoSpace 判成永久 miss。
 
 物理节点可能仍被原生 load/dump、I/O 或消费者占用。已接受的原生任务具有完整
-handles，c50 独立完成线程不依赖该等待者或 H2D FIFO 的缺失分配，因此可完成释放。
+handles，独立完成线程不依赖该等待者或 H2D FIFO 的缺失分配，因此可完成释放。
 资格控制避免 Early 之间形成无安全完成顺序的部分占用。两项条件同时成立才使用
 事件等待。原生正式加载未取得完整 handles 时仍有界拒绝；不修改 kv_load_failure_policy，
 也不保证外部故障或未核验持有者总能恢复。
@@ -43,7 +43,7 @@ handles，c50 独立完成线程不依赖该等待者或 H2D FIFO 的缺失分�
 共享 epoch 在最后引用归零后递增。FUTEX_WAIT 对观察值作原子比较，避免释放先于
 等待；Python release_serial 在同一 condition 内比较并等待，避免转发通知丢失。
 通知只提示重试；TryGet 重新检查身份、状态、并发创建和物理容量。等待不持 bucket
-锁、全局锁或 GIL。完成轮询保留 c50 既有节奏，容量重试不依赖高频轮询。
+锁、全局锁或 GIL。完成轮询保留既有节奏，容量重试不依赖高频轮询。
 
 观察到 epoch 变化只开放一次有限分配机会；实际取得引用前仍处于资源等待，不恢复
 后续查询。若后续批次正在激活而此前批次进入等待，归还该批尚未提交 I/O 的引用，
@@ -68,4 +68,5 @@ ReleaseEpoch/WaitRelease、execution_request/grant、lookup_complete、resource_
 BufferStrategy 使用现有共享映射中的事件指针；不是第二个 allocator/共享协议。
 
 共享 header magic 3、owner VERSION 5 和扩展的 Early::Batch ABI 必须整套重建。
-旧映射不能原地复用。测试/构建命令与证据见 DEFERRED_PIN_WAIT_VALIDATION.md。
+旧映射不能原地复用。通用构建命令、回归入口和测试覆盖边界见
+[Cache and POSIX lifecycle regressions](../ucm/store/test/REGRESSIONS.md)。

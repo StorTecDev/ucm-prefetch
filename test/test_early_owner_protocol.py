@@ -338,14 +338,15 @@ def _transport_worker(endpoint, dp, rank, commands, events):
         control.close()
 
 
-def test_real_zmq_owner_dispatch_four_worker_processes_two_dp(tmp_path):
+def test_real_zmq_owner_dispatch_four_worker_processes_two_dp():
     import multiprocessing as mp
     import queue
     import uuid
     from owner_protocol_source.early_control import Control as RealControl
     ctx = mp.get_context("spawn")
     events = ctx.Queue()
-    endpoint = "ipc://" + str(tmp_path / (uuid.uuid4().hex + ".sock"))
+    # Linux abstract IPC avoids the Unix path limit in deep pytest workspaces.
+    endpoint = "ipc://@ucm-owner-" + uuid.uuid4().hex
     received = [[], []]
     schedulers = [RealControl(endpoint, "s0", received[0].append, dict(tp_size=2, dp_size=2)),
                   RealControl(endpoint, "s1", received[1].append)]

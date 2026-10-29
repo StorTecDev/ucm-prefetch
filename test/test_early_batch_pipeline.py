@@ -22,6 +22,17 @@ def wait(predicate):
         time.sleep(.002)
 
 
+def wait_answer(worker, key):
+    # State is published before the control message while holding this lock.
+    # Observing READY without the lock does not imply its answer was sent.
+    def answered():
+        with worker.condition:
+            return any(m.get("key") == key and m["op"] == "answer"
+                       for m in worker.control.messages)
+
+    wait(answered)
+
+
 class Control:
     def __init__(self, *args, **kwargs):
         self.messages = []
@@ -135,7 +146,7 @@ def test_first_batch_reads_before_next_reserve_finishes(worker):
         assert not worker.control.messages
     finally:
         allow_second.set()
-    wait(lambda: worker.jobs["overlap"].ready)
+    wait_answer(worker, "overlap")
     assert [len(ids) for ids in calls] == [32, 64]
     assert worker.control.messages[-1]["hit"] == 96
     worker.bind(SimpleNamespace(early_keys={"r": "overlap"}, request_meta={
@@ -148,7 +159,7 @@ def test_first_batch_reads_before_next_reserve_finishes(worker):
 def test_all_l1_and_short_prefix_never_use_data_queue(worker):
     worker.store.reserve_prefix.side_effect = [result(1, 32, 0), result(2, 7, 0)]
     worker.receive(dict(op="reserve", key="short", blocks=blocks(512)))
-    wait(lambda: worker.jobs["short"].ready)
+    wait_answer(worker, "short")
     assert worker.control.messages[-1]["hit"] == 39
     assert worker.store.reserve_prefix.call_count == 2
     worker.store.prefetch_reserved.assert_not_called()
@@ -342,7 +353,7 @@ def test_capacity_cutoff_waits_for_submitted_tail_drain_and_never_requeries(work
         assert tail.discarded and not tail.drained.is_set()
         before = tail.reads
         tail_gate.set()
-        wait(lambda: worker.jobs['cut'].ready)
+        wait_answer(worker, "cut")
         assert tail.reads == before
         assert worker.control.messages[-1]['hit'] == retained
         assert worker.store.reserve_prefix.call_count == 2
@@ -362,7 +373,7 @@ def test_capacity_in_later_batch_preserves_completed_earlier_prefix(worker):
     last['batch'] = TruncatingCapability(3, gate)
     worker.store.reserve_prefix.side_effect = [result(1, 32, 0), last]
     worker.receive(dict(op='reserve', key='later', blocks=blocks(100)))
-    wait(lambda: worker.jobs['later'].ready)
+    wait_answer(worker, "later")
     assert worker.control.messages[-1]['hit'] == 35
     worker.store.release_reservation.assert_not_called()
 
@@ -387,7 +398,7 @@ def test_late_reserve_after_capacity_cutoff_releases_without_publishing(worker):
         wait(lambda: worker.jobs['race'].capacity_end == 2)
         assert not worker.jobs['race'].ready
         finish.set()
-        wait(lambda: worker.jobs['race'].ready)
+        wait_answer(worker, "race")
         assert worker.control.messages[-1]['hit'] == 2
         assert len(worker.jobs['race'].batches) == 1
         worker.store.release_reservation.assert_called_once_with(2)
@@ -416,7 +427,7 @@ def test_real_io_error_in_discarded_tail_is_failure_not_successful_capacity(work
         first_gate.set()
         wait(lambda: tail.discarded)
         tail_gate.set()
-        wait(lambda: worker.jobs['fault'].cancelled)
+        wait_answer(worker, "fault")
         assert worker.control.messages[-1]['state'] == 'FAILED'
     finally:
         first_gate.set()

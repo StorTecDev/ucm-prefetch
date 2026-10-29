@@ -52,6 +52,16 @@ class EarlyScheduler:
         self.fatal = None
         self.sequence = 0
         self.owner_domain_active = False
+        launch = getattr(connector, "launch_config", {})
+        admission_limits = {}
+        for name, default in (
+            ("max_waiting_jobs", 256),
+            ("max_waiting_candidate_blocks", 65536),
+        ):
+            value = launch.get("early_owner_" + name, default)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"early_owner_{name} must be a positive integer")
+            admission_limits[name] = value
         self.pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="ucm-early-hash"
         )
@@ -59,7 +69,15 @@ class EarlyScheduler:
         # Dense engines reset communication DP rank to zero. The native index
         # retains the actual engine identity for both dense and MoE models.
         self.dp_rank = parallel.data_parallel_index
-        broker = dict(tp_size=connector.tp_size, dp_size=getattr(parallel, "data_parallel_size", 1)) if self.dp_rank == 0 else None
+        broker = (
+            dict(
+                tp_size=connector.tp_size,
+                dp_size=getattr(parallel, "data_parallel_size", 1),
+                **admission_limits,
+            )
+            if self.dp_rank == 0
+            else None
+        )
         self.control = control_factory(
             f"ipc:///dev/shm/ucm_early_{connector.unique_id}.sock",
             f"s{self.dp_rank}",

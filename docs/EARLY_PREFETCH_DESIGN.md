@@ -295,6 +295,20 @@ metadata 主流程。实际 allocation 前的重试可以刷新原生消费计�
 
 ## 共享域与有界推进
 
+owner 的 job 或候选块额度暂时不足时，请求保持 PENDING，记录
+`wait_reason=owner_capacity`。等待只持有候选 ID，不占 owner 或 L1 额度；
+普通 PENDING 超时扣除这段等待，心跳和共享域故障处理保持有效。
+只有 `owner_drained` 确认实际归还额度后，才按原始到达顺序重新检查等待请求；
+暂时放不下的候选不阻塞后面能准入的请求。READY、单个消费者完成及周期心跳
+都不能提前归还额度。取消移除等待项，不创建新的执行尝试。
+
+`early_owner_max_waiting_jobs`（默认 256）和
+`early_owner_max_waiting_candidate_blocks`（默认 65536）限制整个 broker 的
+等待请求数及候选 ID 总数，均须为正整数。这些限制约束控制面元数据，不预留
+L1。等待队列已满时，新请求明确回退；已进入等待的请求不会因等待时长而失败。
+单个请求超过所有可选 owner 的候选块硬上限时直接回退，不进入无法完成的等待。
+此准入上限与查询后实际命中前缀的 L1 容量截断相互独立。
+
 协议版本 5 保留内核对象/布局/成员握手和单 owner，执行资格以确认批次为单位。
 申请携 key/attempt/batch/begin/count，迟到或重复授权不作用于新 generation。
 共享内存事件使用同一原生映射，header magic 为 3；所有成员须全量重建、重启到

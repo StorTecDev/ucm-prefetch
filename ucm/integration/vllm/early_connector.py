@@ -100,6 +100,9 @@ class _EarlyConnectorMixin:
         connector["ucm_connector_name"] = "EarlyPipelineStore"
         connector["ucm_connector_module_path"] = "ucm.store.pipeline.early_connector"
         if role == KVConnectorRole.SCHEDULER:
+            from .early_scheduling import install_scheduler_policy
+
+            install_scheduler_policy(vllm_config.scheduler_config)
             self.store = self._create_store(None)
         self._early = (
             EarlyScheduler(self) if role == KVConnectorRole.SCHEDULER else None

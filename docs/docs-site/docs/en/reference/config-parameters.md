@@ -23,6 +23,8 @@ These fields belong at the YAML root. Descriptions identify model- or engine-spe
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | Optional | bool | Default: `true` | Enable layer-wise (per-layer) load/save mode. Recommended `true`; DeepSeek V4 series recommends `false`. |
 | `enable_early_prefetch` | Optional | bool | Default: `false` | Enable the Early prefetch path; required for whole-block reads and Early scheduling options. |
+| `early_ready_max_candidates` | Optional | int | Default: `64`; positive | On vLLM 0.28.0, bound native matching/allocation attempts per waiting pass. Positive-hit READY requests receive preference, including across native priorities. |
+| `early_ready_max_bypasses` | Optional | int | Default: `8`; positive | Younger admissions before an older request receives a priority attempt. An unfit request yields; this does not reserve HBM for it. |
 | `early_owner_max_waiting_jobs` | Optional | int | Default: `256`; positive | Broker-wide bound on requests waiting for owner admission. Admitted waiters do not fail because of resource wait duration. |
 | `early_owner_max_waiting_candidate_blocks` | Optional | int | Default: `65536`; positive | Broker-wide bound on candidate IDs in the owner admission queue. This bounds metadata, not L1 reservations; new requests exceeding the queue bound fall back. |
 | `early_prefetch_request_first` | Optional | bool | Default: `false` | With Early enabled, prioritize the oldest eligible request and backfill spare read credit; `false` retains HRRN rounds. |

@@ -12,6 +12,7 @@ import uuid
 import weakref
 
 from .early_control import Control
+from .early_errors import EarlyLookupUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,11 @@ class EarlyScheduler:
             value = launch.get("early_owner_" + name, default)
             if type(value) is not int or value < 1:
                 raise ValueError(f"early_owner_{name} must be a positive integer")
+            admission_limits[name] = value
+        for name, default in (("max_retries", 1), ("retry_backoff_ms", 100)):
+            value = launch.get("early_owner_" + name, default)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"early_owner_{name} must be a nonnegative integer")
             admission_limits[name] = value
         self.pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="ucm-early-hash"
@@ -214,7 +220,13 @@ class EarlyScheduler:
             if job is None or job.state not in ("PENDING", "READY"):
                 return
             if message["op"] == "owner_assigned":
+                if message["grant"] <= job.grant:
+                    return
                 job.owner, job.attempt, job.grant = message["owner"], message["attempt"], message["grant"]
+                return
+            if job.attempt is not None and (
+                message.get("attempt") != job.attempt or message.get("grant") != job.grant
+            ):
                 return
             job.hit = message.get("hit", 0)
             job.capacity_truncated = message.get("capacity_truncated", False)
@@ -617,6 +629,7 @@ class EarlyWorker:
                     self.store.release_reservation(reservation["handle"])
                     raise RuntimeError("invalid reserved prefix length")
                 batch = WorkerBatch(len(job.batches), begin, reservation,
+                                    entered=job.entered,
                                     done=not job.deferred and reservation["remaining_l2_work"] == 0)
                 with self.condition:
                     if self.owner_protocol.fatal:
@@ -659,7 +672,9 @@ class EarlyWorker:
                      job.key, c.tp_rank, time.monotonic_ns(), len(job.batches),
                      (time.monotonic() - started) * 1000)
         except Exception as error:
-            self._answer(job, str(error))
+            retryable = (isinstance(error, EarlyLookupUnavailable) and job.owner
+                         and job.deferred and not job.batches)
+            self._answer(job, str(error), error_code=error.code if retryable else None)
         finally:
             with self.condition:
                 job.lookup_finished = not paused or job.cancelled or self.closed or job.capacity_end is not None
@@ -912,12 +927,12 @@ class EarlyWorker:
                     if self.release_serial == observed_release:
                         self.condition.wait(timeout=2 if only_resource_wait else .001)
 
-    def _answer(self, job, error=None):
+    def _answer(self, job, error=None, *, error_code=None):
         with self.condition:
             if self.owner_protocol.fatal:
                 return
             if job.owner:
-                self.owner_protocol.answer(job, error)
+                self.owner_protocol.answer(job, error, error_code=error_code)
                 return
             if job.cancelled or job.ready:
                 return

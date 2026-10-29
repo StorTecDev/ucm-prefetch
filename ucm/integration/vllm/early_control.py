@@ -36,16 +36,22 @@ class BrokerState:
         for worker in self.workers(job["dp"]):
             self.send(worker, {"op": "release", "key": job["key"], "reason": reason})
 
+    def send_result(self, job, state, **fields):
+        generation = {}
+        if job.get("attempt") is not None:
+            generation = {name: job.get(name) for name in ("owner", "attempt", "grant")}
+        self.send(
+            job["client"],
+            dict(op="result", key=job["key"], state=state, **generation, **fields),
+        )
+
     def fail(self, job, reason):
         if job["status"] in ("FAILED", "CANCELLED"):
             return
         job["status"] = "FAILED"
         self.release(job, "failed")
         log.warning("UCM_EARLY failed key=%s reason=%s", job["key"], reason)
-        self.send(
-            job["client"],
-            {"op": "result", "key": job["key"], "state": "FAILED", "reason": reason},
-        )
+        self.send_result(job, "FAILED", reason=reason)
 
     def dispatch(self, job):
         if job["status"] != "PENDING" or job.get("running"):
@@ -196,8 +202,8 @@ class Control:
             connect_timeout = float(os.getenv("VLLM_ENGINE_READY_TIMEOUT_S", "3600"))
             while not self.stopping.is_set():
                 events = dict(
-                    poller.poll(1000)
-                )  # control heartbeat; no storage polling
+                    poller.poll(broker.poll_timeout_ms() if router is not None else 1000)
+                )  # control deadlines only; no storage polling
                 if self.reader.fileno() in events:
                     self.reader.recv(65536)
                     while not self.outbound.empty():
@@ -211,6 +217,8 @@ class Control:
                     if message["op"] != "pong":
                         self.callback(message)
                 now = time.monotonic()
+                if router is not None:
+                    broker.advance_retries(now)
                 if now - heartbeat >= 2:
                     dealer.send(encode({"op": "ping", "session": self.hello["session"]}))
                     heartbeat = now

@@ -2,9 +2,11 @@
 
 import numpy as np
 
+from ucm.integration.vllm.early_errors import EarlyLookupUnavailable
 from ucm.integration.vllm.early_lookup import current_lookup
 
 from .connector import UcmPipelineStore, UcmPipelineStoreBuilder, ucmpipelinestore
+from .errors import StoreUnhealthyError
 
 _EARLY_PIPELINE = "Early(Cache|Posix)"
 
@@ -185,9 +187,14 @@ class EarlyPipelineStore(UcmPipelineStore):
         return super().lookup_on_prefix(block_ids)
 
     def reserve_prefix(self, block_ids: list[bytes], *, deferred=False) -> dict:
-        return ucmpipelinestore.EarlyReservePrefix(
-            self._native_store, np.frombuffer(b"".join(block_ids), dtype=np.uint8), deferred
-        )
+        try:
+            return ucmpipelinestore.EarlyReservePrefix(
+                self._native_store, np.frombuffer(b"".join(block_ids), dtype=np.uint8), deferred
+            )
+        except StoreUnhealthyError as error:
+            if deferred:
+                raise EarlyLookupUnavailable(str(error)) from error
+            raise
 
     def release_epoch(self):
         return ucmpipelinestore.EarlyReleaseEpoch(self._native_store)

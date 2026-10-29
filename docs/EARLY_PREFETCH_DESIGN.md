@@ -291,7 +291,8 @@ owner reserve 完成且所有已发布批次 READY 后，broker 发布受保护�
 Scheduler 复用已保存 IDs/hit，执行同一原生 HBM 扣除、缺失过滤、token 计算和
 metadata 主流程。实际 allocation 前的重试可以刷新原生消费计划；首次 dispatch
 后冻结该 generation 的预期 external blocks。失败恢复原生 lookup/load，而不
-使用旧 READY 地址。没有运行中迁移或自动换 owner；需要重新处理时由原生重算。
+使用旧 READY 地址。没有运行中迁移；只有下述可证明安全的首次查询错误，才允许
+在旧 generation 排空后分配新的 attempt/owner。其余错误保留原生回退或共享域隔离。
 
 ## 共享域与有界推进
 
@@ -309,7 +310,7 @@ L1。等待队列已满时，新请求明确回退；已进入等待的请求不
 单个请求超过所有可选 owner 的候选块硬上限时直接回退，不进入无法完成的等待。
 此准入上限与查询后实际命中前缀的 L1 容量截断相互独立。
 
-协议版本 5 保留内核对象/布局/成员握手和单 owner，执行资格以确认批次为单位。
+当前控制协议版本为 11，保留内核对象/布局/成员握手和单 owner，执行资格以确认批次为单位。
 申请携 key/attempt/batch/begin/count，迟到或重复授权不作用于新 generation。
 共享内存事件使用同一原生映射，header magic 为 3；所有成员须全量重建、重启到
 同版库，不能挂接旧布局或混用协议版本。不增加另一套共享 identity 或节点索引。

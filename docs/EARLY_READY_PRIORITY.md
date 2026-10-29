@@ -60,3 +60,41 @@ TTFT improvement.
 Owner admission waiting is described in `EARLY_PREFETCH_DESIGN.md`; it is separate
 from HBM admission. READY or scheduling success does not return owner or L1 credits
 before the existing consumer and owner-drain protocol completes.
+
+## Safe execution retry
+
+Only the owner/deferred path can retry `lookup_unavailable`: a typed native
+`StoreUnhealthyError` from its first metadata reservation, before any batch has
+been published. The query submits no data I/O; temporary native lookup references
+are scoped. String-matched errors, later queries, activation, accepted I/O,
+unknown failures and shared-domain faults are not eligible.
+
+After that error the scheduler stays PENDING. Every old consumer must quiesce and
+the old owner must report drained before another attempt is admitted. New attempts
+retain the logical key, candidate hashes and original age, but get a fresh attempt
+and monotonically increasing grant. Stale results cannot authorize HBM use or
+change the new attempt. Cancel/finish prevents reexecution at every waiting stage.
+Failure to establish drain within the independent execution timeout fences the
+domain and does not return uncertain credits.
+
+`early_owner_max_retries` defaults to 1; 0 disables new execution attempts.
+`early_owner_retry_backoff_ms` defaults to 100. Both are nonnegative integers at the
+YAML root. Backoff starts at the classified error; dispatch additionally requires
+drain and owner capacity. The budget increments only when a new execution is
+actually dispatched. Resource checks, owner/L1 waiting and resuming the original
+batch never consume it or become FAILED merely because they wait a long time.
+Retry waiting shares the bounded owner admission queue; queue overflow falls back.
+Budget exhaustion falls back only after the failed generation drains.
+
+The default permits one cheap recovery attempt and bounds repeated failure work.
+It does not wait out the backend's independent health-breaker cooldown (which may
+be much longer than 100 ms), so a prolonged outage can exhaust it. Configure
+backoff for the deployment; normal capacity contention must not be classified as
+this execution error. Release events continue against the live L1 mapping during
+backend health failures, without submitting I/O or bypassing domain fencing.
+
+`test/test_early_retry.py` covers retry/drain/backoff ordering, budgets, resource
+waiting, cancellation, stale generations and real worker classification.
+`test/test_early_batch_binding.py` injects a real backend health failure, checks
+typed rejection and release events, restores health, and validates native batch
+lifetime and simulated transfers. These checks do not certify accelerator timing.

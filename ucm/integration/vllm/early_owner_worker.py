@@ -67,6 +67,7 @@ class OwnerWorker:
                 if key in self.worker.jobs:
                     return True
                 job = WorkerJob(key, message.get("blocks", []), owner=message["owner"],
+                                entered=message.get("entered", time.monotonic()),
                                 attempt=message["attempt"], grant=message["grant"],
                                 request_id=message.get("request"), deferred=message.get("deferred", False))
                 self.worker.jobs[key] = job
@@ -159,7 +160,7 @@ class OwnerWorker:
         with self.consumer.lock:
             self.consumer.requests.update(retired)
 
-    def answer(self, job, error):
+    def answer(self, job, error, *, error_code=None):
         if job.cancelled or job.ready:
             return
         if error is not None:
@@ -169,6 +170,7 @@ class OwnerWorker:
         hit = self.worker._hit(job)
         self.send(dict(op="owner_answer", key=job.key, attempt=job.attempt,
                        state="FAILED" if error else "READY", reason=error,
+                       error_code=error_code,
                        hit=hit, capacity_truncated=job.capacity_end is not None and job.truncate_reason != "revalidation_miss"))
         fast = error is None and hit > 0 and not any(b.started for b in job.batches)
         outcome = "failed" if error else (job.truncate_reason or "capacity_truncated") if job.capacity_end is not None else "zero_hit" if not hit else "l1_ready" if fast else "prefetched"

@@ -28,11 +28,13 @@ struct BoundBatch {
 // Narrow access to the native argument conversion; it stays private and is
 // shared with the native Load entry instead of duplicating buffer parsing.
 struct LoadBinding {
-    template <class Pipeline>
-    static UC::Early::DomainProvider& Provider(Pipeline& pipeline)
+    template <class UnhealthyError = std::runtime_error, class Pipeline>
+    static UC::Early::DomainProvider& Provider(Pipeline& pipeline, bool requireHealthy = true)
     {
-        for (const auto& health : pipeline.healthBreakerStores_) {
-            if (!health->Enabled()) { throw std::runtime_error("Early store unhealthy"); }
+        if (requireHealthy) {
+            for (const auto& health : pipeline.healthBreakerStores_) {
+                if (!health->Enabled()) { throw UnhealthyError("Early store unhealthy"); }
+            }
         }
         for (const auto& store : pipeline.stores_) {
             if (auto* provider = dynamic_cast<UC::Early::DomainProvider*>(store.get())) { return *provider; }
@@ -94,10 +96,12 @@ void BindOperations(pybind11::module_& module)
         return out;
     });
     module.def("EarlyReleaseEpoch", [](Pipeline& pipeline) {
-        return LoadBinding::Provider(pipeline).ReleaseEpoch();
+        // Backend health cannot invalidate the live L1 mapping or its release
+        // notifications. These entry points submit no storage I/O.
+        return LoadBinding::Provider(pipeline, false).ReleaseEpoch();
     });
     module.def("EarlyWaitRelease", [](Pipeline& pipeline, uint32_t epoch, unsigned milliseconds) {
-        auto& provider = LoadBinding::Provider(pipeline);
+        auto& provider = LoadBinding::Provider(pipeline, false);
         py::gil_scoped_release release;
         return provider.WaitRelease(epoch, std::min(milliseconds, 1000u));
     });
@@ -218,7 +222,7 @@ void BindOperations(pybind11::module_& module)
         {
             py::gil_scoped_release release;
             result = ValueOrThrow<NotFoundError, UnhealthyError>(
-                deferred ? LoadBinding::Provider(pipeline).ReserveDeferred(blocks, count)
+                deferred ? LoadBinding::Provider<UnhealthyError>(pipeline).ReserveDeferred(blocks, count)
                          : store->ReservePrefix(blocks, count));
             if (deferred && result.batch) {
                 result.batch->SetHealthGuard([&pipeline] {

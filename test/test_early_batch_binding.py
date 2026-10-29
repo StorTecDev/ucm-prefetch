@@ -1,6 +1,6 @@
 """Real CPython/C++ batch lifetime and Posix reads, with simulated H2D.
 
-Run only against a simu build via python_with_build.py. No NPU is initialized.
+Run against the native simulation build. No accelerator is initialized.
 PSync seeds complete before lookup; this does not certify native AIO commit
 ordering or measure SSD performance.
 """
@@ -18,6 +18,68 @@ import pytest
 from ucm.store.pipeline import ucmpipelinestore as native
 from ucm.store.pipeline.early_connector import _ReservedLoad
 from ucm.integration.vllm.early_consumer import Consumer, load_scope
+
+
+def test_deferred_health_rejection_is_typed_and_release_events_survive(tmp_path):
+    from ucm.integration.vllm.early_errors import EarlyLookupUnavailable
+    from ucm.store.pipeline.early_connector import EarlyPipelineStore
+
+    store_dir = Path(native.__file__).resolve().parent.parent
+    backend, offline = tmp_path / "backend", tmp_path / "offline"
+    backend.mkdir()
+    config = dict(storage_backends=[str(backend)], device_id=0,
+                  tensor_size=4096, shard_size=4096, block_size=4096,
+                  data_dir_shard_bytes=1, posix_data_trans_concurrency=1,
+                  posix_lookup_concurrency=1, posix_io_engine="psync", io_direct=False,
+                  store_health=dict(health_check_interval_s=.05, health_check_timeout_s=.02,
+                                    health_window_size=1, failure_threshold=1,
+                                    initial_cooldown_s=0, max_cooldown_s=0))
+    pipeline = native.PipelineStore()
+    pipeline.Stack("EarlyPosix", str(store_dir / "posix/libposixstore.so"), config)
+    pipeline.Stack("EarlyCache", str(store_dir / "cache/libcachestore.so"),
+                   dict(config, unique_id=uuid.uuid4().hex,
+                        cache_buffer_capacity_gb=1, share_buffer_enable=False,
+                        cache_load_exclusive_buffer_number=128,
+                        waiting_queue_depth=8, running_queue_depth=16,
+                        cache_stream_number=1, store_health={"enabled": False}))
+    connector = EarlyPipelineStore.__new__(EarlyPipelineStore)
+    connector._native_store = pipeline
+    ids = [uuid.uuid4().bytes]
+
+    def wait_for_breaker():
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if native.EarlyDomainInfo(pipeline)["nodes"] == 0:
+                return
+            time.sleep(.01)
+        pytest.fail("native health breaker did not open")
+
+    assert native.EarlyDomainInfo(pipeline)["nodes"] > 0
+    backend.rename(offline)
+    try:
+        wait_for_breaker()
+        with pytest.raises(EarlyLookupUnavailable) as caught:
+            connector.reserve_prefix(ids, deferred=True)
+        assert isinstance(caught.value.__cause__, native.StoreUnhealthyError)
+        for _ in range(5):
+            epoch = native.EarlyReleaseEpoch(pipeline)
+            native.EarlyWaitRelease(pipeline, epoch, 1)
+            with pytest.raises(EarlyLookupUnavailable):
+                connector.reserve_prefix(ids, deferred=True)
+        # No batch was accepted during the rejected queries. Release waiting
+        # still uses the same live L1 mapping while the backend is unavailable.
+    finally:
+        offline.rename(backend)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            reservation = connector.reserve_prefix(ids, deferred=True)
+            break
+        except EarlyLookupUnavailable:
+            assert time.monotonic() < deadline, "native health did not recover"
+            time.sleep(.01)
+    assert reservation["batch"].snapshot()["l2_read_bytes"] == 0
+    native.EarlyReleaseReservation(pipeline, reservation["handle"])
 
 
 @pytest.mark.parametrize("deferred", [False, True])

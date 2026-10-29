@@ -27,6 +27,8 @@ enable_metrics: true
 | `early_ready_max_bypasses` | 选填 | int | 默认 `8`；正整数 | 被较晚到达的请求成功越过达到此次数后，给予优先尝试；仍放不下时让后续请求推进，不为其预留 HBM。 |
 | `early_owner_max_waiting_jobs` | 选填 | int | 默认 `256`；正整数 | 整个 broker 等待 owner 准入的请求数上限。已进入等待的请求不因资源等待时长而失败。 |
 | `early_owner_max_waiting_candidate_blocks` | 选填 | int | 默认 `65536`；正整数 | 整个 broker 准入等待队列中的候选 ID 总数上限。限制元数据而非 L1 预留；新请求超过队列上限时回退。 |
+| `early_owner_max_retries` | 选填 | int | 默认 `1`；非负整数 | 首次 deferred 查询在发布批次前被原生健康检查明确拒绝，且旧 generation 已排空时，允许的新执行次数。`0` 禁用重试；资源等待和原批次恢复不计数。 |
+| `early_owner_retry_backoff_ms` | 选填 | int | 默认 `100`；非负整数 | 可恢复执行错误后的最小等待时间；仍须满足旧任务排空和 owner 准入条件。独立的后端健康冷却时间可能更长。 |
 | `early_prefetch_request_first` | 选填 | bool | 默认 `false` | 启用 Early 时优先读取最早可提交的请求，并利用空闲读取额度回填；关闭时保留 HRRN 轮转。 |
 | `early_prefetch_min_submit_reads` | 选填 | int | 默认 `1`；1–64 | 补充提交所需的最小空闲读取单元数，自动限制在 owner 窗口内。`1` 不合批；I/O 窗口为空时立即补充。 |
 | `early_prefetch_submit_max_wait_ms` | 选填 | number | 默认 `2`；(0, 10] | 合批等待的毫秒上限，到期后在下一次执行器调度提交可用读取；不提供实时保证。 |

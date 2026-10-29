@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import time
@@ -15,9 +16,10 @@ import uuid
 
 from .early_control import BrokerState
 from .early_capacity import ExecutionWindow
+from .early_errors import EarlyLookupUnavailable
 
 log = logging.getLogger(__name__)
-VERSION = 10
+VERSION = 11
 
 
 def worker_capability(connector):
@@ -104,6 +106,8 @@ class OwnerBroker(BrokerState):
         dp_size=1,
         max_waiting_jobs=256,
         max_waiting_candidate_blocks=65536,
+        max_retries=1,
+        retry_backoff_ms=100,
     ):
         super().__init__(send, tp_size, timeout)
         for name, value in (
@@ -114,6 +118,14 @@ class OwnerBroker(BrokerState):
                 raise ValueError(f"early_owner_{name} must be a positive integer")
         self.max_waiting_jobs = max_waiting_jobs
         self.max_waiting_candidate_blocks = max_waiting_candidate_blocks
+        for name, value in (
+            ("max_retries", max_retries),
+            ("retry_backoff_ms", retry_backoff_ms),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"early_owner_{name} must be a nonnegative integer")
+        self.max_retries = max_retries
+        self.retry_backoff_ms = retry_backoff_ms
         self.admission_waiting = {}
         self.waiting_candidates = 0
         self.dp_size = dp_size
@@ -192,8 +204,9 @@ class OwnerBroker(BrokerState):
             self.capacity_wait(job, "admission", False)
             job.pop("wait_reason", None)
 
-    def _wait_for_owner(self, job):
+    def _wait_for_owner(self, job, reason="owner_capacity"):
         if job["key"] in self.admission_waiting:
+            job["wait_reason"] = reason
             return
         work = len(job["blocks"])
         if (
@@ -204,7 +217,7 @@ class OwnerBroker(BrokerState):
             return
         self.admission_waiting[job["key"]] = job
         self.waiting_candidates += work
-        job["wait_reason"] = "owner_capacity"
+        job["wait_reason"] = reason
         self.capacity_wait(job, "admission", True)
         log.info(
             "UCM_EARLY admission_wait key=%s dp=%s candidates=%s queued=%s",
@@ -223,8 +236,53 @@ class OwnerBroker(BrokerState):
         for job in waiting:
             self.dispatch(job, reconsider=True)
 
+    def poll_timeout_ms(self):
+        if self.fenced:
+            return 1000
+        deadlines = [
+            job["retry_ready_at"]
+            for job in self.admission_waiting.values()
+            if job.get("wait_reason") == "retry_backoff"
+        ]
+        if not deadlines:
+            return 1000
+        return max(0, min(1000, math.ceil((min(deadlines) - time.monotonic()) * 1000)))
+
+    def advance_retries(self, now):
+        if self.fenced:
+            return
+        for job in sorted(self.admission_waiting.values(), key=lambda job: job["created"]):
+            if job.get("wait_reason") == "retry_backoff" and job["retry_ready_at"] <= now:
+                self.dispatch(job, reconsider=True)
+
+    def _retry_after_drain(self, job):
+        now = time.monotonic()
+        job.update(
+            status="PENDING", owner=None, domain=None, running=False,
+            retiring=False, attempt_started=now, capacity_waits=set(),
+            capacity_wait_since=None, capacity_wait_credit=0,
+        )
+        for name in (
+            "execution_end", "storage_hit", "oversized", "hit",
+            "capacity_truncated", "retire_started",
+        ):
+            job.pop(name, None)
+        self._wait_for_owner(job, "retry_backoff")
+
+    def _lookup_failed(self, job, reason):
+        job["retry_pending"] = job.get("retry_count", 0) < self.max_retries
+        job["fallback_after_drain"] = not job["retry_pending"]
+        job["failure_reason"] = reason
+        job["retry_ready_at"] = time.monotonic() + self.retry_backoff_ms / 1000
+        self.retire(job, "lookup unavailable")
+        log.info(
+            "UCM_EARLY retry_drain key=%s attempt=%s retries=%s retry_pending=%s",
+            job["key"], job["attempt"], job.get("retry_count", 0), job["retry_pending"],
+        )
+
     def fail(self, job, reason):
         self._leave_admission_wait(job)
+        job["retry_pending"] = job["fallback_after_drain"] = False
         super().fail(job, reason)
 
     def dispatch(self, job, *, reconsider=False):
@@ -232,11 +290,13 @@ class OwnerBroker(BrokerState):
             return
         if job["key"] in self.admission_waiting and not reconsider:
             return
+        if job.get("retry_pending") and time.monotonic() < job["retry_ready_at"]:
+            return
         if not self.workers(job["dp"]).issubset(self.peers):
             return
         domain, reason = self.compatible(job["dp"])
         if domain is None:
-            if self.fenced:
+            if self.fenced or job.get("attempt"):
                 self.fail(job, reason)
                 return
             log.info("UCM_EARLY owner_disabled key=%s dp=%s reason=%s", job["key"], job["dp"], reason)
@@ -263,6 +323,8 @@ class OwnerBroker(BrokerState):
                 self.fail(job, "owner_request_limit; native fallback")
             return
         self._leave_admission_wait(job)
+        if job.pop("retry_pending", False):
+            job["retry_count"] = job.get("retry_count", 0) + 1
         load = domain["owners"].setdefault(owner, dict(jobs=0, candidates=0, assignments=0))
         load["jobs"] += 1
         load["candidates"] += work
@@ -270,13 +332,15 @@ class OwnerBroker(BrokerState):
         self.next_grant += 1
         job.update(owner=owner, attempt=uuid.uuid4().hex, grant=self.next_grant, running=True, domain=domain,
                    consumers=set(), terminal=set(), assigned_ns=time.monotonic_ns())
+        job.update(attempt_started=time.monotonic(), capacity_waits=set(),
+                   capacity_wait_since=None, capacity_wait_credit=0)
         job["execution_pending"] = {}
         job["execution_grants"] = {}
         domain["execution"].add(job["key"], job["blocks"])
         envelope = dict(key=job["key"], attempt=job["attempt"], grant=job["grant"], owner=owner, dp=job["dp"],
                         request=job.get("request"), candidate_blocks=work,
                         submitted_ns=job.get("submitted_ns"), io_quota=domain["io_quota"],
-                        deferred=True)
+                        deferred=True, entered=job["created"])
         for peer in self.workers(job["dp"]):
             self.send(peer, dict(envelope, op="owner_reserve", blocks=job["blocks"]) if peer == owner
                       else dict(envelope, op="observe"))
@@ -306,7 +370,8 @@ class OwnerBroker(BrokerState):
         # Resource waiting is not a lookup/I/O timeout. Heartbeats, native I/O
         # deadlines and domain fencing remain live while this clock is paused.
         paused = now - job["capacity_wait_since"] if job.get("capacity_wait_since") is not None else 0
-        return now - job["created"] - job.get("capacity_wait_credit", 0) - paused > self.timeout
+        started = job.get("attempt_started", job["created"])
+        return now - started - job.get("capacity_wait_credit", 0) - paused > self.timeout
 
     def advance_execution(self, domain):
         window = domain["execution"]
@@ -400,6 +465,7 @@ class OwnerBroker(BrokerState):
         if job.get("retiring"):
             return
         job["retiring"] = True
+        job["retire_started"] = time.monotonic()
         job["status"] = "CANCELLED"
         for peer in self.workers(job["dp"]):
             self.send(peer, dict(op="retire", key=job["key"], attempt=job["attempt"], reason=reason))
@@ -441,6 +507,7 @@ class OwnerBroker(BrokerState):
                 if peer != job["client"]:
                     return
                 if op in ("finish", "cancel"):
+                    job["retry_pending"] = job["fallback_after_drain"] = False
                     self.retire(job, op)
                 return  # metadata carries the generation; submission is no acknowledgement
             if peer not in self.workers(job["dp"]) or message.get("attempt") != job["attempt"]:
@@ -458,8 +525,14 @@ class OwnerBroker(BrokerState):
                 valid = (type(hit) is int and 0 <= hit <= len(job["blocks"])
                          and type(message.get("capacity_truncated")) is bool)
                 if message["state"] != "READY" or not valid:
-                    self.send(job["client"], dict(op="result", key=job["key"], state="FAILED", reason=message.get("reason")))
-                    self.retire(job, "owner failure")
+                    if (message["state"] == "FAILED"
+                            and message.get("error_code") == EarlyLookupUnavailable.code
+                            and not job["execution_grants"] and not job["execution_pending"]
+                            and "storage_hit" not in job):
+                        self._lookup_failed(job, message.get("reason"))
+                    else:
+                        self.send_result(job, "FAILED", reason=message.get("reason"))
+                        self.retire(job, "owner failure")
                 else:
                     job["domain"]["execution"].complete(job["key"])
                     job["status"], job["hit"] = "READY", hit
@@ -477,7 +550,8 @@ class OwnerBroker(BrokerState):
             elif op == "consumer_failed":
                 self.poison("consumer failure did not prove native queue drain")
             elif op == "worker_retire":
-                self.send(job["client"], dict(op="result", key=job["key"], state="FAILED", reason=message.get("reason", "worker shutdown")))
+                job["retry_pending"] = job["fallback_after_drain"] = False
+                self.send_result(job, "FAILED", reason=message.get("reason", "worker shutdown"))
                 self.retire(job, message.get("reason", "worker shutdown"))
             elif op == "quiesced" and job.get("retiring"):
                 job["terminal"].add(peer)
@@ -498,7 +572,12 @@ class OwnerBroker(BrokerState):
                          message.get("read_bytes"), message.get("submitted_read_bytes"),
                          message.get("wasted_read_upper_bound_bytes"), time.monotonic_ns())
                 domain["execution"].release(job["key"])
-                self.jobs.pop(job["key"])
+                if job.get("retry_pending"):
+                    self._retry_after_drain(job)
+                else:
+                    if job.get("fallback_after_drain"):
+                        self.send_result(job, "FAILED", reason=job.get("failure_reason"))
+                    self.jobs.pop(job["key"])
                 self.advance_execution(domain)
                 self._wake_admission()
             return
@@ -516,10 +595,14 @@ class OwnerBroker(BrokerState):
             self.poison("participant heartbeat lost; death/refcount state unknown")
             return
         for job in list(self.jobs.values()):
+            if job.get("retiring") and now - job["retire_started"] > self.timeout:
+                self.poison("owner drain timeout; native reference state unknown")
+                return
             if job.get("owner") and job["status"] == "PENDING" and self.pending_expired(job, now):
-                self.send(job["client"], dict(op="result", key=job["key"], state="FAILED", reason="owner timeout"))
+                self.send_result(job, "FAILED", reason="owner timeout")
                 self.retire(job, "owner timeout")
         # Owner timeouts above are already retiring; a domain peer loss exits
         # through poison. Reuse all native broker loss/timeout behavior for
         # legacy jobs, including invalidating READY after a required peer loss.
         super().expire(now)
+        self.advance_retries(now)

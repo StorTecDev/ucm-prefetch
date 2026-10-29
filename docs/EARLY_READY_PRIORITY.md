@@ -21,8 +21,10 @@ particular TTFT.
 - A priority attempt that still cannot fit yields to other candidates. The policy
   does not deliberately stop READY admission to reserve space for a large request;
   under continuous load, eventual admission of such a request is not guaranteed.
-- Rejected candidates rotate across passes even when nothing is admitted, so a
-  bounded scan cannot permanently revisit only the same blocked requests.
+- Rejected candidates rotate within each readiness class across passes even when
+  nothing is admitted. Cross-class rotation is not implemented: if unfit READY
+  candidates exhaust every bounded scan, a smaller fallback candidate outside
+  that class can remain unvisited. This boundary is deferred from the current scope.
 
 Both settings are positive integers at the YAML root. Original request arrival
 times remain unchanged. The counters use request objects rather than reusable

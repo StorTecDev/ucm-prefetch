@@ -23,6 +23,8 @@ These fields belong at the YAML root. Descriptions identify model- or engine-spe
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | Optional | bool | Default: `true` | Enable layer-wise (per-layer) load/save mode. Recommended `true`; DeepSeek V4 series recommends `false`. |
 | `enable_early_prefetch` | Optional | bool | Default: `false` | Enable the Early prefetch path; required for whole-block reads and Early scheduling options. |
+| `early_owner_max_waiting_jobs` | Optional | int | Default: `256`; positive | Broker-wide bound on requests waiting for owner admission. Admitted waiters do not fail because of resource wait duration. |
+| `early_owner_max_waiting_candidate_blocks` | Optional | int | Default: `65536`; positive | Broker-wide bound on candidate IDs in the owner admission queue. This bounds metadata, not L1 reservations; new requests exceeding the queue bound fall back. |
 | `early_prefetch_request_first` | Optional | bool | Default: `false` | With Early enabled, prioritize the oldest eligible request and backfill spare read credit; `false` retains HRRN rounds. |
 | `early_prefetch_min_submit_reads` | Optional | int | Default: `1`; 1–64 | Minimum free read units before a refill; clamped to the owner window. `1` disables coalescing; an empty I/O window refills immediately. |
 | `early_prefetch_submit_max_wait_ms` | Optional | number | Default: `2`; (0, 10] | Maximum coalescing wait in milliseconds before the next executor turn submits available reads; not a real-time bound. |

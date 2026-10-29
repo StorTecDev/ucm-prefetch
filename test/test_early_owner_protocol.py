@@ -26,9 +26,15 @@ def capability(dp=0, rank=0, domain="native-object"):
 
 
 class Cluster:
-    def __init__(self, dp=1, tp=2, capacity=True):
+
+    def __init__(self, dp=1, tp=2, capacity=True, **broker_options):
         self.out = []
-        self.b = owner.OwnerBroker(lambda peer, msg: self.out.append((peer, msg)), tp, dp_size=dp)
+        self.b = owner.OwnerBroker(
+            lambda peer, msg: self.out.append((peer, msg)),
+            tp,
+            dp_size=dp,
+            **broker_options,
+        )
         self.sequence = [0] * dp
         for d in range(dp):
             self.b.receive(f"s{d}", dict(op="hello", session="scheduler"))
@@ -102,14 +108,144 @@ def test_owner_work_slot_returns_after_all_consumers_and_io_drain_only():
     c.drain(b)
 
 
-def test_owner_job_and_candidate_limits_choose_another_owner_or_fallback():
+def test_owner_temporary_limits_wait_but_intrinsic_oversize_falls_back():
     c = Cluster()
     for cap in c.b.capabilities.values():
         cap.update(max_jobs=1, max_candidates=4)
     assert c.job("a")["owner"] == "w0.0"
     assert c.job("b")["owner"] == "w0.1"
-    assert c.job("c")["status"] == "FAILED"
+    waiting = c.job("c")
+    assert waiting["status"] == "PENDING"
+    assert waiting["wait_reason"] == "owner_capacity"
+    assert not waiting.get("running")
     assert c.job("too-large", count=5)["status"] == "FAILED"
+    assert set(c.b.admission_waiting) == {"c"}
+
+
+def test_admission_wakes_only_after_all_consumers_and_owner_drain():
+    c = Cluster(tp=2)
+    for cap in c.b.capabilities.values():
+        cap.update(max_jobs=1, max_candidates=4)
+    first, second = c.job("first"), c.job("second")
+    waiting = c.job("waiting")
+    created = waiting["created"]
+    c.ready(first)
+    c.ready(second)
+    for _ in range(5):
+        c.b.wake()
+    assert not waiting.get("owner")
+    assert c.b.waiting_candidates == 4
+    c.b.receive(first["client"], dict(op="finish", key=first["key"]))
+    c.message(first, "quiesced", "w0.0")
+    c.message(first, "owner_drained")
+    assert not waiting.get("owner")
+    c.message(first, "quiesced", "w0.1")
+    assert not waiting.get("owner")
+    c.message(first, "owner_drained")
+    assert waiting["owner"] == first["owner"]
+    assert waiting["status"] == "PENDING" and waiting["running"]
+    assert waiting["created"] == created
+    assert "wait_reason" not in waiting
+    assert not c.b.admission_waiting and c.b.waiting_candidates == 0
+    assignments = [
+        m
+        for _, m in c.out
+        if m["op"] == "owner_assigned" and m["key"] == waiting["key"]
+    ]
+    assert len(assignments) == 1
+    c.message(first, "owner_drained")
+    assert waiting["domain"]["owners"][waiting["owner"]]["jobs"] == 1
+
+
+@pytest.mark.parametrize("limit", ["jobs", "candidates"])
+def test_admission_queue_bounds_metadata_and_cancel_returns_queue_capacity(limit):
+    c = Cluster(
+        tp=1,
+        max_waiting_jobs=1 if limit == "jobs" else 4,
+        max_waiting_candidate_blocks=2 if limit == "candidates" else 16,
+    )
+    c.b.capabilities["w0.0"].update(max_jobs=1, max_candidates=4)
+    active = c.job("active", count=2)
+    queued = c.job("queued", count=2)
+    rejected = c.job("rejected", count=2)
+    assert queued["status"] == "PENDING" and rejected["status"] == "FAILED"
+    assert c.b.waiting_candidates == 2
+    c.b.receive("s1", dict(op="cancel", key=queued["key"]))
+    assert queued["key"] in c.b.admission_waiting
+    c.b.receive("s0", dict(op="cancel", key=queued["key"]))
+    assert queued["key"] not in c.b.jobs
+    assert c.b.waiting_candidates == 0
+    replacement = c.job("replacement", count=2)
+    c.drain(active)
+    assert replacement["owner"] == "w0.0"
+    assert not any(
+        m["op"] == "owner_assigned" and m["key"] == queued["key"] for _, m in c.out
+    )
+
+
+def test_owner_wait_does_not_expire_and_does_not_reset_age_on_admission(monkeypatch):
+    c = Cluster(tp=1)
+    c.b.capabilities["w0.0"].update(max_jobs=1)
+    active = c.job("active")
+    c.ready(active)
+    waiting = c.job("waiting")
+    created = waiting["created"]
+    later = created + c.b.timeout * 3
+    monkeypatch.setattr(owner.time, "monotonic", lambda: later)
+    c.b.peers = {peer: later for peer in c.b.peers}
+    for _ in range(10):
+        c.b.wake()
+        c.b.expire(later)
+    assert waiting["status"] == "PENDING" and not c.b.fenced
+    assert waiting.get("retry_count", 0) == 0
+    c.drain(active)
+    assert waiting["created"] == created and waiting["running"]
+    assert not c.b.pending_expired(waiting, later + 1)
+    assert c.b.pending_expired(waiting, later + c.b.timeout + 1)
+
+
+def test_waiting_request_still_observes_independent_heartbeat_failure():
+    c = Cluster(tp=1)
+    c.b.capabilities["w0.0"].update(max_jobs=1)
+    c.job("active")
+    waiting = c.job("waiting")
+    c.b.peers["w0.0"] = time.monotonic() - 61
+    c.b.expire()
+    assert c.b.fenced and waiting["status"] == "FAILED"
+    assert not waiting.get("owner")
+
+
+def test_admission_uses_each_owner_hard_limit_and_skips_ineligible_waiter():
+    c = Cluster()
+    c.b.capabilities["w0.0"].update(max_jobs=1, max_candidates=4)
+    c.b.capabilities["w0.1"].update(max_jobs=1, max_candidates=8)
+    small_owner = c.job("small-owner", count=4)
+    large_owner = c.job("large-owner", count=8)
+    large = c.job("large", count=8)
+    small = c.job("small", count=4)
+    c.drain(small_owner)
+    assert large["status"] == "PENDING" and not large.get("owner")
+    assert small["owner"] == "w0.0"
+    c.drain(large_owner)
+    assert large["owner"] == "w0.1"
+    assert not c.b.admission_waiting
+
+
+def test_admission_prefers_original_age_when_multiple_waiters_fit():
+    c = Cluster(tp=1)
+    c.b.capabilities["w0.0"].update(max_jobs=1)
+    active, older, newer = c.job("active"), c.job("older"), c.job("newer")
+    c.drain(active)
+    assert older["running"] and not newer.get("running")
+    c.drain(older)
+    assert newer["running"]
+
+
+@pytest.mark.parametrize("name", ["max_waiting_jobs", "max_waiting_candidate_blocks"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_invalid_admission_limits_are_rejected(name, value):
+    with pytest.raises(ValueError, match="positive integer"):
+        owner.OwnerBroker(Mock(), 1, **{name: value})
 
 
 def test_ready_waits_for_owner_only_but_release_requires_every_consumer():

@@ -95,8 +95,27 @@ def worker_capability(connector):
 
 
 class OwnerBroker(BrokerState):
-    def __init__(self, send, tp_size, timeout=300, dp_size=1):
+
+    def __init__(
+        self,
+        send,
+        tp_size,
+        timeout=300,
+        dp_size=1,
+        max_waiting_jobs=256,
+        max_waiting_candidate_blocks=65536,
+    ):
         super().__init__(send, tp_size, timeout)
+        for name, value in (
+            ("max_waiting_jobs", max_waiting_jobs),
+            ("max_waiting_candidate_blocks", max_waiting_candidate_blocks),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"early_owner_{name} must be a positive integer")
+        self.max_waiting_jobs = max_waiting_jobs
+        self.max_waiting_candidate_blocks = max_waiting_candidate_blocks
+        self.admission_waiting = {}
+        self.waiting_candidates = 0
         self.dp_size = dp_size
         self.capabilities, self.sessions, self.domains = {}, {}, {}
         self.cursor, self.last_sequence = {}, {}
@@ -167,8 +186,51 @@ class OwnerBroker(BrokerState):
                 return order[index]
         return None
 
-    def dispatch(self, job):
+    def _leave_admission_wait(self, job):
+        if self.admission_waiting.pop(job["key"], None) is not None:
+            self.waiting_candidates -= len(job["blocks"])
+            self.capacity_wait(job, "admission", False)
+            job.pop("wait_reason", None)
+
+    def _wait_for_owner(self, job):
+        if job["key"] in self.admission_waiting:
+            return
+        work = len(job["blocks"])
+        if (
+            len(self.admission_waiting) >= self.max_waiting_jobs
+            or self.waiting_candidates + work > self.max_waiting_candidate_blocks
+        ):
+            self.fail(job, "owner_wait_queue_limits; native fallback")
+            return
+        self.admission_waiting[job["key"]] = job
+        self.waiting_candidates += work
+        job["wait_reason"] = "owner_capacity"
+        self.capacity_wait(job, "admission", True)
+        log.info(
+            "UCM_EARLY admission_wait key=%s dp=%s candidates=%s queued=%s",
+            job["key"],
+            job["dp"],
+            work,
+            len(self.admission_waiting),
+        )
+
+    def _wake_admission(self):
+        # Query cost is unknown before admission. Preserve age, but allow an
+        # ineligible large request to yield to one that fits a released slot.
+        waiting = sorted(
+            self.admission_waiting.values(), key=lambda job: job["created"]
+        )
+        for job in waiting:
+            self.dispatch(job, reconsider=True)
+
+    def fail(self, job, reason):
+        self._leave_admission_wait(job)
+        super().fail(job, reason)
+
+    def dispatch(self, job, *, reconsider=False):
         if job["status"] != "PENDING" or job.get("running"):
+            return
+        if job["key"] in self.admission_waiting and not reconsider:
             return
         if not self.workers(job["dp"]).issubset(self.peers):
             return
@@ -181,25 +243,26 @@ class OwnerBroker(BrokerState):
             return super().dispatch(job)
         work = len(job["blocks"])
         candidates = []
-        job_limited = candidate_limited = 0
+        can_ever_fit = False
         for peer in self.workers(job["dp"]):
             load = domain["owners"].get(peer, dict(jobs=0, candidates=0))
             peer_cap = self.capabilities[peer]
             work_limit = peer_cap["max_candidates"] or peer_cap["max_jobs"] * peer_cap["task_shards"]
-            if load["jobs"] >= peer_cap["max_jobs"]:
-                job_limited += 1
-            elif load["candidates"] + work > work_limit:
-                candidate_limited += 1
-            elif peer in self.peers:
+            can_ever_fit |= work <= work_limit
+            if (
+                load["jobs"] < peer_cap["max_jobs"]
+                and load["candidates"] + work <= work_limit
+                and peer in self.peers
+            ):
                 candidates.append(peer)
         owner = self.select_owner(candidates, job["dp"])
         if owner is None:
-            reason = "owner_work_limits"
-            log.info("UCM_EARLY owner_work_rejected key=%s dp=%s candidates=%s "
-                     "job_limited=%s candidate_limited=%s wasted_read_bytes=0",
-                     job["key"], job["dp"], work, job_limited, candidate_limited)
-            self.fail(job, "bounded owner capacity: " + reason + "; native fallback")
+            if can_ever_fit:
+                self._wait_for_owner(job)
+            else:
+                self.fail(job, "owner_request_limit; native fallback")
             return
+        self._leave_admission_wait(job)
         load = domain["owners"].setdefault(owner, dict(jobs=0, candidates=0, assignments=0))
         load["jobs"] += 1
         load["candidates"] += work
@@ -240,8 +303,6 @@ class OwnerBroker(BrokerState):
                 job["capacity_wait_since"] = None
 
     def pending_expired(self, job, now):
-        if not job.get("owner"):
-            return super().pending_expired(job, now)
         # Resource waiting is not a lookup/I/O timeout. Heartbeats, native I/O
         # deadlines and domain fencing remain live while this clock is paused.
         paused = now - job["capacity_wait_since"] if job.get("capacity_wait_since") is not None else 0
@@ -439,11 +500,14 @@ class OwnerBroker(BrokerState):
                 domain["execution"].release(job["key"])
                 self.jobs.pop(job["key"])
                 self.advance_execution(domain)
+                self._wake_admission()
             return
         if op in ("owner_answer", "consumed", "quiesced", "owner_drained", "consumer_failed", "worker_retire"):
             return
         if op in ("finish", "cancel", "handoff") and job and job["client"] != peer:
             return
+        if op in ("finish", "cancel") and job:
+            self._leave_admission_wait(job)
         return super().receive(peer, message, now)
 
     def expire(self, now=None):

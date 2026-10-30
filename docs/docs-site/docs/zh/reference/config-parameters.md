@@ -23,8 +23,9 @@ enable_metrics: true
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`，DeepSeek v4 系列模型推荐设置为 `false`。 |
 | `enable_early_prefetch` | 选填 | bool | 默认 `false` | 启用 Early 预取路径；整块读取和 Early 调度选项要求开启。 |
-| `early_ready_max_candidates` | 选填 | int | 默认 `64`；正整数 | vLLM 0.28.0 每轮等待调度的原生匹配、分配尝试上限。有效命中的 READY 请求可跨原生优先级优先尝试。 |
-| `early_ready_max_bypasses` | 选填 | int | 默认 `8`；正整数 | 被较晚到达的请求成功越过达到此次数后，给予优先尝试；仍放不下时让后续请求推进，不为其预留 HBM。 |
+| `early_ready_priority` | 选填 | bool | 默认 `false` | vLLM 0.28.0 启用 Early 时，`false` 保持原生等待队列准入；`true` 启用有效命中的 READY 优先，按估算未缓存后缀排序，并启用有界扫描和公平性补偿。适用于 Direct/LayerWise 及同步/异步 scheduler，修改后重启。与 HRRN 加载调度独立。 |
+| `early_ready_max_candidates` | 选填 | int | 默认 `64`；正整数 | `early_ready_priority: true` 时，每轮等待调度的原生匹配、分配尝试上限。有效命中的 READY 请求可跨原生优先级优先尝试。开关关闭时仍校验格式，但不生效。 |
+| `early_ready_max_bypasses` | 选填 | int | 默认 `8`；正整数 | `early_ready_priority: true` 时，被较晚请求成功越过达到此次数后给予优先尝试；仍放不下时让后续请求推进，不为其预留 HBM。开关关闭时仍校验格式，但不生效。 |
 | `early_owner_max_waiting_jobs` | 选填 | int | 默认 `256`；正整数 | 整个 broker 等待 owner 准入的请求数上限。已进入等待的请求不因资源等待时长而失败。 |
 | `early_owner_max_waiting_candidate_blocks` | 选填 | int | 默认 `65536`；正整数 | 整个 broker 准入等待队列中的候选 ID 总数上限。限制元数据而非 L1 预留；新请求超过队列上限时回退。 |
 | `early_owner_max_retries` | 选填 | int | 默认 `1`；非负整数 | 首次 deferred 查询在发布批次前被原生健康检查明确拒绝，且旧 generation 已排空时，允许的新执行次数。`0` 禁用重试；资源等待和原批次恢复不计数。 |

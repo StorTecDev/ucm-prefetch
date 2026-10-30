@@ -102,7 +102,7 @@ class _EarlyConnectorMixin:
         if role == KVConnectorRole.SCHEDULER:
             from .early_scheduling import install_scheduler_policy
 
-            install_scheduler_policy(vllm_config.scheduler_config)
+            install_scheduler_policy(vllm_config.scheduler_config, self.launch_config)
             self.store = self._create_store(None)
         self._early = (
             EarlyScheduler(self) if role == KVConnectorRole.SCHEDULER else None

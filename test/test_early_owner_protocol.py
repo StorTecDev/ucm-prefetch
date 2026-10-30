@@ -378,6 +378,7 @@ def test_task_scope_wraps_same_native_consistency_and_preserves_errors():
 
 def make_worker(rank):
     store = Mock()
+    store.domain_info.return_value = capability(rank=rank)["native"]
     store.config = {"timeout_ms": 1000}
     connector = SimpleNamespace(
         use_request_async_load=False,

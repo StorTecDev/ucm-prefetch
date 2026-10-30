@@ -454,11 +454,17 @@ changed; do not mix old and new libraries or workers. Generic coverage is in
 `test/packed_l2_probe.cc`, and `test/early_scope_probe.cc`.
 
 The connector-level `early_prefetch_request_first: true` option prioritizes the
-oldest eligible request for L2 reads (default: `false`, existing HRRN rounds).
+oldest eligible request for L2 reads. The default (`false`) uses request-level
+HRRN rounds: snapshot currently eligible requests, score each once by its entire
+remaining load in native bytes, then retain that order across data batches.
+Unqueried tails are conservatively estimated as cold native blocks, preserving
+lookup/read overlap. Later arrivals enter a later round. If earlier rounds cannot
+submit, a later round may use spare I/O credit; earlier rounds resume first.
 Reads within that request remain concurrent under the shared byte window. Once
 its remaining reads are submitted, another request can fill spare credit while
 the tail completes. Lookup, activation and capacity waits also allow backfill;
-priority is reconsidered when they clear. READY still requires all request
+eligible work is reconsidered when they clear, without rescoring HRRN rounds.
+READY still requires all request
 batches to complete. L1-to-device layerwise copies and native read batching are
 unchanged. Large requests can delay younger requests; this option does not
 promise greater device bandwidth or physically contiguous files.

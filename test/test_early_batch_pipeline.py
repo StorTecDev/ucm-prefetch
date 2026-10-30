@@ -47,6 +47,7 @@ class Control:
 @pytest.fixture
 def worker():
     store = Mock()
+    store.domain_info.return_value = dict(block_bytes=1, shard_bytes=1)
     connector = SimpleNamespace(
         use_request_async_load=False,
         store=store,
@@ -212,18 +213,21 @@ def test_each_block_identity_is_computed_once_across_batches(worker, mla, rank):
                          if not mla and rank else message["blocks"])
 
 
-def test_hrrn_service_estimate_is_remaining_shards_not_total_prefix():
-    long = early.WorkerBatch(0, 0, result(1, 512, 1), entered=0)
-    short = early.WorkerBatch(0, 0, result(2, 2, 4), entered=0)
-    assert early.EarlyWorker.ratio(long, 10) == 11
-    assert early.EarlyWorker.ratio(long, 10) > early.EarlyWorker.ratio(short, 10)
+def test_hrrn_service_estimate_is_request_work_not_total_prefix(worker):
+    long = early.WorkerJob("long", blocks(512), entered=0, reserve_done=True,
+                          batches=[early.WorkerBatch(0, 0, result(1, 512, 1))])
+    short = early.WorkerJob("short", blocks(2), entered=0, reserve_done=True,
+                           batches=[early.WorkerBatch(0, 0, result(2, 2, 4))])
+    assert worker.ratio(long, 10) == 11
+    assert worker.ratio(long, 10) > worker.ratio(short, 10)
 
 
 def enqueue(worker, key, handle, capability, age=0):
     reservation = result(handle, 32, capability.work)
     reservation["batch"] = capability
     batch = early.WorkerBatch(0, 0, reservation, entered=time.monotonic() - age)
-    job = early.WorkerJob(key, [], batches=[batch], reserve_done=True, lookup_finished=True)
+    job = early.WorkerJob(key, [], entered=batch.entered, batches=[batch],
+                         reserve_done=True, lookup_finished=True)
     worker.jobs[key] = job
     worker.preparing.append((job, batch))
     return job, batch
@@ -232,7 +236,7 @@ def enqueue(worker, key, handle, capability, age=0):
 def test_pending_long_read_does_not_block_another_request(worker):
     gate = threading.Event()
     submitted = []
-    long = Capability(4, submit=lambda: submitted.append("long"), gate=gate)
+    long = Capability(1, submit=lambda: submitted.append("long"), gate=gate)
     short = Capability(1, submit=lambda: submitted.append("short"))
     with worker.condition:
         a, _ = enqueue(worker, "long", 1, long, age=100)
@@ -290,21 +294,17 @@ def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker, re
     assert len(submitted) == 2
 
 
-def test_new_arrivals_cannot_keep_an_existing_request_out_of_later_rounds(worker):
-    # Exercise the scheduling rule independently of I/O timing: one old long
-    # request and newly arriving short requests participate in finite rounds.
+def test_new_arrivals_do_not_preempt_selected_request(worker):
     with worker.condition:
-        _, old = enqueue(worker, "old", 1, Capability(100), age=20)
-        _, first = enqueue(worker, "first", 2, Capability(1), age=10)
-        remaining = set()
-        worker._choose(remaining)
-        key, batch = worker.selected.pop(0)
-        remaining.discard(key.key)
-        worker.preparing.append((key, batch))
+        job, first = enqueue(worker, "first", 1, Capability(100), age=20)
+        worker._choose()
+        assert worker.selected == [(job, first)]
+        worker.preparing.extend(worker.selected)
+        worker.selected.clear()
         for i in range(10):
-            enqueue(worker, "new" + str(i), i + 3, Capability(1), age=100)
-        worker._choose(remaining)
-        assert worker.selected[0][1] is old  # finish original round before arrivals
+            enqueue(worker, "new" + str(i), i + 2, Capability(1), age=10)
+        worker._choose()
+        assert worker.selected == [(job, first)]
         worker.preparing.clear()
         worker.selected.clear()
 
@@ -434,14 +434,15 @@ def test_real_io_error_in_discarded_tail_is_failure_not_successful_capacity(work
         tail_gate.set()
 
 
+@pytest.mark.parametrize("request_first", [False, True])
 @pytest.mark.parametrize("first_work, expected", [(4, ["first", "first"]), (1, ["first", "next"])])
-def test_request_first_fills_window_and_backfills_unfinished_tail(worker, first_work, expected):
+def test_request_priority_fills_window_and_backfills_unfinished_tail(worker, request_first, first_work, expected):
     first_gate, next_gate = threading.Event(), threading.Event()
     submitted = []
     first = Capability(first_work, submit=lambda: submitted.append("first"), gate=first_gate)
     next_cap = Capability(4, submit=lambda: submitted.append("next"), gate=next_gate)
     with worker.condition:
-        worker.request_first = True
+        worker.request_first = request_first
         a, _ = enqueue(worker, "first", 1, first)
         b, _ = enqueue(worker, "next", 2, next_cap)
         a.entered, b.entered = 1, 2
@@ -461,7 +462,8 @@ def test_request_first_fills_window_and_backfills_unfinished_tail(worker, first_
     wait(lambda: a.ready and b.ready)
 
 
-def test_request_first_capacity_wait_backfills_and_resumes(worker):
+@pytest.mark.parametrize("request_first", [False, True])
+def test_request_priority_capacity_wait_backfills_and_resumes(worker, request_first):
     released, next_gate = threading.Event(), threading.Event()
     class CapacityWait(Capability):
         def step(self, available):
@@ -473,7 +475,7 @@ def test_request_first_capacity_wait_backfills_and_resumes(worker):
     first = CapacityWait(1)
     later = Capability(4, gate=next_gate)
     with worker.condition:
-        worker.request_first = True
+        worker.request_first = request_first
         a, batch = enqueue(worker, "first", 1, first)
         b, _ = enqueue(worker, "next", 2, later)
         a.entered, b.entered = 1, 2
@@ -502,16 +504,16 @@ def test_request_first_orders_batches_and_skips_resource_blocked_jobs(worker):
         second = early.WorkerBatch(1, 32, result(3, 32, 3))
         a.batches.append(second)
         worker.preparing.insert(0, (a, second))
-        worker._choose({"next"})
+        worker._choose()
         assert worker.selected == [(a, first)]
         worker.selected.clear()
         first.waiting_capacity, first.can_submit = True, False
         worker.preparing.append((a, first))
-        worker._choose(set())
+        worker._choose()
         assert worker.selected == [(b, other)]
         worker.selected.clear()
         first.waiting_capacity, first.done = False, True
-        worker._choose(set())
+        worker._choose()
         assert worker.selected == [(a, second)]
         worker.preparing.clear()
         worker.selected.clear()

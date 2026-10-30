@@ -64,7 +64,7 @@ owner、READY 接收时刻、首次 PENDING、PENDING 次数、匹配调用数�
 已核验 owner 域使用 `ReserveDeferred`：查询期间只临时取得现有节点引用以确认
 连续 L1/L2 命中，返回前释放这些引用；排队的 reservation 只留 block identity、
 read lease 和 L2-positive 信息。它不分配缺失节点，也不把候选命中当成 READY。
-HRRN 选中批次、共享域资格检查通过后，`Batch.Activate` 复用 Locate/位置提示，
+HRRN 选中请求后按前缀顺序推进其批次；共享域资格检查通过后，`Batch.Activate` 复用 Locate/位置提示，
 在原生锁内重新取得引用。L2-positive 由原 lease 保护；原 L1-only block 若被淘汰，
 再查当前 L2，真正缺失才截断。分配仍在 Step 提交 SSD 读取之前执行。
 全 L1 在执行资格通过并重新取得全部引用后直接 READY，不进入 SSD 数据队列。
@@ -118,7 +118,11 @@ TryGet 必须重新确认其他 rank 是否已经创建同一 shard，再决定�
 
 total_hit_blocks 表示连续总命中；remaining_l2_work 是 reservation 时尚未 READY
 的 shard 数，包含其他 owner 的在途工作，不等于本 rank 最终的 SSD 读取字节。
-HRRN 保持 `1 + waiting_time / max(remaining_l2_work, 1)`。
+HRRN 按整个请求计算 `1 + waiting_time / max(remaining_bytes, native_shard_bytes)`。
+`remaining_bytes` 汇总所有未完成且未丢弃批次的 `remaining_l2_work * native_shard_bytes`，
+包括暂时不能提交和仍有在途读取的批次。查询尚未结束时，未查询尾部按 native
+block 大小保守计入；查询结束或前缀截断后不再计入未知尾部，避免为完整查询阻塞首批读取。
+等待时间从请求最初入队时刻计算，同一轮使用同一个评分时刻；同分按入队时间、key 稳定排序。
 批次推进时，已完成的本地读取与已观察到的 peer READY 从工作估计中扣除。
 尚未观察到的 peer 完成可能仍被计入，因此它是保守估计；实际 SSD 读取另记。
 
@@ -163,9 +167,14 @@ sequenceDiagram
 未完成 I/O 不在 Step 内同步 Wait；原生没有完成回调时，数据线程以既有 1 ms
 等待节奏调用 Check，不增加 lookup/data 线程或 Posix 并发。
 
-数据队列每请求选取最早的可提交批次。每个有限轮次内，每请求取得一次有界
-推进机会；该轮候选按 HRRN 选择前四分之一，完成该轮后才接纳新到候选。
-等待完成的批次仍在 active 中回收，不占用提交机会。整请求 PENDING 保持不变；owner 模式等 owner 的完整受保护结果，兼容路径等全部 rank。软化门控不属于此设计。
+数据队列以当前可提交请求的快照开启一轮，每个请求只评分一次，固定整轮顺序。
+每次推进按该顺序取最早可执行的请求，再取其最早可提交批次；提交或完成一个
+数据 batch 不结束请求的优先权，也不触发重新评分。新到请求进入后续轮次。
+当前轮请求因查询、激活、容量或读取尾部等待而都无法提交时，可开启下一轮，
+利用空闲 I/O 额度补位；前轮恢复后优先继续，其轮内顺序不变。无需等待凑批，
+补位仍受同一全局字节窗口限制。取消、失败或 READY 的请求退出优先队列。
+等待完成的批次仍在 active 中回收。整请求 PENDING 保持不变；owner 模式等
+owner 的完整受保护结果，兼容路径等全部 rank。软化门控不属于此设计。
 
 取消后停止新提交，已接受的任务由 Check/Wait 排空，再标记尚未完成的本地 owner
 为 FAILED。非 owner 路径关闭时数据线程继续排空 active，未发布的 lookup 结果立即释放。owner 路径关闭执行下述 generation 排空握手；无法证明排空则停用共享域。
@@ -285,7 +294,7 @@ broker 为请求实例生成的 UUID key 保存独立 attempt 和单调 grant。
 是策略扩展点。非 owner 只收到 generation/owner 通知，不收到完整候选数组，
 不执行 reserve、lease、候选扫描或预取。owner 保持四个后台执行槽位，分为两个 query 与两个 activation worker，避免
 activation 排在完整前缀查询之后；仍使用一个 data worker 及原生 I/O 并发，继续自适应批次、reserve/read 重叠和跨请求
-有限轮次 HRRN。无需跨 rank 的 handle、reservation ID、节点目录或读取分片。
+请求级分轮 HRRN。无需跨 rank 的 handle、reservation ID、节点目录或读取分片。
 
 owner reserve 完成且所有已发布批次 READY 后，broker 发布受保护的连续前缀。
 Scheduler 复用已保存 IDs/hit，执行同一原生 HBM 扣除、缺失过滤、token 计算和

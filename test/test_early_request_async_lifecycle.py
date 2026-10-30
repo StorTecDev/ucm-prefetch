@@ -247,6 +247,7 @@ def test_shutdown_waits_or_quarantines_before_closing_early(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_real_worker_initialization_installs_async_failure_handler(enabled):
     store = Mock()
+    store.domain_info.return_value = dict(block_bytes=1, shard_bytes=1)
     store.config = {}
     connector = SimpleNamespace(
         store=store,

@@ -331,11 +331,13 @@ def test_resource_wait_pauses_pending_clock_but_not_peer_loss_or_drain():
 def test_late_activation_returns_unsubmitted_pins_and_does_not_run_ahead_of_wait():
     from test_early_owner_protocol import make_worker, early, blocks
     worker = make_worker(0)
-    first = early.WorkerBatch(0, 0, dict(handle=1, total_hit_blocks=3, batch=DeferredCapability(3, 3)))
+    first = early.WorkerBatch(0, 0, dict(handle=1, total_hit_blocks=3, remaining_l2_work=3,
+                                      batch=DeferredCapability(3, 3)))
     capability = DeferredCapability(3, 0)
     second = early.WorkerBatch(1, 3, dict(handle=2, total_hit_blocks=3, remaining_l2_work=0, batch=capability),
                                eligible=True, activating=True)
     job = early.WorkerJob("late", blocks(6), deferred=True, batches=[first, second])
+    worker.jobs[job.key] = job
     original = capability.activate
     def activate():
         result = original()
@@ -347,10 +349,10 @@ def test_late_activation_returns_unsubmitted_pins_and_does_not_run_ahead_of_wait
         assert not capability.activated and not second.done and not second.activating
         assert (job, second) in worker.preparing
         with worker.condition:
-            worker._choose(set())
+            worker._choose()
             assert not worker.selected  # paused job does not pin its next batch
             first.waiting_capacity = False
-            worker._choose(set())
+            worker._choose()
             assert worker.selected == [(job, second)]
     finally:
         worker.close()

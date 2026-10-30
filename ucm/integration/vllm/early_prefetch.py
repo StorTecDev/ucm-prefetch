@@ -409,6 +409,7 @@ class EarlyWorker:
         self.jobs = {}
         self.preparing = []
         self.selected = []
+        self.hrrn_requests = []
         self.request_first = getattr(connector, "launch_config", {}).get(
             "early_prefetch_request_first", False)
         if type(self.request_first) is not bool:
@@ -422,6 +423,22 @@ class EarlyWorker:
         if (type(self.submit_max_wait_ms) not in (int, float)
                 or not 0 < self.submit_max_wait_ms <= 10):
             raise ValueError("early_prefetch_submit_max_wait_ms must be in (0, 10]")
+        native = self.store.domain_info()
+        self.block_bytes = native["block_bytes"]
+        self.shard_bytes = native["shard_bytes"]
+        if not self.block_bytes or not self.shard_bytes:
+            # A health rejection hides the domain but does not change its
+            # layout. Keep later recovered requests schedulable as well.
+            config = self.store.config
+            self.block_bytes, self.shard_bytes = (
+                config["block_size"],
+                config["shard_size"],
+            )
+            if config.get("cache_full_block_l1", False):
+                self.block_bytes = sum(
+                    config.get("posix_packed_layer_bytes") or [self.block_bytes]
+                )
+                self.shard_bytes = self.block_bytes
         self.request_keys = {}
         self.closed = False
         dp_rank = connector._vllm_config.parallel_config.data_parallel_index
@@ -727,17 +744,37 @@ class EarlyWorker:
                 and all(part.done for part in job.batches)):
             self._answer(job)
 
-    @staticmethod
-    def ratio(batch, now):
-        # Shards not READY at reserve, including peer-owned in-flight work.
-        return 1 + (now - batch.entered) / max(batch.reservation["remaining_l2_work"], 1)
+    def ratio(self, job, now):
+        # Include draining and eligibility-blocked batches: choosing a tiny
+        # head must not disguise the cost of reaching whole-request READY.
+        work = (
+            sum(
+                part.reservation["remaining_l2_work"]
+                for part in job.batches
+                if not part.done and not part.discarded
+            )
+            * self.shard_bytes
+        )
+        if not job.reserve_done and job.capacity_end is None:
+            # Unknown tails are conservatively cold until lookup proves a hit
+            # or miss. Waiting for full lookup here would break read overlap.
+            last = job.batches[-1] if job.batches else None
+            known = last.begin + last.reservation["total_hit_blocks"] if last else 0
+            work += max(len(job.blocks) - known, 0) * self.block_bytes
+        return 1 + (now - job.entered) / max(work, self.shard_bytes)
 
-    def _choose(self, round_keys):
-        # Condition held; one pending batch per request participates in
-        # selection. Default HRRN gives each eligible request a turn before
-        # repeating; request-first keeps issuing for the oldest eligible job.
-        self.preparing = [item for item in self.preparing
-                          if not item[0].cancelled and not item[1].done and not item[1].discarded and item[1].can_submit]
+    def _choose(self):
+        # Condition held; batch boundaries are execution details, not new
+        # scheduling turns. Freeze each request round across temporary backfill.
+        self.preparing = [
+            item
+            for item in self.preparing
+            if not item[0].cancelled
+            and not item[0].ready
+            and not item[1].done
+            and not item[1].discarded
+            and item[1].can_submit
+        ]
         heads = {}
         for job, batch in self.preparing:
             if not self._resource_eligible(job, batch):
@@ -751,17 +788,35 @@ class EarlyWorker:
             # false; the next request can use spare credit while that tail drains.
             # Lookup, activation and capacity waits also permit useful backfill.
             # The data loop still polls every active batch and bounds global I/O.
-            eligible = sorted(heads.values(), key=lambda item: (item[0].entered, item[0].key))
-            self.selected = eligible[:1]
-            round_keys.clear()
+            chosen = min(
+                heads.values(),
+                key=lambda item: (item[0].entered, item[0].key),
+                default=None,
+            )
         else:
-            round_keys.intersection_update(heads)
-            if not round_keys:
-                round_keys.update(heads)
-            eligible = [heads[key] for key in round_keys]
-            now = time.monotonic()
-            eligible.sort(key=lambda item: self.ratio(item[1], now), reverse=True)
-            self.selected = eligible[:max(1, len(eligible) // 4)]
+            self.hrrn_requests = [
+                job
+                for job in self.hrrn_requests
+                if not job.cancelled and not job.ready and self.jobs.get(job.key) is job
+            ]
+            chosen = next(
+                (heads[job.key] for job in self.hrrn_requests if job.key in heads), None
+            )
+            if chosen is None and heads:
+                now = time.monotonic()
+                ordered = sorted(
+                    heads.values(),
+                    key=lambda item: (
+                        -self.ratio(item[0], now),
+                        item[0].entered,
+                        item[0].key,
+                    ),
+                )
+                # One score per request per round. Appending preserves earlier
+                # rounds when their lookup, activation or capacity wait clears.
+                self.hrrn_requests.extend(job for job, _ in ordered)
+                chosen = ordered[0]
+        self.selected = [chosen] if chosen is not None else []
         chosen = {batch for _, batch in self.selected}
         self.preparing = [item for item in self.preparing if item[1] not in chosen]
 
@@ -833,7 +888,7 @@ class EarlyWorker:
             return True
 
     def _data(self):
-        active, round_keys = [], set()
+        active = []
         window, peak = 0, 0
         refill_since = None
         while True:
@@ -852,21 +907,16 @@ class EarlyWorker:
                 if self.closed:
                     self.preparing.clear()
                     self.selected.clear()
+                    self.hrrn_requests.clear()
                     if not active:
                         return
                 else:
-                    if self.request_first and self.selected:
+                    if self.selected:
                         # Reconsider priority when a capacity/lookup wait clears
-                        # while a younger request was waiting for global credit.
+                        # while a backfilled request was waiting for global credit.
                         self.preparing.extend(self.selected)
                         self.selected.clear()
-                    blocked = [item for item in self.selected if not self._resource_eligible(*item)]
-                    self.preparing.extend(blocked)
-                    self.selected = [item for item in self.selected if item not in blocked]
-                    self.selected = [item for item in self.selected
-                                     if not item[0].cancelled and not item[1].done and not item[1].discarded and item[1].can_submit]
-                    if not self.selected:
-                        self._choose(round_keys)
+                    self._choose()
                     if self.selected:
                         job, batch = self.selected[0]
                         capability = batch.reservation["batch"]
@@ -886,7 +936,6 @@ class EarlyWorker:
                         if enough:
                             refill_since = None
                             self.selected.pop(0)
-                            round_keys.discard(job.key)
                         else:
                             job = batch = None
                     else:

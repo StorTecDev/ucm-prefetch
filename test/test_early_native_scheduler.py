@@ -58,9 +58,11 @@ def schedule(connector, scheduler_factory, states, *, hit=48, same_prompt=False)
     return scheduler, output, adapter
 
 
-def attach(connector, scheduler, requests, states, hits):
+def attach(connector, scheduler, requests, states, hits, *, ready_priority=True):
     connector.block_size = connector.hash_block_size = 128
-    connector._early.scheduling = ReadyPriority({})
+    connector._early.scheduling = ReadyPriority(
+        {"early_ready_priority": ready_priority}
+    )
     for request, state, hit in zip(requests, states, hits):
         scheduler.add_request(request)
         job = Job(request, request.all_token_ids, connector._early.identity(request))

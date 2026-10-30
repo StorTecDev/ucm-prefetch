@@ -1,9 +1,26 @@
 # Early READY admission in vLLM 0.28.0
 
-Early requests with a protected, nonzero cache prefix receive an opportunity to
+`early_ready_priority` is a boolean at the UCM YAML root and defaults to `false`.
+With the default, Early uses the original native waiting-queue admission order,
+including native FCFS/request priorities and stopping conditions after an HBM
+allocation refusal. Set it to `true` to enable the READY admission policy below:
+
+```yaml
+enable_early_prefetch: true
+early_ready_priority: true
+```
+
+Omitting the option or setting `early_ready_priority: false` selects native order.
+Restart the engine after changing it. Both EarlyDirectConnector and
+EarlyLayerWiseConnector support the switch on vLLM 0.28.0, including its native
+Scheduler and AsyncScheduler. The switch changes waiting admission only; Early
+prefetch, PENDING/READY/FAILED handling, request-level HRRN loading and owner
+resource lifetimes remain active in either mode.
+
+When explicitly enabled, Early requests with a protected, nonzero cache prefix receive an opportunity to
 enter HBM before failed requests consume the native fallback budget. This policy
 applies to the native vLLM 0.28.0 Scheduler and AsyncScheduler when an Early
-connector is active. Other connectors retain the native schedule method.
+connector enables it. Other connectors retain the native schedule method.
 
 READY preference can cross native request priorities. Within the preferred
 candidates, a smaller estimated uncached suffix is tried first. A zero-hit READY
@@ -26,6 +43,10 @@ particular TTFT.
   candidates exhaust every bounded scan, a smaller fallback candidate outside
   that class can remain unvisited. This boundary is deferred from the current scope.
 
+Both limits take effect only with `early_ready_priority: true`; their types and
+ranges are still validated when it is false. Non-boolean switch values, including
+strings such as `"false"`, are rejected.
+
 Both settings are positive integers at the YAML root. Original request arrival
 times remain unchanged. The counters use request objects rather than reusable
 request IDs and do not retain completed requests.
@@ -38,6 +59,11 @@ request are released before backfill. A rejected request stays in its original
 queue until a later pass; it does not lose its native priority or queue membership.
 
 ## Implementation boundary
+
+Disabled connectors do not install the adapter. Because installation patches a
+shared scheduler class, an already patched method also checks each connector's
+switch and calls the original native method for disabled instances. Enabled and
+disabled instances can therefore coexist without sharing admission policy.
 
 The adapter transforms the verified waiting-loop selection and per-request exit
 branches of the installed native method. It preserves the rest of that method,
@@ -58,6 +84,12 @@ transfers are mocked. It covers fallback blocking, a large READY request refusin
 HBM, priority crossing, fairness, bounded scans, native budgets, async scheduling,
 and encoder rollback. These tests do not establish GPU transfer correctness or a
 TTFT improvement.
+
+`test/test_early_ready_priority_switch.py` verifies default and explicit native
+order, opt-in uncached-work ordering, both connector constructors, synchronous
+and asynchronous scheduling, independent instances in a patched process, native
+priority/HBM stopping behavior, PENDING gating, global budgets and configuration
+validation. Existing READY-preference regressions explicitly enable the option.
 
 Owner admission waiting is described in `EARLY_PREFETCH_DESIGN.md`; it is separate
 from HBM admission. READY or scheduling success does not return owner or L1 credits

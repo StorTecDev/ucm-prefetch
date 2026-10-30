@@ -1,4 +1,4 @@
-"""Bounded READY preference in the vLLM 0.28.0 waiting admission loop."""
+"""Opt-in bounded READY preference in the vLLM 0.28.0 admission loop."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ from dataclasses import dataclass
 
 class ReadyPriority:
     def __init__(self, config):
+        self.enabled = config.get("early_ready_priority", False)
+        if type(self.enabled) is not bool:
+            raise ValueError("early_ready_priority must be a boolean")
         self.max_candidates = config.get("early_ready_max_candidates", 64)
         self.max_bypasses = config.get("early_ready_max_bypasses", 8)
         for name in ("max_candidates", "max_bypasses"):
@@ -268,7 +271,9 @@ def patch_scheduler_class(scheduler_class):
                 early = candidate
                 break
             connector = getattr(connector, "connector", None)
-        if early is None:
+        # Patching is process-wide, but admission policy belongs to each
+        # connector. A native-order instance must bypass the entire adapter.
+        if early is None or not early.scheduling.enabled:
             return original(self, *args, **kwargs)
         waiting = WaitingPass(self, early)
         output = adapted(self, *args, _ucm_waiting=waiting, **kwargs)
@@ -279,12 +284,15 @@ def patch_scheduler_class(scheduler_class):
     scheduler_class.schedule = schedule
 
 
-def install_scheduler_policy(config):
-    """Patch the configured scheduler while preserving native admission checks.
+def install_scheduler_policy(config, launch_config):
+    """Install READY preference only when enabled for this connector.
 
     Args:
         config: The vLLM scheduler configuration.
+        launch_config: The UCM connector configuration at the YAML root.
     """
+    if not ReadyPriority(launch_config).enabled:
+        return
     from vllm import __version__
 
     if __version__.split("+", 1)[0] != "0.28.0":

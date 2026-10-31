@@ -113,17 +113,22 @@ installs module stubs, including a NumPy stub.
 ```bash
 python -m pytest --noconftest -q -o addopts= \
   test/test_ucm_connector_metrics.py
-test_tmp=$(mktemp -d -t ucm-py-XXXXXX)
-python -m pytest --noconftest -q -o addopts= --basetemp="$test_tmp" \
-  test/test_early_batch_pipeline.py test/test_early_owner_protocol.py \
-  test/test_early_capacity_wait.py test/test_early_owner_budget.py \
-  test/test_early_packed_layout.py test/suites/Unit/test_early_ready_prefix.py
+(
+  test_tmp=$(mktemp -d -t ucm-py-XXXXXX) || exit 1
+  trap 'rm -rf -- "$test_tmp"' EXIT
+  python -m pytest --noconftest -q -o addopts= --basetemp="$test_tmp" \
+    test/test_early_batch_pipeline.py test/test_early_owner_protocol.py \
+    test/test_early_capacity_wait.py test/test_early_owner_budget.py \
+    test/test_early_hrrn.py test/test_early_retry.py \
+    test/test_early_packed_layout.py test/suites/Unit/test_early_ready_prefix.py
+)
 ```
 
 These cases cover generation ownership, safe capacity admission, release-event
-notification, cancellation/draining, packed-layout validation, metrics, and dump
-source-completion/finalization. Stubbed connector tests do not exercise a running
-vLLM engine or device transfers. The short temporary directory avoids the Unix
+notification, request-level HRRN scheduling through completion, typed retries
+after owner drain, cancellation/draining, packed-layout validation, metrics, and
+dump source-completion/finalization. Stubbed connector tests do not exercise a
+running vLLM engine or device transfers. The short temporary directory avoids the Unix
 socket pathname limit in the multiprocess ZeroMQ test; use a short temporary
 directory root if the system's default is deeply nested.
 
@@ -132,21 +137,38 @@ installing its libraries into the source tree:
 
 ```bash
 python test/python_with_build.py --build "$(pwd)/build/regression" \
-  --noconftest -q -o addopts= test/test_early_batch_binding.py
+  --noconftest -q -o addopts= \
+  test/test_early_batch_binding.py test/test_early_hrrn_binding.py
 ```
 
 This requires the normal UCM Python dependencies, including PyTorch and NumPy.
 The helper selects extensions from the specified build. Binding tests exercise
-real POSIX storage and simulated device copies; they do not establish GPU/NPU
-correctness, model-output equivalence, or end-to-end performance.
+real POSIX storage, backend health failures, request rounds across multiple
+batches, and simulated device copies; they do not establish GPU/NPU correctness,
+model-output equivalence, or end-to-end performance.
 
 The remaining integration modules (`test_early_ready_reuse.py`,
 `test_early_request_async.py`, `test_early_request_async_lifecycle.py`,
-`test_early_v080_compat.py`, and `test_early_native_scheduler.py`) additionally
-require a compatible vLLM environment. The scheduler module imports vLLM's
+`test_early_v080_compat.py`, `test_early_native_scheduler.py`, and
+`test_early_ready_priority_switch.py`) additionally require a compatible vLLM
+environment. The scheduler module imports vLLM's
 `tests.v1.core.utils` from its source checkout. Run these with the same build
 helper, in a separate process from the stubbed connector fixture. A CPU control
 or binding pass does not establish that these integration cases passed.
+
+For native scheduler admission and the READY-priority opt-in switch, use vLLM
+0.28.0 and run:
+
+```bash
+python test/python_with_build.py --build "$(pwd)/build/regression" \
+  --noconftest -q -o addopts= \
+  test/test_early_native_scheduler.py test/test_early_ready_priority_switch.py
+```
+
+These cases cover native-order defaults, opt-in READY preference, synchronous
+and asynchronous schedulers, independent connector instances, and configuration
+validation. See [Early READY admission](../../../docs/EARLY_READY_PRIORITY.md)
+for policy details and the boundary between mocked transfers and real scheduling.
 
 Keep generated build files, logs, environment inventories, and benchmark outputs
 outside tracked source. Documentation examples should use relative paths or

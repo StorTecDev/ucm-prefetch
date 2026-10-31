@@ -27,7 +27,7 @@ ucm_connectors:
       # Mandatory: Enable compression pipeline, fixed configuration as Cache|Compress|Posix
       store_pipeline: "Cache|Compress|Posix"
       # Storage path, supports local path or NFS mounted path
-      storage_backends: "/home/lyj/temp/kv"
+      storage_backends: "./kv-cache"
       # Compression ratio configuration: 16=2.0x compression, 32=1.0x no compression, other values not supported yet
       compress_ratio: 16
       # Data type configuration: 0=BF16, 100=INVALID, other values not supported yet

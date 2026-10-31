@@ -309,6 +309,8 @@ jobs:
             -f ./docker/Dockerfile.ucm-vllm-ascend.a2-v0.18.0 ./
 
       - name: Test E2E Online Inference in Docker
+        env:
+          A2_E2E_MODELS_DIR: ${{ vars.A2_E2E_MODELS_DIR || '/home/models' }}
         run: |
           RESULT_DIR="${{ github.workspace }}/test_results"
           RESULT_FILE="${{ steps.version.outputs.version }}-online-inference.xml"
@@ -334,7 +336,7 @@ jobs:
             -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
             -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
             -v /etc/ascend_install.info:/etc/ascend_install.info \
-            -v /home/huangmy/models:/home/models:ro \
+            -v "${A2_E2E_MODELS_DIR}:/home/models:ro" \
             -e http_proxy="${http_proxy:-}" \
             -e https_proxy="${https_proxy:-}" \
             -e no_proxy="${no_proxy:-}" \

@@ -579,8 +579,7 @@ with open(sys.argv[1], 'a+') as lock:
         assert readers[1]._try_become_leader()
     finally:
         for reader in readers:
-            if reader._lock_file:
-                reader._lock_file.close()
+            reader.stop()
 
 
 @pytest.mark.parametrize(

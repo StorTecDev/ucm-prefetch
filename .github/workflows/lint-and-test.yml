@@ -87,6 +87,24 @@ jobs:
       with:
         extra_args: --all-files --hook-stage manual
 
+  cpu-connector-tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install CPU regression dependencies
+      run: python -m pip install -r test/suites/Unit/requirements-cpu.txt
+    - name: Test hybrid connector and Docker installation contracts
+      # These source-level tests do not use the model/service E2E conftest.
+      run: >-
+        python -m pytest --noconftest -q -o addopts= -o log_cli=false
+        test/suites/Unit/test_hla_connector.py
+        test/suites/Unit/test_docker_wheel_install.py
+
   cpp_gtest:
     runs-on: ubuntu-latest
     env:

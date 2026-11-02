@@ -1,3 +1,6 @@
+import shlex
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,8 +13,16 @@ EXPECTED_UCM_WHEEL_DOCKERFILES = {
     "Dockerfile.ucm-vllm-ascend.a2-v0.18.0",
     "Dockerfile.ucm-vllm-ascend.a2-v0.18.0glm5.1",
     "Dockerfile.ucm-vllm-ascend.a2-v0.20.2rc1",
+    "Dockerfile.ucm-vllm-ascend.a2-v0.21.0rc1",
+    "Dockerfile.ucm-vllm-ascend.a2-v0.22.1rc1",
+    "Dockerfile.ucm-vllm-ascend.a2-v0.23.0",
+    "Dockerfile.ucm-vllm-ascend.a2-v0.23.0rc1",
     "Dockerfile.ucm-vllm-ascend.a3-v0.18.0glm5.1",
     "Dockerfile.ucm-vllm-ascend.a3-v0.20.2rc1",
+    "Dockerfile.ucm-vllm-ascend.a3-v0.21.0rc1",
+    "Dockerfile.ucm-vllm-ascend.a3-v0.22.1rc1",
+    "Dockerfile.ucm-vllm-ascend.a3-v0.23.0",
+    "Dockerfile.ucm-vllm-ascend.a3-v0.23.0rc1",
     "Dockerfile.ucm-vllm-cuda-latest",
     "Dockerfile.ucm-vllm-cuda-v0.18.0",
     "Dockerfile.ucm-vllm-cuda-v0.20.2",
@@ -20,9 +31,10 @@ EXPECTED_UCM_WHEEL_DOCKERFILES = {
 INSTALL_COMMAND = "RUN pip install /workspace/package/uc_manager-*.whl"
 POST_INSTALL_COMMAND = (
     "RUN if [ -f /workspace/package/install.sh ]; then \\\n"
-    "        bash /workspace/package/install.sh; \\\n"
+    "        bash /workspace/package/install.sh{failure_policy}; \\\n"
     "    fi"
 )
+FATAL_POST_INSTALL_DOCKERFILES = {"Dockerfile.ucm-sglang-ascend.a2-v0.5.18"}
 
 
 class DockerWheelInstallTest(unittest.TestCase):
@@ -57,9 +69,48 @@ class DockerWheelInstallTest(unittest.TestCase):
         for path in wheel_dockerfiles:
             text = path.read_text(encoding="utf-8")
             self.assertIn(INSTALL_COMMAND, text, path)
-            self.assertIn(POST_INSTALL_COMMAND, text, path)
+            # Older images deliberately tolerate optional hook failures;
+            # the newer SGLang A2 image propagates them.
+            failure_policy = (
+                "" if path.name in FATAL_POST_INSTALL_DOCKERFILES else " || true"
+            )
+            self.assertIn(
+                POST_INSTALL_COMMAND.format(failure_policy=failure_policy), text, path
+            )
             self.assertNotIn("uc_manager-*.whl &&", text, path)
             self.assertNotIn("install_ucm_wheel.sh", text, path)
+
+    def test_post_install_hooks_execute_the_checked_script(self):
+        with tempfile.TemporaryDirectory(prefix="ucm-hook-") as directory:
+            hook = Path(directory) / "install.sh"
+            for path in self._wheel_dockerfiles():
+                text = path.read_text(encoding="utf-8")
+                start = text.index("RUN if [ -f /workspace/package/install.sh ]; then")
+                end = text.index("\n    fi", start) + len("\n    fi")
+                command = text[start + len("RUN ") : end].replace(
+                    "/workspace/package/install.sh", shlex.quote(str(hook))
+                )
+                for exit_code in (None, 0, 7):
+                    with self.subTest(dockerfile=path.name, hook_exit=exit_code):
+                        hook.unlink(missing_ok=True)
+                        if exit_code is not None:
+                            hook.write_text(f"printf 'hook-ran\\n'\nexit {exit_code}\n")
+                        result = subprocess.run(
+                            ["bash", "-c", command],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        self.assertEqual(result.stderr, "")
+                        self.assertEqual(
+                            result.stdout, "" if exit_code is None else "hook-ran\n"
+                        )
+                        expected = (
+                            exit_code or 0
+                            if path.name in FATAL_POST_INSTALL_DOCKERFILES
+                            else 0
+                        )
+                        self.assertEqual(result.returncode, expected)
 
     def test_ucm_wheel_dockerfiles_export_engine_type(self):
         wheel_dockerfiles = self._wheel_dockerfiles()

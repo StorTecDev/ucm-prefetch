@@ -308,6 +308,7 @@ def test_dense_to_sparse_load_chain_reaches_every_layer(runtime, connector_symbo
     connector._connector_metadata = metadata
     connector._get_connector_metadata = lambda: metadata
     connector._dumped_layer_ids = set()
+    connector._dump_ready_layers = set()
     connector._layerwise_load_start_by_layer = {}
     connector._record_layerwise_load_duration = Mock(return_value=False)
     connector.load_tasks = defaultdict(dict)

@@ -82,30 +82,40 @@ def hla():
             "compute_all_group_block_ids",
         },
         "HybridLinearAttentionLayout": {
-            "_tokens_per_state",
-            "_has_glm53_layout",
             "_build_layout",
-            "_build_glm53_ascend_layout",
-            "_validate_glm53_ascend_descriptors",
-            "_build_glm53_ascend_row",
-            "_finalize_glm53_ascend_columns",
-            "_finalize_layout_arrays",
-            "_extract_group_addrs",
+            "_map_layers_to_slots",
+            "_layer_components",
+            "_build_layer_anchors",
+            "_finalize_layer_arrays",
+            "extract_layer_addrs",
+            "extract_block_addrs",
+            "direct_store_config",
         },
         "UCMHybridLinearAttentionConnector": {
+            "supports_kv_cache_layout",
             "_scope_blocks",
             "_append_mamba_align_state_block",
             "_generate_hla_dispatch_meta",
             "build_connector_meta",
+            "_reset_transfer_state",
+            "_prepare_load_plan",
+            "_ensure_dump_plan",
+            "_mark_load_failed",
         },
         "UCMHybridLinearAttentionLayerWiseConnector": {
-            "_plan_row_saves",
+            "_MODULE_TIER_ONLY_ARCHITECTURES",
+            "layerwise_engine_config_error",
+            "register_kv_caches",
             "wait_for_save",
             "start_load_kv",
-            "_submit_request_load_tasks_for_row",
-            "_wait_row_load",
-            "_mark_load_failed",
-            "_record_layerwise_load_bytes",
+            "wait_for_layer_load",
+            "save_kv_layer",
+            "_submit_layer_load",
+            "_wait_layer_load_pair",
+            "_record_load_bytes",
+            "_submit_layer_dump",
+            "_submit_commit_dump",
+            "_wait_dump_tasks",
         },
     }
     nodes = []
@@ -117,11 +127,35 @@ def hla():
         }:
             nodes.append(node)
         elif isinstance(node, ast.ClassDef) and node.name in methods:
-            node.bases = []
+            node.bases = (
+                [ast.Name(id="UCMHybridLinearAttentionConnector", ctx=ast.Load())]
+                if node.name == "UCMHybridLinearAttentionLayerWiseConnector"
+                else []
+            )
+            available = {
+                item.name for item in node.body if isinstance(item, ast.FunctionDef)
+            } | {
+                target.id
+                for item in node.body
+                if isinstance(item, ast.Assign)
+                for target in item.targets
+                if isinstance(target, ast.Name)
+            }
+            assert methods[node.name] <= available, (
+                node.name,
+                methods[node.name] - available,
+            )
             node.body = [
                 item
                 for item in node.body
                 if getattr(item, "name", None) in methods[node.name]
+                or (
+                    isinstance(item, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id in methods[node.name]
+                        for target in item.targets
+                    )
+                )
             ]
             nodes.append(node)
     connector_path = ROOT / "ucm/integration/vllm/ucm_connector.py"
@@ -135,6 +169,7 @@ def hla():
             "RequestMeta",
             "RequestDispatchMeta",
             "UCMConnectorMetadata",
+            "PendingDumpTask",
         }
     ]
     for node in base_nodes:
@@ -159,6 +194,7 @@ def hla():
         "torch": SimpleNamespace(Tensor=FakeTensor),
         "logger": MagicMock(),
         "ucmmetrics": MagicMock(),
+        "_short_list": lambda values, limit=12: values[:limit],
         "current_platform": SimpleNamespace(
             device_type="npu", is_cuda_alike=lambda: False
         ),
@@ -246,124 +282,121 @@ def test_tail_is_excluded_from_hashes_and_lcm_without_renumbering(hla):
 
 
 @pytest.mark.parametrize(
-    "fields,expected",
-    [
-        ({}, 1),
-        ({"compress_ratio": 4}, 4),
-        ({"tokens_per_state": 2, "compress_ratio": 4}, 2),
-    ],
+    "allocation_blocks,expected_stride", [(1, 64), (2, 32), (4, 16)]
 )
-def test_compression_field_fallback(hla, fields, expected):
-    assert (
-        hla.HybridLinearAttentionLayout._tokens_per_state(KVCacheSpec(**fields))
-        == expected
-    )
+def test_allocation_block_count_controls_component_span(
+    hla, allocation_blocks, expected_stride
+):
+    layout = hla.HybridLinearAttentionLayout()
+    layout.num_blocks = 2
+    tensor = FakeTensor(1000, (4, 2, 4), (8, 4, 1))
+    (segment,) = layout._layer_components("mla", tensor, allocation_blocks)
+    assert segment.copy_size == segment.block_stride == expected_stride
+    assert segment.buffer_size == layout.num_blocks * expected_stride
 
 
-def _glm_detection_layout(hla, hf_fields):
-    specs = {
-        "mla": MLAAttentionSpec(tokens_per_state=1),
-        "indexer": MLAAttentionSpec(tokens_per_state=4),
-    }
-    config = SimpleNamespace(
-        kv_cache_tensors=[SimpleNamespace(layers=["mla", "indexer", "state"])],
+def hybrid_config():
+    return SimpleNamespace(
+        kv_cache_tensors=[SimpleNamespace(layers=["mla", "state"])],
         kv_cache_groups=[
-            group(UniformTypeKVCacheSpecs(kv_cache_specs=specs), *specs),
+            group(MLAAttentionSpec(), "mla"),
             group(MambaSpec(mamba_cache_mode="align"), "state"),
         ],
     )
-    layout = hla.HybridLinearAttentionLayout()
-    layout.kv_cache_config = config
-    layout.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(**hf_fields))
-    )
-    return layout
-
-
-@pytest.mark.parametrize(
-    "fields,expected",
-    [
-        ({"architectures": ["Glm5NextForConditionalGeneration"]}, True),
-        ({"architectures": ["OtherModel", "Glm5NextForConditionalGeneration"]}, True),
-        ({"architectures": ["Glm5NextForCausalLM"]}, False),
-        ({"architectures": ["OtherHybridForConditionalGeneration"]}, False),
-        ({"architectures": ["Glm5NextForConditionalGenerationExtra"]}, False),
-        ({"architectures": []}, False),
-        ({"architectures": None}, False),
-        ({}, False),
-    ],
-)
-def test_glm_detection_uses_exact_supported_architecture(hla, fields, expected):
-    layout = _glm_detection_layout(hla, fields)
-    assert layout._has_glm53_layout(layout.kv_cache_config) is expected
-
-
-@pytest.mark.parametrize("tag", [None, "other_model", "glm5_next"])
-def test_similar_structure_and_spec_tags_do_not_override_other_architecture(hla, tag):
-    layout = _glm_detection_layout(
-        hla, {"architectures": ["OtherHybridForConditionalGeneration"]}
-    )
-    specs = layout.kv_cache_config.kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-    for spec in specs.values():
-        spec.model_version = tag
-    assert not layout._has_glm53_layout(layout.kv_cache_config)
 
 
 @pytest.mark.parametrize(
     "device,expected", [("npu", True), ("cuda", True), ("cpu", False)]
 )
-def test_glm_detection_preserves_platform_guard(hla, device, expected):
-    layout = _glm_detection_layout(
-        hla, {"architectures": ["Glm5NextForConditionalGeneration"]}
-    )
+def test_hybrid_detection_preserves_platform_guard(hla, device, expected):
     hla.current_platform.device_type = device
     hla.current_platform.is_cuda_alike = lambda: device == "cuda"
-    assert layout._has_glm53_layout(layout.kv_cache_config) is expected
-
-
-def test_glm_detection_requires_allocations(hla):
-    layout = _glm_detection_layout(
-        hla, {"architectures": ["Glm5NextForConditionalGeneration"]}
+    assert (
+        hla.UCMHybridLinearAttentionConnector.supports_kv_cache_layout(hybrid_config())
+        is expected
     )
-    layout.kv_cache_config.kv_cache_tensors = []
-    assert not layout._has_glm53_layout(layout.kv_cache_config)
-
-
-def test_supported_architecture_selects_ascend_layout(hla):
-    layout = _glm_detection_layout(
-        hla, {"architectures": ["Glm5NextForConditionalGeneration"]}
-    )
-    layout._build_glm53_ascend_layout = MagicMock()
-    caches = {"mla": object()}
-    layout._build_layout(caches)
-    layout._build_glm53_ascend_layout.assert_called_once_with(caches)
-
-
-def test_supported_architecture_explicitly_rejects_cuda(hla):
-    layout = _glm_detection_layout(
-        hla, {"architectures": ["Glm5NextForConditionalGeneration"]}
-    )
-    hla.current_platform.device_type = "cuda"
-    hla.current_platform.is_cuda_alike = lambda: True
-    with pytest.raises(
-        NotImplementedError, match="CUDA KV cache layout is not supported"
-    ):
-        layout._build_layout({})
 
 
 @pytest.mark.parametrize(
-    "architecture", ["OtherHybridForConditionalGeneration", "Glm5NextForCausalLM"]
+    "mutation",
+    [
+        "no_config",
+        "no_allocations",
+        "no_attention",
+        "no_state",
+        "non_aligned_state",
+        "unknown_layers",
+    ],
 )
-def test_other_architectures_keep_generic_cuda_path(hla, architecture):
-    layout = _glm_detection_layout(hla, {"architectures": [architecture]})
-    hla.current_platform.device_type = "cuda"
-    hla.current_platform.is_cuda_alike = lambda: True
-    layout._build_glm53_ascend_layout = MagicMock()
-    # Exercise the generic dispatch branch without requiring physical tensors.
-    layout._collect_shared_tensor_info = MagicMock(return_value=([], []))
-    layout._build_layout({})
-    layout._collect_shared_tensor_info.assert_called_once()
-    layout._build_glm53_ascend_layout.assert_not_called()
+def test_hybrid_detection_requires_allocated_attention_and_aligned_state(hla, mutation):
+    config = hybrid_config()
+    if mutation == "no_config":
+        config = None
+    elif mutation == "no_allocations":
+        config.kv_cache_tensors = []
+    elif mutation == "no_attention":
+        config.kv_cache_groups = config.kv_cache_groups[1:]
+    elif mutation == "no_state":
+        config.kv_cache_groups = config.kv_cache_groups[:1]
+    elif mutation == "non_aligned_state":
+        config.kv_cache_groups[1].kv_cache_spec.mamba_cache_mode = "all"
+    else:
+        config.kv_cache_tensors[0].layers = ["unallocated"]
+    assert not hla.UCMHybridLinearAttentionConnector.supports_kv_cache_layout(config)
+
+
+def test_hybrid_detection_accepts_separate_allocations_and_uniform_specs(hla):
+    config = hybrid_config()
+    config.kv_cache_tensors = [
+        SimpleNamespace(layers=[name]) for name in ["mla", "state"]
+    ]
+    config.kv_cache_groups[0].kv_cache_spec = UniformTypeKVCacheSpecs(
+        kv_cache_specs={"mla": MLAAttentionSpec()}
+    )
+    assert hla.UCMHybridLinearAttentionConnector.supports_kv_cache_layout(config)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Glm5NextForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "OtherHybridForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize(
+    "mode,graph",
+    [
+        ("NONE", "NONE"),
+        ("NONE", "FULL_DECODE_ONLY"),
+        ("NONE", "FULL"),
+        ("VLLM_COMPILE", "NONE"),
+    ],
+)
+def test_layerwise_engine_guard_preserves_required_model_hooks(
+    hla, architecture, mode, graph
+):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        ),
+        compilation_config=SimpleNamespace(
+            mode=SimpleNamespace(name=mode), cudagraph_mode=SimpleNamespace(name=graph)
+        ),
+    )
+    error = (
+        hla.UCMHybridLinearAttentionLayerWiseConnector.layerwise_engine_config_error(
+            config
+        )
+    )
+    requires_hooks = architecture in {
+        "Glm5NextForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+    }
+    if requires_hooks and (mode != "NONE" or graph == "FULL"):
+        assert architecture in error and "requires mode=NONE" in error
+    else:
+        assert error is None
 
 
 def test_empty_rope_is_skipped_before_contiguity_checks(hla):
@@ -371,219 +404,257 @@ def test_empty_rope_is_skipped_before_contiguity_checks(hla):
     layout.num_blocks = 2
     key = FakeTensor(1000, (4, 2, 4), (8, 4, 1))
     rope = FakeTensor(2000, (4, 2, 0), (8, 4, 1))
-    rows = layout._build_glm53_ascend_row(
-        "mla",
-        {"mla": (key, rope)},
-        SimpleNamespace(size=64),
-        KVCacheSpec(page_size_bytes=32),
-    )
-    assert len(rows) == 1
-    segment = rows[0]
+    (segment,) = layout._layer_components("mla", (key, rope), 2)
     assert (
         segment.ptr,
         segment.copy_size,
         segment.block_stride,
         segment.buffer_size,
-    ) == (
-        1000,
+    ) == (1000, 32, 32, 64)
+
+
+def test_padded_state_uses_whole_page_and_registered_span(hla):
+    layout = hla.HybridLinearAttentionLayout()
+    layout.num_blocks = 2
+    (segment,) = layout._layer_components(
+        "state", FakeTensor(1000, (2, 2, 3), (16, 3, 1)), 2
+    )
+    assert (segment.copy_size, segment.block_stride, segment.buffer_size) == (
         32,
         32,
         64,
     )
+    assert segment.block_stride + segment.copy_size <= segment.buffer_size
 
 
-def test_padded_state_copies_only_live_bytes(hla):
+@pytest.mark.parametrize(
+    "shape,strides,allocation_blocks,message",
+    [
+        ((2, 2, 3), (16, 4, 1), 2, "not a dense page"),
+        ((2, 2, 3), (4, 3, 1), 2, "Overlapping KV blocks"),
+        ((3, 2, 3), (8, 3, 1), 2, "do not divide"),
+    ],
+)
+def test_invalid_component_geometry_is_rejected(
+    hla, shape, strides, allocation_blocks, message
+):
     layout = hla.HybridLinearAttentionLayout()
     layout.num_blocks = 2
-    rows = layout._build_glm53_ascend_row(
-        "gdn",
-        {"gdn": FakeTensor(1000, (2, 2, 3), (16, 3, 1))},
-        SimpleNamespace(size=64),
-        KVCacheSpec(page_size_bytes=32),
-    )
-    assert (rows[0].copy_size, rows[0].block_stride, rows[0].buffer_size) == (
-        12,
-        32,
-        44,
-    )
-
-
-def test_nonempty_noncontiguous_view_is_rejected(hla):
-    layout = hla.HybridLinearAttentionLayout()
-    layout.num_blocks = 2
-    with pytest.raises(ValueError, match="Non-contiguous Ascend KV block"):
-        layout._build_glm53_ascend_row(
-            "mla",
-            {"mla": FakeTensor(1000, (2, 2, 3), (16, 4, 1))},
-            SimpleNamespace(size=64),
-            KVCacheSpec(page_size_bytes=32),
+    with pytest.raises(ValueError, match=message):
+        layout._layer_components(
+            "mla", FakeTensor(1000, shape, strides), allocation_blocks
         )
 
 
-@pytest.mark.parametrize("compressed_first", [False, True])
-def test_glm_families_preserve_column_order_and_pad_rows(hla, compressed_first):
-    specs = {
-        "mla0": MLAAttentionSpec(page_size_bytes=16, tokens_per_state=1),
-        "mla1": MLAAttentionSpec(page_size_bytes=16, tokens_per_state=1),
-        "index": MLAAttentionSpec(page_size_bytes=16, tokens_per_state=4),
-    }
-    names = ["index", "mla0", "mla1"] if compressed_first else ["mla0", "index", "mla1"]
-    layout = hla.HybridLinearAttentionLayout()
-    layout.num_blocks = 2
-    layout.kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[
-            group(UniformTypeKVCacheSpecs(kv_cache_specs=specs), *names),
-            group(KVCacheSpec(page_size_bytes=16, prefix_cacheable=False), "tail"),
-            group(MambaSpec(page_size_bytes=16), "gdn"),
-        ],
-        kv_cache_tensors=[
-            SimpleNamespace(layers=[name], size=32, block_stride=16)
-            for name in [*names, "tail", "gdn"]
-        ],
-    )
-
-    def tensor(ptr):
-        return FakeTensor(ptr, (2, 2), (8, 1))
-
-    layout._build_glm53_ascend_layout(
-        {
-            "mla0": tensor(1000),
-            "mla1": tensor(3000),
-            "index": tensor(2000),
-            "gdn": (tensor(5000), tensor(5004)),
-        }
-    )
-    first = [2000, 1000] if compressed_first else [1000, 2000]
-    second = [0, 3000] if compressed_first else [3000, 0]
-    assert layout.base_ptrs.tolist() == [*first, 5000, 5004, *second, 0, 0]
-    assert layout.row_tensor_size_lists == [[4, 4, 4, 4], [4, 4, 4, 4]]
-    assert layout.row_shard_sizes == [16, 16]
-    assert set(layout.group_layouts) == {0, 2}
-    assert layout.preload_all_rows and layout.save_after_forward
-    assert layout.layer_name_to_row["mla1"] == 1
-    assert "tail" not in layout.layer_name_to_row
-    addresses = layout._extract_group_addrs([1, 1], [0, 2])
-    assert addresses[0].tolist() == [
-        first[0] + 16,
-        first[1] + 16,
-        0,
-        0,
-        *[value + 16 if value else 0 for value in second],
-        0,
-        0,
-    ]
-    assert addresses[1].tolist() == [0, 0, 5016, 5020, 0, 0, 0, 0]
-    np.testing.assert_array_equal(
-        layout._extract_group_addrs([1, 1], [0, 2], layout.row_slices[1]),
-        addresses[:, 4:],
-    )
-
-
-def test_group_address_validation_and_empty_batch(hla):
-    layout = hla.HybridLinearAttentionLayout()
-    layout.base_ptrs = np.array([1000], dtype=np.uint64)
-    layout.group_layouts = {0: (layout.base_ptrs, np.array([16], dtype=np.uint64))}
-    with pytest.raises(ValueError, match="lengths differ"):
-        layout._extract_group_addrs([1], [])
-    with pytest.raises(ValueError, match="No hybrid physical layout"):
-        layout._extract_group_addrs([1], [5])
-    empty = layout._extract_group_addrs([], [])
-    assert empty.shape == (0, 1)
-    assert empty.flags.c_contiguous
-
-
 @pytest.fixture
-def save_connector(hla):
-    connector = hla.UCMHybridLinearAttentionLayerWiseConnector()
-    connector._metadata_factory = hla.UCMConnectorMetadata
-    specs = {
-        "attn0": FullAttentionSpec(),
-        "state2": MambaSpec(),
-        "attn3": FullAttentionSpec(),
-        "index4": MLAAttentionSpec(tokens_per_state=4),
-        "state9": MambaSpec(),
-        "attn8": FullAttentionSpec(),
-        "tail100": KVCacheSpec(prefix_cacheable=False),
-    }
-    connector._kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[group(spec, name) for name, spec in specs.items()]
+def page_layout(hla):
+    def build(small_first=False):
+        main = SimpleNamespace(layers=["mla0", "state0"], size=32, block_stride=16)
+        small = SimpleNamespace(layers=["index0"], size=16, block_stride=8)
+        last = SimpleNamespace(
+            layers=["mla1", "state1", "tail"], size=32, block_stride=16
+        )
+        layout = hla.HybridLinearAttentionLayout()
+        layout.num_blocks = 2
+        layout.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                group(FullAttentionSpec(), "mla0", "index0", "mla1"),
+                group(KVCacheSpec(prefix_cacheable=False), "tail"),
+                group(MambaSpec(mamba_cache_mode="align"), "state0", "state1"),
+            ],
+            kv_cache_tensors=(
+                [small, main, last] if small_first else [main, small, last]
+            ),
+        )
+        tensors = {
+            name: FakeTensor(ptr, (2, 2), (stride, 1))
+            for name, ptr, stride in [
+                ("mla0", 1000, 8),
+                ("index0", 2000, 4),
+                ("mla1", 3000, 8),
+                ("state0", 1004, 8),
+                ("state1", 3004, 8),
+                ("tail", 9000, 8),
+            ]
+        }
+        layout._build_layout(tensors)
+        layout.layer_name_to_id = dict(zip(tensors, range(len(tensors))))
+        return layout
+
+    return build
+
+
+@pytest.mark.parametrize("small_first", [False, True])
+def test_page_types_keep_group_ownership_and_null_columns(page_layout, small_first):
+    layout = page_layout(small_first)
+    assert layout.num_slots == 2 and layout.width == 2
+    assert layout.page_types == ([8, 16] if small_first else [16, 8])
+    assert "tail" not in layout.layer_anchors
+    assert layout.group_pairs == {0: {0, 1}, 2: {0, 1}}
+    assert layout.direct_group_bytes == {0: 40, 2: 32}
+    expected = (
+        [[2008, 1016, 0, 3016], [0, 1016, 0, 3016]]
+        if small_first
+        else [[1016, 2008, 3016, 0], [1016, 0, 3016, 0]]
     )
-    connector.kv_cache_layout = SimpleNamespace(save_after_forward=False)
-    connector.layer_name_to_id = {
-        "attn0": 0,
-        "state2": 2,
-        "attn3": 3,
-        "index4": 4,
-        "state9": 9,
-        "attn8": 8,
-        "tail100": 100,
-    }
-    connector.layer_name_to_row = {
-        "attn0": 0,
-        "state2": 0,
-        "attn3": 1,
-        "index4": 1,
-        "state9": 2,
-        "attn8": 3,
-        "tail100": 0,
-    }
-    connector.row_ids = [0, 1, 2, 3]
-    connector.commit_row_id = 3
+    addresses = layout.extract_block_addrs([1, 1], [0, 2])
+    assert addresses.tolist() == expected
+    assert layout.extract_layer_addrs("mla0", [1]).tolist() == [expected[0][:2]]
+    assert layout.extract_layer_addrs("state1", [1]).tolist() == [expected[1][2:]]
+    assert layout.direct_store_config() == (layout.page_types * 2, 48, 48)
+    assert addresses.flags.c_contiguous
+    for row in addresses:
+        for address, size in zip(row, layout.page_types * 2):
+            if address:
+                assert any(
+                    base <= address and address + size <= base + span
+                    for base, span in zip(layout.base_ptrs, layout.buffer_sizes)
+                )
+
+
+def test_group_address_validation_and_empty_batch(page_layout):
+    layout = page_layout()
+    with pytest.raises(ValueError, match="lengths differ"):
+        layout.extract_block_addrs([1], [])
+    assert not layout.extract_block_addrs([1], [5]).any()
+    with pytest.raises(ValueError, match="no per-layer anchors"):
+        layout.extract_layer_addrs("tail", [1])
+    empty = layout.extract_block_addrs([], [])
+    assert empty.shape == (0, 4) and empty.flags.c_contiguous
+
+
+def test_group_packed_descriptors_respect_family_offsets(page_layout):
+    layout = page_layout()
+    layout.kv_cache_config.kv_cache_groups = [
+        group(FullAttentionSpec(), "mla0", "mla1"),
+        group(MambaSpec(mamba_cache_mode="align"), "state0"),
+    ]
+    layout.kv_cache_config.kv_cache_tensors = [
+        SimpleNamespace(
+            layers=["mla0", "state0"], offset=128, layer_stride=64, block_stride=16
+        ),
+        SimpleNamespace(layers=["mla1"], offset=256, layer_stride=64, block_stride=16),
+    ]
+    layout._map_layers_to_slots()
+    assert layout.layer_name_to_slot == {"mla0": 0, "state0": 1, "mla1": 2}
+    layout.kv_cache_config.kv_cache_tensors[1].offset = 257
+    with pytest.raises(ValueError, match="not aligned"):
+        layout._map_layers_to_slots()
+
+
+def transfer_connector(hla):
+    connector = hla.UCMHybridLinearAttentionLayerWiseConnector()
+    connector.load_tasks = defaultdict(dict)
+    connector._load_bytes_by_pair = defaultdict(int)
+    connector.request_data = []
+    connector._failure_req_ids = set()
+    connector._submitted_positions = set()
+    connector._waited_layers = set()
+    connector._dump_tasks = []
+    connector._dumped_layers = set()
+    connector._dumped_group_slots = set()
+    connector._dump_plan = None
+    connector._submitted_group_slots = set()
+    connector._waited_group_slots = set()
+    connector.is_save = False
+    connector._save_bytes_total = 0
+    connector._reset_transfer_state()
+    connector._invalid_block_ids = set()
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=MagicMock())
+    connector.tp_rank, connector.tp_size, connector.is_mla = 0, 1, True
+    connector.store = object()
+    connector.enable_event_sync = False
+    connector._get_dump_event_handle = lambda: None
+    connector.device = SimpleNamespace(synchronize=MagicMock())
     return connector
 
 
-def test_row_saves_wait_for_last_component_and_exclude_commit(save_connector):
-    # index4 cannot be a callback; tail100 must not delay row 0.
-    # state9 has no subsequent callback, so row 2 stays for post-forward.
-    assert save_connector._plan_row_saves() == {"attn3": [0], "attn8": [1]}
-
-
-def test_no_attention_callback_leaves_rows_for_post_forward(save_connector):
-    save_connector._kv_cache_config.kv_cache_groups = [
-        group(MambaSpec(), name) for name in save_connector.layer_name_to_row
-    ]
-    assert save_connector._plan_row_saves() == {}
-
-
-def test_glm_saves_are_all_deferred(save_connector):
-    save_connector.kv_cache_layout.save_after_forward = True
-    assert save_connector._plan_row_saves() == {}
-
-
-@pytest.mark.parametrize("already_saved", [set(), {0, 1}])
-def test_post_forward_backfills_rows_before_commit(save_connector, already_saved):
-    connector = save_connector
-    events = []
-    metadata = connector._metadata_factory(request_meta={})
+@pytest.fixture
+def save_connector(hla, page_layout):
+    connector = transfer_connector(hla)
+    layout = page_layout()
+    connector.kv_cache_layout = layout
+    connector.layer_order = ["mla0", "index0", "state0", "mla1", "state1"]
+    connector.layer_pos = {
+        name: index for index, name in enumerate(connector.layer_order)
+    }
+    connector.layer_to_group = layout.layer_name_to_group
+    connector.layer_to_slot = layout.layer_name_to_slot
+    connector._register_common = lambda _: (layout, None, None)
+    connector._create_store_bound = MagicMock()
+    layout.tensor_size_list = layout.page_types
+    connector.register_kv_caches({})
+    metadata = hla.UCMConnectorMetadata(
+        request_meta={
+            "req": SimpleNamespace(
+                dump_block_ids=([b"attention", b"state"], [1, 1]),
+                dump_group_ids=[0, 2],
+                dump_full_attn_count=1,
+                load_block_ids=([], []),
+            )
+        }
+    )
     connector._connector_metadata = metadata
     connector._get_connector_metadata = lambda: metadata
-    connector._dumped_row_ids = set(already_saved)
-    connector.dump_tasks = {}
-    connector._dump_transfer_data = (None, None, None, {"req"})
-    connector._layerwise_save_bytes = 0
-    connector.is_save = True
-    connector.enable_event_sync = False
     connector._rank_consistency = SimpleNamespace(
-        finish_dump=lambda requests: events.append(("finish", requests))
+        submit_dump=MagicMock(side_effect=range(20)),
+        wait_dump=MagicMock(),
+        finish_dump=MagicMock(),
     )
+    return connector
 
-    def submit(row, meta):
-        assert meta is metadata
-        events.append(("submit", row))
-        connector._dumped_row_ids.add(row)
 
-    connector._submit_dump_row = submit
-    connector._wait_dump_rows = lambda rows: events.append(("wait", rows))
-    connector.wait_for_save()
-    assert events == [
-        *(("submit", row) for row in [0, 1, 2] if row not in already_saved),
-        ("wait", [0, 1, 2]),
-        ("submit", 3),
-        ("wait", [3]),
-        ("finish", {"req"}),
+def test_max_pair_is_deferred_and_partner_hooks_are_deduplicated(save_connector):
+    connector = save_connector
+    assert connector._deferred_dump_layers == {"mla1", "state1"}
+    for name in connector.layer_order:
+        connector.save_kv_layer(name, None, None)
+    calls = connector._rank_consistency.submit_dump.call_args_list
+    assert len(calls) == 2
+    assert [call.args[2:4] for call in calls] == [
+        ([b"attention"], [0]),
+        ([b"state"], [0]),
     ]
-    assert connector._dump_transfer_data is None
-    assert not connector.is_save
+    assert [call.args[4].tolist() for call in calls] == [[[1016, 2008]], [[1016, 0]]]
+
+
+@pytest.mark.parametrize("hooked", [[], ["mla0", "index0"]])
+def test_post_forward_backfills_pairs_before_commit(save_connector, hooked):
+    connector = save_connector
+    events = []
+    connector._rank_consistency.submit_dump.side_effect = lambda *args: events.append(
+        ("submit", args[2], args[3], args[4].tolist())
+    ) or len(events)
+    connector._rank_consistency.wait_dump.side_effect = lambda task: events.append(
+        ("wait", task)
+    )
+    connector._rank_consistency.finish_dump.side_effect = (
+        lambda requests: events.append(("finish", requests))
+    )
+    for name in hooked:
+        connector.save_kv_layer(name, None, None)
+    connector.wait_for_save()
+    assert events[:3] == [
+        ("submit", [b"attention"], [0], [[1016, 2008]]),
+        ("submit", [b"state"], [0], [[1016, 0]]),
+        ("submit", [b"attention", b"state"], [1, 1], [[3016, 0], [3016, 0]]),
+    ]
+    assert events[3:] == [("wait", 1), ("wait", 2), ("wait", 3), ("finish", {"req"})]
+    assert connector._dump_plan is None and not connector._dump_tasks
+    assert not connector.is_save and not connector._dumped_group_slots
+
+
+def test_deferred_load_start_keeps_in_flight_dumps(save_connector):
+    connector = save_connector
+    connector.save_kv_layer("mla0", None, None)
+    pending = list(connector._dump_tasks)
+    plan = connector._dump_plan
+    connector.start_load_kv(SimpleNamespace())
+    assert connector._dump_tasks == pending and connector._dump_plan is plan
+    assert connector._dumped_group_slots == {(0, 0)}
+    connector.wait_for_save()
+    assert connector._rank_consistency.submit_dump.call_count == 3
+    connector._rank_consistency.wait_dump.assert_any_call(pending[0].task)
 
 
 @pytest.mark.parametrize("is_mla", [False, True])
@@ -596,7 +667,7 @@ def test_rank_scoping_keeps_keys_blocks_and_groups_paired(hla, is_mla, rank, is_
     connector.is_mla = is_mla
     connector.request_hasher = lambda key: b"rank1:" + key
     result = connector._scope_blocks([b"mla", b"gdn"], [11, 22], [0, 2], 1, is_dump)
-    selected = [1] if is_mla and rank == 1 and is_dump else [0, 1]
+    selected = [1] if is_mla and rank == 0 and is_dump else [0, 1]
     expected_keys = [b"mla", b"gdn"]
     expected_scoped = [
         b"mla" if is_mla or rank == 0 else b"rank1:mla",
@@ -797,77 +868,135 @@ def test_new_request_restores_only_external_hit_increment(
         state_connector.group_manager.compute_mamba_align_state_hash.assert_not_called()
 
 
-@pytest.mark.parametrize("row_count", [2, 3])
-def test_glm_preload_waits_all_state_rows_before_returning(
-    hla, state_connector, row_count
-):
+def restore_connector(hla, state_connector, state_count):
     dispatch = state_connector._generate_hla_dispatch_meta(
         _restore_request_meta(hla), 1, ([], []), request_id="req"
     )
     metadata = hla.UCMConnectorMetadata(request_meta={"req": dispatch})
-    connector = hla.UCMHybridLinearAttentionLayerWiseConnector()
+    connector = transfer_connector(hla)
+    connector._connector_metadata = metadata
     connector._get_connector_metadata = lambda: metadata
-    connector.tp_rank = 0
-    connector.tp_size = 1
-    connector.is_mla = True
-    connector._scope_blocks = state_connector._scope_blocks
-    state_connector.tp_rank = 0
-    state_connector.tp_size = 1
-    connector.row_ids = list(range(row_count))
-    connector._load_prefetch_rows = 0
-    connector._row_shard_size = 16
-    connector.load_tasks = defaultdict(dict)
-    connector.request_data = []
-    connector._failure_req_ids = set()
-    connector._submitted_load_rows = set()
-    connector._dumped_row_ids = set()
-    connector._load_block_counts = {}
-    connector._invalid_block_ids = set()
-    connector._connector_worker_meta = SimpleNamespace(mark_failed=MagicMock())
-    connector.store = object()
-    events = []
-    memory = {
-        row: {22: b"old-checkpoint", 23: b"old-running", 99: b"scratch"}
-        for row in connector.row_ids
+    names = ["attention", *[f"state{i}" for i in range(state_count)]]
+    connector.layer_order = names
+    connector.layer_pos = {name: i for i, name in enumerate(names)}
+    connector.layer_to_group = {name: int(name != "attention") for name in names}
+    connector.layer_to_slot = {
+        "attention": 0,
+        **{name: i for i, name in enumerate(names[1:])},
     }
-
-    def addresses(blocks, row, group_ids):
-        assert blocks == [11, 12, 22, 23]
-        assert group_ids == [0, 0, 1, 1]
-        return np.array([[block] for block in blocks], dtype=np.uint64)
-
-    connector.kv_cache_layout = SimpleNamespace(
-        preload_all_rows=True, extract_block_addrs_for_row=addresses
+    layout = hla.HybridLinearAttentionLayout()
+    layout.layer_column_bytes = dict.fromkeys(names, 16)
+    layout.extract_layer_addrs = lambda name, blocks: np.asarray(
+        [[block] for block in blocks], dtype=np.uint64
     )
-    connector.device = SimpleNamespace(synchronize=lambda: events.append(("sync",)))
+    connector.kv_cache_layout = layout
+    events, pending = [], []
+    memory = {
+        name: {22: b"old-checkpoint", 23: b"old-running", 99: b"scratch"}
+        for name in names[1:]
+    }
+    connector.device.synchronize.side_effect = lambda: events.append(("sync",))
 
-    def submit(store, requests, keys, shards, ptrs):
-        assert store is connector.store
-        assert requests == {"req": dispatch.load_block_ids[0]}
-        row = shards[0]
-        assert shards == [row] * len(keys)
-        events.append(("submit", row))
-        return SimpleNamespace(row=row, keys=list(keys), blocks=ptrs[:, 0].tolist())
+    def submit(store, requests, keys, shards, pointers):
+        assert store is connector.store and len(set(shards)) == 1
+        assert requests == {"req": keys}
+        name = "attention" if keys[0] == b"fa0" else names[shards[0] + 1]
+        assert pointers[:, 0].tolist() == (
+            [11, 12] if name == "attention" else [22, 23]
+        )
+        task = SimpleNamespace(layer=name, keys=keys, blocks=pointers[:, 0].tolist())
+        pending.append(task)
+        assert len(pending) <= 2
+        events.append(("submit", name))
+        return task
 
     def wait(task):
-        events.append(("wait", task.row))
-        # Fake the external DMA: pre-existing destination contents are
-        # replaced only when this row's load is completed.
-        for key, block in zip(task.keys, task.blocks):
-            if block in memory[task.row]:
-                memory[task.row][block] = key
+        pending.remove(task)
+        events.append(("wait", task.layer))
+        if task.layer in memory:
+            for key, block in zip(task.keys, task.blocks):
+                memory[task.layer][block] = key
 
-    connector._rank_consistency = SimpleNamespace(submit_load=submit, wait_load=wait)
+    connector._rank_consistency = SimpleNamespace(
+        submit_load=MagicMock(side_effect=submit), wait_load=MagicMock(side_effect=wait)
+    )
+    return connector, events, pending, memory
+
+
+@pytest.mark.parametrize("state_count", [2, 3])
+def test_layerwise_restore_waits_for_each_consumer_with_depth_two(
+    hla, state_connector, state_count
+):
+    connector, events, pending, memory = restore_connector(
+        hla, state_connector, state_count
+    )
     connector.start_load_kv(SimpleNamespace())
-    assert events == [
-        ("sync",),
-        *(("submit", row) for row in connector.row_ids),
-        *(("wait", row) for row in connector.row_ids),
-    ]
-    assert not connector.load_tasks
-    assert connector._layerwise_load_bytes == row_count * 4 * 16
-    assert connector._layerwise_load_bytes_recorded
-    # A consumer proceeding after start_load_kv sees both restored slots
-    # for every row, while the unused speculative tail remains untouched.
+    assert events == [("sync",), ("submit", "attention"), ("submit", "state0")]
     for values in memory.values():
-        assert values == {22: b"checkpoint", 23: b"checkpoint", 99: b"scratch"}
+        assert values[22] == b"old-checkpoint" and values[23] == b"old-running"
+    for name in connector.layer_order:
+        connector.wait_for_layer_load(name)
+        if name in memory:
+            assert memory[name] == {
+                22: b"checkpoint",
+                23: b"checkpoint",
+                99: b"scratch",
+            }
+        seen = list(events)
+        connector.wait_for_layer_load(name)
+        assert events == seen
+    assert [
+        name for op, *rest in events if op == "wait" for name in rest
+    ] == connector.layer_order
+    assert not pending and not connector.load_tasks
+    assert connector._load_bytes_total == (state_count + 1) * 2 * 16
+    assert connector._load_bytes_recorded
+    hla.ucmmetrics.update_stats.assert_called_once_with(
+        {"load_bytes_total": connector._load_bytes_total}
+    )
+
+
+@pytest.mark.parametrize("failure", ["submit", "wait"])
+def test_layerwise_load_failure_invalidates_request_and_stops_later_submissions(
+    hla, state_connector, failure
+):
+    connector, _, _, _ = restore_connector(hla, state_connector, 3)
+    rank = connector._rank_consistency
+    if failure == "submit":
+        rank.submit_load.side_effect = RuntimeError("storage unavailable")
+    else:
+        rank.wait_load.side_effect = RuntimeError("read failed")
+    connector.start_load_kv(SimpleNamespace())
+    connector.wait_for_layer_load("attention")
+    count = rank.submit_load.call_count
+    for name in connector.layer_order[1:]:
+        connector.wait_for_layer_load(name)
+    assert rank.submit_load.call_count == count
+    assert connector._failure_req_ids == {"req"}
+    assert connector._invalid_block_ids == {11, 12, 22, 23}
+    connector._connector_worker_meta.mark_failed.assert_called_with("req")
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 5, 7])
+@pytest.mark.parametrize("ranks", [2, 3])
+def test_mla_dump_partition_is_disjoint_and_complete(hla, count, ranks):
+    connector = hla.UCMHybridLinearAttentionConnector()
+    connector.is_mla = True
+    connector.tp_size = ranks
+    keys = [f"mla{i}".encode() for i in range(count)]
+    blocks = list(range(10, 10 + count))
+    assignments = []
+    for rank in range(ranks):
+        connector.tp_rank = rank
+        connector.request_hasher = lambda key: b"private:" + key
+        context, stored, selected, groups = connector._scope_blocks(
+            keys + [b"state"], blocks + [99], [0] * count + [2], count, True
+        )
+        assignments.append(context[:-1])
+        assert stored[:-1] == context[:-1]
+        assert selected[:-1] == [blocks[keys.index(key)] for key in context[:-1]]
+        assert groups == [0] * len(context[:-1]) + [2]
+        assert context[-1] == b"state" and selected[-1] == 99
+        assert stored[-1] == (b"state" if rank == 0 else b"private:state")
+    assert [key for assigned in assignments for key in assigned] == keys
+    assert max(map(len, assignments)) - min(map(len, assignments)) <= 1

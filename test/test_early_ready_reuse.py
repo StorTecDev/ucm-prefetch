@@ -67,7 +67,9 @@ def test_native_worker_hash_identity_without_scheduler_seed(cls):
             parallel_config=SimpleNamespace(tensor_parallel_size=4, data_parallel_index=0, pipeline_parallel_size=1),
             scheduler_config=SimpleNamespace(max_num_seqs=4))
         c._vllm_config = config
-        c.request_hasher = ucm_connector.RequestHasher(config, rank)
+        c.request_hasher = ucm_connector.RequestHasher(
+            ucm_connector.build_kv_hash_meta(config, rank)
+        )
         c.launch_config = {}
         c.is_mla = True
         c.cp_world_size = 1

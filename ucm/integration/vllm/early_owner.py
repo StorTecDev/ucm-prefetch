@@ -53,7 +53,11 @@ def worker_capability(connector):
         # Native workers have no scheduler _seed, and their own RequestHasher
         # includes the worker rank. MLA IDs arrive from the rank-0 scheduler
         # hasher, so fingerprint that same native identity once at handshake.
-        scheduler_hasher = type(connector.request_hasher)(connector._vllm_config, 0)
+        from .ucm_connector import build_kv_hash_meta
+
+        scheduler_hasher = type(connector.request_hasher)(
+            build_kv_hash_meta(connector._vllm_config, 0)
+        )
         layout = [connector.unique_id, native, config["tensor_size_list"],
                   connector.use_layerwise, connector.hash_block_size, connector.blocks_per_chunk,
                   scheduler_hasher("UCM_HASH_SEED").hex()]

@@ -479,10 +479,16 @@ def test_normal_shutdown_uses_acknowledged_drain_instead_of_fencing():
 
 @pytest.mark.parametrize("field,value,ready", [("is_mla", False, False), ("cp_world_size", 2, False),
     ("layer_ids", [0, 2], False), ("is_mla", True, True)])
-def test_worker_capability_checks_actual_native_layout_and_configuration(field, value, ready):
+def test_worker_capability_checks_actual_native_layout_and_configuration(field, value, ready, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        package.__name__ + ".ucm_connector",
+        SimpleNamespace(build_kv_hash_meta=lambda config, rank: str(rank)),
+    )
+
     class Hasher:
-        def __init__(self, config, rank):
-            self.rank = rank
+        def __init__(self, meta):
+            self.rank = int(meta)
 
         def __call__(self, value):
             return bytes([self.rank]) * 16
@@ -493,7 +499,7 @@ def test_worker_capability_checks_actual_native_layout_and_configuration(field, 
                                         tensor_size_list=[4]), domain_info=lambda: info)
     c = SimpleNamespace(store=store, launch_config={}, is_mla=True, cp_world_size=1,
         layer_ids=[0, 1], use_layerwise=True, unique_id="native", hash_block_size=4, block_size=4,
-        blocks_per_chunk=1, request_hasher=Hasher(None, 1), tp_rank=1, tp_size=2,
+        blocks_per_chunk=1, request_hasher=Hasher("1"), tp_rank=1, tp_size=2,
         _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_index=0),
             model_config=SimpleNamespace(max_model_len=32), scheduler_config=SimpleNamespace(max_num_seqs=3)))
     setattr(c, field, value)

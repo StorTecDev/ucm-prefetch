@@ -1,4 +1,4 @@
-"""Early integration with v0.8.0 request hashes and native async completion."""
+"""Early integration with native request namespaces and async completion."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,6 +13,7 @@ from ucm.integration.vllm.ucm_connector import (
     RequestDispatchMeta,
     UCMConnectorMetadata,
     UCMDirectConnector,
+    build_kv_hash_meta,
 )
 from test_early_ready_reuse import Request, connector
 from test_ucm_request_hasher import _config, _mm_feature, _semantic_extra_keys
@@ -28,7 +29,7 @@ def test_background_hash_and_ready_reuse_keep_native_request_semantics(
     connector, monkeypatch, semantics
 ):
     monkeypatch.setattr(hashing, "generate_block_hash_extra_keys", _semantic_extra_keys)
-    connector.request_hasher = hashing.RequestHasher(_config(), 0)
+    connector.request_hasher = hashing.RequestHasher(build_kv_hash_meta(_config(), 0))
     connector._seed = connector.request_hasher.seed
     connector._bind_request_block_hasher()
     native = connector._native_request_block_hasher

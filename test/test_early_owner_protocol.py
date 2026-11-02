@@ -805,10 +805,16 @@ def test_rebound_plan_is_checked_without_losing_partial_completion():
 
 
 @pytest.mark.parametrize("mutation", [None, "native_flag", "physical_size", "consumer_size", "layer_count"])
-def test_whole_block_l1_keeps_logical_layer_consumers_and_physical_budget(mutation):
+def test_whole_block_l1_keeps_logical_layer_consumers_and_physical_budget(mutation, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        package.__name__ + ".ucm_connector",
+        SimpleNamespace(build_kv_hash_meta=lambda config, rank: str(rank)),
+    )
+
     class Hasher:
-        def __init__(self, config, rank):
-            self.rank = rank
+        def __init__(self, meta):
+            self.rank = int(meta)
 
         def __call__(self, value):
             return bytes([self.rank]) * 16
@@ -825,7 +831,7 @@ def test_whole_block_l1_keeps_logical_layer_consumers_and_physical_budget(mutati
     c = SimpleNamespace(store=SimpleNamespace(config=config, domain_info=lambda: info),
         launch_config={}, is_mla=True, cp_world_size=1, layer_ids=list(range(14)),
         use_layerwise=True, unique_id="block-native", hash_block_size=64, block_size=64,
-        blocks_per_chunk=1, request_hasher=Hasher(None, 0), tp_rank=0, tp_size=1,
+        blocks_per_chunk=1, request_hasher=Hasher("0"), tp_rank=0, tp_size=1,
         _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_index=0),
             model_config=SimpleNamespace(max_model_len=40000)))
     if mutation == "native_flag":

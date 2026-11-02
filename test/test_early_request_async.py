@@ -44,6 +44,7 @@ def constructor_config(monkeypatch):
         cache_config=SimpleNamespace(block_size=16),
         scheduler_config=SimpleNamespace(),
         model_config=SimpleNamespace(
+            model="unit-model",
             is_deepseek_mla=True,
             dtype=torch.float16,
             hf_config=SimpleNamespace(),

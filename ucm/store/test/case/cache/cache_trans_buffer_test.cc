@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <chrono>
+#include <filesystem>
 #include <gtest/gtest.h>
 #include "cache/cc/trans_buffer.h"
 #include "detail/random.h"
@@ -206,6 +208,39 @@ TEST(UCCacheTransBufferSharedTest, SharesFailureAcrossMappings)
     ASSERT_FALSE(waiter.Owner());
     ASSERT_EQ(waiter.GetState(), TransBuffer::State::FAILED);
     ASSERT_EQ(waiter.FailureStatus(), UC::Status::NotFound());
+}
+
+TEST(UCCacheTransBufferSharedTest, WatcherPreservesOtherActiveDomain)
+{
+    namespace fs = std::filesystem;
+    using UC::CacheStore::TransBuffer;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::Config config;
+    config.uniqueId = rd.RandomString(20);
+    config.shardSize = 4096;
+    config.bufferCapacity = config.shardSize * 16;
+    config.shareBufferEnable = true;
+    config.deviceId = 0;
+    config.loadExclusiveBufferNumber = 0;
+    TransBuffer worker;
+    ASSERT_EQ(worker.Setup(config), UC::Status::OK());
+
+    auto otherConfig = config;
+    otherConfig.uniqueId = rd.RandomString(20);
+    TransBuffer otherWorker;
+    ASSERT_EQ(otherWorker.Setup(otherConfig), UC::Status::OK());
+    const auto otherPath = fs::path("/dev/shm") / ("uc_shm_cache_" + otherConfig.uniqueId);
+    // mmap traffic does not refresh mtime, so an old file may still serve a live worker.
+    fs::last_write_time(otherPath, fs::file_time_type::clock::now() - std::chrono::hours(1));
+
+    config.deviceId = -1;
+    TransBuffer watcher;
+    ASSERT_EQ(watcher.Setup(config), UC::Status::OK());
+    ASSERT_TRUE(fs::exists(otherPath));
+
+    otherConfig.deviceId = -1;
+    TransBuffer otherWatcher;
+    ASSERT_EQ(otherWatcher.Setup(otherConfig), UC::Status::OK());
 }
 
 TEST_P(UCCacheTransBufferTest, GetReservedNode)

@@ -7,6 +7,7 @@ set_target_properties(Ascend::ascendcl PROPERTIES
 add_library(trans STATIC
     ascend_device.cc
     ascend_buffer.cc
+    ascend_host_registration.cc
     ascend_event.cc
     ascend_stream.cc
 )

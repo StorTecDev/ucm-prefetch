@@ -54,6 +54,8 @@ struct Config {
     size_t bufferCapacity{256ULL << 30};
     size_t loadExclusiveBufferNumber{1024};
     bool shareBufferEnable{true};
+    std::string cacheHostMemoryMode{"default"};
+    bool cachePinAllowPageableFallback{false};
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};
@@ -70,6 +72,9 @@ struct Config {
     bool cacheIOAggregation{false};
     bool cacheSdmaDirect{UCM_RUNTIME_ASCEND_SDMA_DIRECT};
     size_t localRankSize{8};
+
+    std::string EffectiveHostMemoryMode() const;
+    Status ValidateHostMemory() const;
 
     size_t EffectiveStreamNumber() const noexcept { return cacheSdmaDirect ? 1 : streamNumber; }
 };

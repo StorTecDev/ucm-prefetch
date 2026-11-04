@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "trans_buffer.h"
+#include "host_registration.h"
 #include "buffer_release_event.h"
 #include <atomic>
 #include <filesystem>
@@ -338,6 +339,9 @@ protected:
     void* addrress_{nullptr};
     size_t totalSize_{0};
     bool ownsShm_{false};
+    HostRegistration registration_;
+    std::string hostMemoryMode_;
+    bool allowPageableFallback_{false};
 
     size_t AccessedOffset() const noexcept
     {
@@ -514,24 +518,37 @@ protected:
             UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
             return s;
         }
-        const auto dataSize = DataSize();
-        s = Trans::Buffer::RegisterHostBuffer((void*)data_, dataSize, (void**)&dataOnDevice_);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to register buffer({}) to device({}).", s, dataSize, deviceId);
+        const auto mode = hostMemoryMode_ == "pin_only" ? HostMemoryMode::PinOnly
+                          : hostMemoryMode_ == "pageable" ? HostMemoryMode::Pageable
+                                                          : HostMemoryMode::Mapped;
+        s = registration_.Setup(data_, DataSize(), mode, allowPageableFallback_);
+        if (s.Failure()) {
+            UC_ERROR("Failed({}) to register shared host buffer in mode({}).", s, hostMemoryMode_);
             return s;
+        }
+        dataOnDevice_ = static_cast<std::byte*>(registration_.DevicePointer());
+        if (registration_.RegistrationStatus().Failure()) {
+            UC_WARN("Pin-only registration failed({}); using explicitly allowed pageable fallback.",
+                    registration_.RegistrationStatus());
+        } else {
+            UC_INFO("Shared host buffer mode={}, registered={}.", hostMemoryMode_,
+                    registration_.Registered());
         }
         return Status::OK();
     }
 
 public:
     SharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
-                         size_t totalSize, size_t reservedNumber, size_t layers = 0, uint64_t layoutTag = 0)
-        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber, layers, layoutTag), uuid_(uuid)
+                         size_t totalSize, size_t reservedNumber, size_t layers = 0,
+                         uint64_t layoutTag = 0, std::string hostMemoryMode = "mapped",
+                         bool allowPageableFallback = false)
+        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber, layers, layoutTag), uuid_(uuid),
+          hostMemoryMode_(std::move(hostMemoryMode)), allowPageableFallback_(allowPageableFallback)
     {
     }
     ~SharedBufferStrategy() override
     {
-        if (data_) { Trans::Buffer::UnregisterHostBuffer(data_); }
+        registration_.Reset();
         if (addrress_) { PosixShm::MUnmap(addrress_, totalSize_); }
         if (!base_.layerCount || ownsShm_) { PosixShm{shmName_}.ShmUnlink(); }
     }
@@ -590,7 +607,10 @@ public:
         accessed_[iNode].store(1, std::memory_order_relaxed);
     }
     void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
-    void* DeviceDataAt(size_t iNode) override { return dataOnDevice_ + nodeSize_ * iNode; }
+    void* DeviceDataAt(size_t iNode) override
+    {
+        return dataOnDevice_ ? dataOnDevice_ + nodeSize_ * iNode : nullptr;
+    }
     BufferMetaNode* MetaAt(size_t iNode) override { return meta_ + iNode; }
     BlockFillState* FillAt(size_t iNode) override
     { return reinterpret_cast<BlockFillState*>(static_cast<std::byte*>(addrress_) + FillOffset()) + iNode; }
@@ -658,6 +678,8 @@ public:
 
 Status TransBuffer::Setup(const Config& config)
 {
+    auto hostMemoryStatus = config.ValidateHostMemory();
+    if (hostMemoryStatus.Failure()) { return hostMemoryStatus; }
     bypassHitOnLoad_ = config.cacheLoadBackendOnly;
     wholeBlock_ = config.cacheFullBlockL1;
     size_t nodeBytes = config.shardSize;
@@ -690,7 +712,8 @@ Status TransBuffer::Setup(const Config& config)
         } else if (config.deviceId >= 0) {
             strategy_ = std::make_shared<SharedBufferStrategy>(
                 config.uniqueId, config.deviceId, nodeBytes, config.bufferCapacity,
-                config.loadExclusiveBufferNumber, layerOffsets_.size(), layoutTag);
+                config.loadExclusiveBufferNumber, layerOffsets_.size(), layoutTag,
+                config.EffectiveHostMemoryMode(), config.cachePinAllowPageableFallback);
         } else {
             strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId, wholeBlock_);
         }

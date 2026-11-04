@@ -249,3 +249,24 @@ lease 和写入提交语义保持不变。
 过小的上限可能降低纯写吞吐，应同时评估端到端延迟、写入积压和排空耗时及读取
 吞吐。`test/write_window_probe.cc` 覆盖并发上限、读取绕过、补充及排空、失败和
 取消、公平性以及关闭时的 FIFO 行为。
+
+### 共享主机内存注册
+
+共享 L1 缓冲区支持以下配置：
+
+| 配置项 | 默认值 | 含义 |
+| --- | --- | --- |
+| cache_host_memory_mode | default | 可选 default、pageable、pin_only；显式模式要求 share_buffer_enable=true。 |
+| cache_pin_allow_pageable_fallback | false | 仅允许 pin_only 注册失败后继续使用 pageable 内存，并输出警告。 |
+
+default 在 ascend-a5 构建中保留共享缓冲区的 pageable 行为，其他运行时保留映射注册。
+pin_only 调用 aclrtHostRegisterV2，仅传 ACL_HOST_REG_PINNED，不申请设备地址别名。
+SDK 不支持该接口时明确失败。注册成功并不保证实际异步 DMA 或带宽提升。
+
+pageable 和 pin_only 使用普通主机指针拷贝，拒绝依赖设备映射地址的 GDR、
+I/O 聚合和直接 SDMA 配置。未显式开启回退时，注册失败会终止初始化。
+仅在注册成功后注销，并在解除共享内存映射之前完成注销。
+
+回退配置为 cache_host_memory_mode=default、
+cache_pin_allow_pageable_fallback=false。本实现包含 A5 的可配置默认行为；
+不要再次叠加无条件跳过共享缓冲区注册的外部补丁，否则会同时跳过 pin_only。

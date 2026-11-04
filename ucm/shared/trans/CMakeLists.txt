@@ -10,6 +10,9 @@ endif()
 if(RUNTIME_ENVIRONMENT STREQUAL "simu")
     add_subdirectory(simu)
 endif()
+if(NOT UCM_RUNTIME_ASCEND_FAMILY)
+    target_sources(trans PRIVATE host_registration.cc)
+endif()
 if(NOT RUNTIME_ENVIRONMENT STREQUAL "cuda")
     target_sources(trans PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda/gdr/gdr_mr_buffer.cc

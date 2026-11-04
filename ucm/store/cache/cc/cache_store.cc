@@ -199,6 +199,8 @@ private:
         config.Get("cpu_affinity_cores", param.cpuAffinityCores);
         if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
         config.Get("share_buffer_enable", param.shareBufferEnable);
+        config.Get("cache_host_memory_mode", param.cacheHostMemoryMode);
+        config.Get("cache_pin_allow_pageable_fallback", param.cachePinAllowPageableFallback);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
         config.Get("use_dpc", param.useDpc);
@@ -235,6 +237,8 @@ private:
     Status CheckConfig(const Config& config)
     {
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
+        auto hostMemoryStatus = config.ValidateHostMemory();
+        if (hostMemoryStatus.Failure()) { return hostMemoryStatus; }
 #if !UCM_RUNTIME_ASCEND_IO_AGGREGATION
         // Validate the requested value before role-specific setup. Masking it in
         // ParseConfig hides incompatible options from both schedulers and workers.
@@ -363,6 +367,10 @@ private:
         UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
         UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
+        UC_INFO("Set {}::HostMemoryMode to {} (configured={}).", ns,
+                config.EffectiveHostMemoryMode(), config.cacheHostMemoryMode);
+        UC_INFO("Set {}::PinAllowPageableFallback to {}.", ns,
+                config.cachePinAllowPageableFallback);
         UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
         UC_INFO("Set {}::CacheFullBlockDump to {}.", ns, config.cacheFullBlockDump);
         UC_INFO("Set {}::CacheDumpReservedBlocks to {}.", ns, config.cacheDumpReservedBlocks);

@@ -41,3 +41,7 @@ if(BUILD_UNIT_TESTS)
     target_link_libraries(ucmstore.test PRIVATE delegator delegator_store)
     gtest_discover_tests(ucmstore.test)
 endif()
+
+if(BUILD_UNIT_TESTS AND RUNTIME_ENVIRONMENT STREQUAL "simu")
+    target_compile_definitions(ucmstore.test PRIVATE UCM_HOST_REGISTRATION_SIMU_TEST)
+endif()

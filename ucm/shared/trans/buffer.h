@@ -51,6 +51,8 @@ public:
     virtual std::shared_ptr<void> MakeDeviceMappedHostBuffer(size_t size) = 0;
 
     static Status RegisterHostBuffer(void* host, size_t size, void** pDevice = nullptr);
+    // Pinning for copies must not change the device-mapping API contract.
+    static Status PinHostBuffer(void* host, size_t size);
     static Status GetHostDevicePointer(void* host, void** pDevice);
     static void UnregisterHostBuffer(void* host);
 };

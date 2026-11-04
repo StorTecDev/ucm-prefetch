@@ -773,3 +773,64 @@ TEST_F(UCPosixStoreTest, AioPartialSubmissionFailureStillDrainsAcceptedOperation
     EXPECT_EQ(syscall(SYS_io_submit, ctx, 1, &cb), 1);
     EXPECT_EQ(wait.get(), UC::Status::Timeout());
 }
+
+namespace {
+class OpenModeTrace {
+public:
+    std::atomic<size_t> reads{0};
+    std::atomic<size_t> writes{0};
+    std::atomic<bool> wrongMode{false};
+    explicit OpenModeTrace(bool direct)
+    {
+        UC::PosixStore::TestHooks::SetOpenHook(
+            [this, direct](const std::string& path, int32_t flags, mode_t mode) {
+                if (bool(flags & O_DIRECT) != direct) { wrongMode.store(true); }
+                if ((flags & O_ACCMODE) == O_RDONLY) { ++reads; }
+                else { ++writes; }
+                return ::open(path.c_str(), flags, mode);
+            });
+    }
+    ~OpenModeTrace() { UC::PosixStore::TestHooks::ClearOpenHook(); }
+};
+
+void CheckFileOpenMode(const std::string& path, bool direct)
+{
+    auto config = direct ? MakeAioConfig(path, 5000) : MakePsyncConfig(path);
+    config.Set("io_direct", direct);
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, 4096, 3 * AIO_TEST_DATA_SIZE), 0);
+    BufferPtr memory(allocation, &std::free);
+    auto* source = static_cast<char*>(allocation) + (direct ? 0 : 1);
+    auto* destination = source + AIO_TEST_DATA_SIZE;
+    std::memset(source, 0x3e, AIO_TEST_DATA_SIZE);
+    std::memset(destination, 0xa5, AIO_TEST_DATA_SIZE);
+    OpenModeTrace trace(direct);
+    UC::PosixStore::PosixStore store;
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    auto dump = store.Dump(MakeDumpDesc("OpenMode", block, source));
+    ASSERT_TRUE(dump.HasValue());
+    auto status = store.Wait(dump.Value());
+    EXPECT_FALSE(trace.wrongMode.load());
+    ASSERT_EQ(status, UC::Status::OK());
+    auto load = store.Load(MakeDumpDesc("OpenMode", block, destination));
+    ASSERT_TRUE(load.HasValue());
+    ASSERT_EQ(store.Wait(load.Value()), UC::Status::OK());
+    EXPECT_FALSE(trace.wrongMode.load());
+    if (direct) {
+        EXPECT_GE(trace.reads.load(), size_t{1});
+        EXPECT_GE(trace.writes.load(), size_t{1});
+    }
+    EXPECT_EQ(std::memcmp(source, destination, AIO_TEST_DATA_SIZE), 0);
+}
+}  // namespace
+
+TEST_F(UCPosixStoreTest, PsyncHonorsBufferedIoWithUnalignedBuffers)
+{
+    CheckFileOpenMode(Path(), false);
+}
+
+TEST_F(UCPosixStoreTest, AioRetainsDirectIoWithAlignedBuffers)
+{
+    CheckFileOpenMode(Path(), true);
+}

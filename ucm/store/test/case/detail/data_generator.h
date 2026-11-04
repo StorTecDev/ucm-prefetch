@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace UC::Test::Detail {
 
@@ -46,8 +47,10 @@ public:
     }
     void Generate()
     {
-        this->data_ = malloc(this->Size());
-        assert(this->data_ != nullptr);
+        // Direct I/O fixtures must not depend on the allocator's incidental alignment.
+        void* data = nullptr;
+        if (posix_memalign(&data, 4096, this->Size()) != 0) { throw std::bad_alloc(); }
+        this->data_ = data;
     }
     void GenerateRandom()
     {

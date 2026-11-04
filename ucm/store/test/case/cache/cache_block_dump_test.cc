@@ -8,6 +8,7 @@
 #include "cache/cc/block_dump_queue.h"
 #include "cache/cc/buffer_manager.h"
 #include "detail/mock_store.h"
+#include "detail/data_generator.h"
 #include "detail/path_base.h"
 #include "posix/cc/aio_impl.h"
 #include "posix/cc/space_layout.h"
@@ -108,7 +109,7 @@ protected:
         config.SetNumber("posix_lookup_concurrency", 1);
         config.SetNumber("posix_write_inflight_limit", 1);
         config.Set("posix_io_engine", std::string{"aio"});
-        config.Set("io_direct", false);
+        config.Set("io_direct", true);
         sizes.assign(layers, kBytes);
         if (packed) {
             std::vector<ssize_t> lengths(layers);
@@ -126,7 +127,7 @@ protected:
         cache.loadExclusiveBufferNumber = 0;
         cache.shareBufferEnable = shared;
         cache.localRankSize = 1;
-        cache.ioDirect = false;
+        cache.ioDirect = true;
         cache.streamNumber = 1;
         cache.cacheFullBlockL1 = cache.cacheFullBlockLoad = cache.cacheFullBlockDump = true;
         cache.cacheDumpReservedBlocks = budget;
@@ -166,16 +167,17 @@ protected:
         ASSERT_EQ(hit.Value(), 0);
         size_t bytes = 0;
         for (auto length : sizes) { bytes += length; }
-        std::vector<char> result(bytes);
+        UC::Test::Detail::DataGenerator result{1, bytes};
+        result.Generate();
         Detail::TaskDesc load;
         load.fullBlockRead = true;
-        load.push_back({id, 0, {result.data()}});
+        load.push_back({id, 0, {result.Buffer()}});
         auto task = backend->Load(std::move(load));
         ASSERT_TRUE(task);
         ASSERT_EQ(backend->Wait(task.Value()), Status::OK());
         size_t offset = 0;
         for (size_t i = 0; i < sizes.size(); ++i) {
-            EXPECT_EQ(std::memcmp(result.data() + offset, source[i].data(), sizes[i]), 0);
+            EXPECT_EQ(std::memcmp(static_cast<char*>(result.Buffer()) + offset, source[i].data(), sizes[i]), 0);
             offset += sizes[i];
         }
     }
@@ -375,7 +377,7 @@ TEST_F(UCCacheBlockDumpTest, FactoryRoutesWriteCompletionWithoutChangingReadEntr
     config.SetNumber("cache_load_exclusive_buffer_number", 0);
     config.SetNumber("cache_stream_number", 1);
     config.Set("share_buffer_enable", false);
-    config.Set("io_direct", false);
+    config.Set("io_direct", true);
     config.Set("cache_full_block_load", true);
     config.Set("cache_full_block_l1", true);
     config.Set("cache_full_block_dump", true);
@@ -488,7 +490,7 @@ Detail::Dictionary IoAggregationConfig(StoreV1* backend, int32_t device)
     config.SetNumber("cache_buffer_capacity_gb", 1);
     config.SetNumber("cache_load_exclusive_buffer_number", 0);
     config.SetNumber("cache_stream_number", 1);
-    config.Set("io_direct", false);
+    config.Set("io_direct", true);
     config.Set("cache_sdma_direct", false);
     return config;
 }

@@ -173,3 +173,16 @@ for policy details and the boundary between mocked transfers and real scheduling
 Keep generated build files, logs, environment inventories, and benchmark outputs
 outside tracked source. Documentation examples should use relative paths or
 explicit placeholders rather than personal filesystem locations.
+
+## Direct I/O fixture alignment
+
+The AIO backend requires `io_direct=true`. Whole-block dump fixtures use that
+contract for both the cache allocator and backend; readback buffers are explicitly
+aligned. `DataGenerator` also uses page-aligned allocation so direct I/O tests do
+not depend on the heap layout or on a filesystem accepting unaligned requests.
+
+`DataGeneratorAlignment.SupportsDirectIoIndependentOfHeapLayout` keeps multiple
+allocations alive to exercise allocator alignment. The POSIX store regressions
+check that buffered PSync accepts unaligned buffers, while AIO retains
+`O_DIRECT` and round-trips aligned data. Existing whole-block tests retain their
+byte comparisons and error-recovery assertions.

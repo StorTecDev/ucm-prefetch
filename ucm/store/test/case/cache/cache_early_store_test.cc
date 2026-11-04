@@ -1526,3 +1526,29 @@ TEST(UCCacheEarlyStoreTest, UnsafePartialCutoffDrainsIoBeforeReturningSlots)
     EXPECT_FALSE(r.batch->Step(0));
     EXPECT_TRUE(buffer->TryGet(blocks[5], 0));
 }
+
+TEST(UCCacheEarlyStoreTest, StagingConfigAcceptsNumericBufferSize)
+{
+    Backend backend;
+    for (auto factory : {MakeCacheStore, MakeEarlyCacheStore}) {
+        auto config = Config(&backend);
+        config.Set("share_buffer_enable", true);
+        config.Set("cache_host_memory_mode", std::string("staged"));
+        config.SetNumber("cache_staging_buffer_bytes", 8 * 1024 * 1024);
+        std::unique_ptr<UC::StoreV1> store(factory());
+        EXPECT_TRUE(store->Setup(config).Success());
+    }
+}
+
+TEST(UCCacheEarlyStoreTest, StagingConfigRejectsZeroNumericBufferSize)
+{
+    Backend backend;
+    for (auto factory : {MakeCacheStore, MakeEarlyCacheStore}) {
+        auto config = Config(&backend);
+        config.Set("share_buffer_enable", true);
+        config.Set("cache_host_memory_mode", std::string("staged"));
+        config.SetNumber("cache_staging_buffer_bytes", 0);
+        std::unique_ptr<UC::StoreV1> store(factory());
+        EXPECT_TRUE(store->Setup(config).Failure());
+    }
+}

@@ -377,7 +377,7 @@ before DMA; D2H copies completed slices back into shared L1 before synchronizati
 returns successfully. Ghost slots and padding are not copied as data.
 Unlike the ordinary transfer mode, this adds a CPU copy in each direction.
 
-cache_staging_buffer_bytes is a positive byte limit **per stream, per active
+cache_staging_buffer_bytes is a positive integer byte limit **per stream, per active
 transfer queue**, defaulting to 8 MiB. It is separate from shared L1 capacity.
 Total pinned allocation is the sum of stream_count * staging_bytes over all
 active load/dump queues in every worker process. At four streams the default is

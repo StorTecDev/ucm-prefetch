@@ -200,7 +200,7 @@ private:
         if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
         config.Get("share_buffer_enable", param.shareBufferEnable);
         config.Get("cache_host_memory_mode", param.cacheHostMemoryMode);
-        config.Get("cache_staging_buffer_bytes", param.cacheStagingBufferBytes);
+        config.GetNumber("cache_staging_buffer_bytes", param.cacheStagingBufferBytes);
         config.Get("cache_pin_allow_pageable_fallback", param.cachePinAllowPageableFallback);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);

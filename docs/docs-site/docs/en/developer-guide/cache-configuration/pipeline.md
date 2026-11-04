@@ -336,7 +336,7 @@ The cache supports explicit registration modes for shared L1 buffers:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| cache_host_memory_mode | default | Select default, pageable, or pin_only. Explicit modes require share_buffer_enable=true. |
+| cache_host_memory_mode | default | Select default, pageable, pin_only, or staged. Explicit modes require share_buffer_enable=true. |
 | cache_pin_allow_pageable_fallback | false | Allow failed pin_only registration to continue with pageable memory, with a warning. |
 
 The default mode preserves pageable shared buffers for ascend-a5 builds and mapped
@@ -354,3 +354,52 @@ To roll back the opt-in, use cache_host_memory_mode=default and
 cache_pin_allow_pageable_fallback=false. The configurable A5 default replaces any
 external patch that unconditionally bypasses shared-buffer registration; applying
 that patch again would bypass the pin-only opt-in as well.
+
+### Bounded pinned host staging
+
+Set these keys in the existing cache connector configuration to opt in:
+
+~~~yaml
+share_buffer_enable: true
+cache_host_memory_mode: staged
+cache_staging_buffer_bytes: 8388608
+cache_pin_allow_pageable_fallback: false
+use_gdr: false
+cache_io_aggregation: false
+cache_sdma_direct: false
+~~~
+
+This mode preserves shared L1 storage, ownership, tensor offsets and layer-ready
+states. Shared L1 itself is not registered with the accelerator. Each transfer
+stream owns a reusable private host arena allocated through the runtime's host
+allocator (aclrtMallocHost on Ascend). H2D copies active slices into that arena
+before DMA; D2H copies completed slices back into shared L1 before synchronization
+returns successfully. Ghost slots and padding are not copied as data.
+Unlike the ordinary transfer mode, this adds a CPU copy in each direction.
+
+cache_staging_buffer_bytes is a positive byte limit **per stream, per active
+transfer queue**, defaulting to 8 MiB. It is separate from shared L1 capacity.
+Total pinned allocation is the sum of stream_count * staging_bytes over all
+active load/dump queues in every worker process. At four streams the default is
+32 MiB per queue. Each stream also has a fixed limit of 256 deferred writebacks.
+When either limit is reached, that stream is drained before reusing its arena;
+a slice larger than the arena is split. No whole-device synchronization is used.
+
+Allocation, submission or completion errors fail explicitly; this mode never
+silently falls back to pageable transfers. A submission/completion failure
+poisons the affected copy queue and discards deferred CPU writebacks. Destruction
+attempts to drain DMA without accessing released queue destinations. If DMA
+completion still cannot be confirmed, the arena and stream are retained until
+process exit rather than freed while the device may still access them.
+
+This is an optional alternative transfer path, not a driver repair or a bandwidth
+guarantee. Measure CPU copying, stream/pool waits and completed end-to-end transfer
+latency under the target tensor layout and concurrency. A small contiguous DMA
+benchmark alone does not establish a production speedup. Restore
+cache_host_memory_mode: default to disable staging when restarting workers.
+
+CPU coverage is in ucm/store/test/case/cache/cache_staged_copy_test.cc.
+With a simulation build and unit tests enabled, run CTest with
+-R 'StagedCopy|StagingConfig'. Tests cover deferred DMA, arena reuse, large slices,
+ghost layouts, partial submissions, failed synchronization, shutdown, multiple
+streams, and cross-process shared-cache visibility. They do not validate accelerator behavior.

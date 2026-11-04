@@ -62,6 +62,7 @@ private:
     std::vector<size_t> tensorSizes_{};
     size_t nShardPerBlock_{0};
     size_t streamNumber_{1};
+    size_t stagingBufferBytes_{0};
     bool useGdr_{false};
     bool cacheIOAggregation_{false};
     bool fullBlockLoad_{false};

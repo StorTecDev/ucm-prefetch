@@ -256,7 +256,7 @@ lease 和写入提交语义保持不变。
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
-| cache_host_memory_mode | default | 可选 default、pageable、pin_only；显式模式要求 share_buffer_enable=true。 |
+| cache_host_memory_mode | default | 可选 default、pageable、pin_only、staged；显式模式要求 share_buffer_enable=true。 |
 | cache_pin_allow_pageable_fallback | false | 仅允许 pin_only 注册失败后继续使用 pageable 内存，并输出警告。 |
 
 default 在 ascend-a5 构建中保留共享缓冲区的 pageable 行为，其他运行时保留映射注册。
@@ -270,3 +270,44 @@ I/O 聚合和直接 SDMA 配置。未显式开启回退时，注册失败会终�
 回退配置为 cache_host_memory_mode=default、
 cache_pin_allow_pageable_fallback=false。本实现包含 A5 的可配置默认行为；
 不要再次叠加无条件跳过共享缓冲区注册的外部补丁，否则会同时跳过 pin_only。
+
+### 有界锁页主机中转
+
+在已有缓存连接器配置中显式启用：
+
+~~~yaml
+share_buffer_enable: true
+cache_host_memory_mode: staged
+cache_staging_buffer_bytes: 8388608
+cache_pin_allow_pageable_fallback: false
+use_gdr: false
+cache_io_aggregation: false
+cache_sdma_direct: false
+~~~
+
+该模式保留共享 L1、所有权、张量偏移和层就绪状态，共享 L1 本身不再向加速器注册。
+每条传输流使用运行时主机分配器创建可复用的私有中转区（Ascend 为 aclrtMallocHost）。
+H2D 先将有效片段复制到中转区，再提交 DMA；D2H 等 DMA 完成后复制回共享 L1，
+CPU 写回完成才允许同步成功返回。ghost 槽和 padding 不作为有效数据复制。
+相较普通传输模式，每个方向都会增加一次 CPU 复制。
+
+cache_staging_buffer_bytes 为**每条流、每个活跃传输队列**的正数字节上限，默认 8 MiB，
+独立于共享 L1 容量。总锁页内存为所有 worker 进程、活跃 load/dump 队列的
+流数乘以中转字节数之和；四条流时默认每队列 32 MiB。
+每条流最多保留 256 个待写回片段。字节或片段额度用尽时，等待所属流完成后复用；
+大于中转区的片段会被拆分，不使用全设备同步。
+
+分配、提交或完成失败会明确报错，不会静默退回 pageable 传输。
+提交或同步失败后，该复制队列停止接收新的成功传输，并丢弃待执行的 CPU 写回。
+析构会尝试排空 DMA，但不会访问可能已经释放的队列目标。
+若仍无法确认 DMA 已结束，保留中转区及流直到进程退出，避免设备访问已释放内存。
+
+这是可选的替代传输路径，不表示修复驱动，也不保证性能收益。
+需按实际张量布局及并发计入 CPU 复制、流或中转区等待和端到端完成耗时；
+小块连续 DMA 微测试不足以证明生产吞吐提升。
+重启 worker 时设置 cache_host_memory_mode: default 可关闭中转。
+
+CPU 测试位于 ucm/store/test/case/cache/cache_staged_copy_test.cc。
+在启用单元测试的模拟构建中使用 CTest 参数 -R 'StagedCopy|StagingConfig'，
+覆盖延迟 DMA、复用、大片段、ghost 布局、部分提交失败、同步失败、退出清理、
+多流和跨进程共享缓存可见性；这些测试不验证加速器运行时行为。

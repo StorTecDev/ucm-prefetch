@@ -22,11 +22,13 @@
  * SOFTWARE.
  * */
 #include "global_config.h"
+#include <limits>
 
 namespace UC::CacheStore {
 
 std::string Config::EffectiveHostMemoryMode() const
 {
+    if (cacheHostMemoryMode == "staged") { return "pageable"; }
     if (cacheHostMemoryMode != "default") { return cacheHostMemoryMode; }
 #if defined(UCM_ASCEND_PAGEABLE_SHARED_L1)
     if (shareBufferEnable) { return "pageable"; }
@@ -37,8 +39,8 @@ std::string Config::EffectiveHostMemoryMode() const
 Status Config::ValidateHostMemory() const
 {
     if (cacheHostMemoryMode != "default" && cacheHostMemoryMode != "pageable" &&
-        cacheHostMemoryMode != "pin_only") {
-        return Status::InvalidParam("cache_host_memory_mode must be default, pageable or pin_only");
+        cacheHostMemoryMode != "pin_only" && cacheHostMemoryMode != "staged") {
+        return Status::InvalidParam("cache_host_memory_mode must be default, pageable, pin_only or staged");
     }
     if (cacheHostMemoryMode != "default" && !shareBufferEnable) {
         return Status::InvalidParam("cache_host_memory_mode requires share_buffer_enable");
@@ -46,10 +48,15 @@ Status Config::ValidateHostMemory() const
     if (cachePinAllowPageableFallback && cacheHostMemoryMode != "pin_only") {
         return Status::InvalidParam("cache_pin_allow_pageable_fallback requires pin_only");
     }
+    if (cacheHostMemoryMode == "staged" &&
+        (cacheStagingBufferBytes == 0 || streamNumber == 0 ||
+         streamNumber > std::numeric_limits<size_t>::max() / cacheStagingBufferBytes)) {
+        return Status::InvalidParam("invalid per-stream staging capacity or stream count");
+    }
     if (shareBufferEnable && EffectiveHostMemoryMode() != "mapped" &&
         (useGdr || cacheIOAggregation || cacheSdmaDirect)) {
         return Status::InvalidParam(
-            "pageable and pin_only shared buffers require ordinary host-pointer copies");
+            "non-mapped shared buffers require ordinary host-pointer copies");
     }
     return Status::OK();
 }

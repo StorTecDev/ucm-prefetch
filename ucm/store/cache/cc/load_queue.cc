@@ -44,6 +44,7 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     tensorSizes_ = config.tensorSizes;
     nShardPerBlock_ = config.blockSize / config.shardSize;
     streamNumber_ = config.EffectiveStreamNumber();
+    stagingBufferBytes_ = config.EffectiveStagingBytes();
     useGdr_ = config.useGdr;
     cacheIOAggregation_ = config.cacheIOAggregation;
     fullBlockLoad_ = config.cacheFullBlockLoad;
@@ -203,7 +204,7 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
     } else if (cacheSdmaDirect_) {
         s = stream.SetupSdmaDirect(deviceId_, useGdr_);
     } else {
-        s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+        s = stream.Setup(deviceId_, streamNumber_, useGdr_, stagingBufferBytes_);
     }
     started.set_value(s);
     if (s.Failure()) [[unlikely]] { return; }

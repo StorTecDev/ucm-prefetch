@@ -46,6 +46,7 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     deviceId_ = config.deviceId;
     tensorSizes_ = config.tensorSizes;
     streamNumber_ = config.EffectiveStreamNumber();
+    stagingBufferBytes_ = config.EffectiveStagingBytes();
     useGdr_ = config.useGdr;
     cacheIOAggregation_ = config.cacheIOAggregation;
     cacheSdmaDirect_ = config.cacheSdmaDirect;
@@ -83,7 +84,7 @@ void DumpQueue::DispatchStage(std::promise<Status>& started)
     } else if (cacheSdmaDirect_) {
         s = stream.SetupSdmaDirect(deviceId_, useGdr_);
     } else {
-        s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+        s = stream.Setup(deviceId_, streamNumber_, useGdr_, stagingBufferBytes_);
     }
     started.set_value(s);
     if (s.Failure()) [[unlikely]] { return; }

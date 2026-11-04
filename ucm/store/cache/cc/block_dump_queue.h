@@ -314,7 +314,8 @@ private:
     void Run(std::promise<Status>& started)
     {
         CopyStream stream;
-        auto status = stream.Setup(config_.deviceId, config_.EffectiveStreamNumber(), false);
+        auto status = stream.Setup(config_.deviceId, config_.EffectiveStreamNumber(), false,
+                                   config_.EffectiveStagingBytes());
         started.set_value(status);
         if (status.Failure()) { return; }
         if (WaitForCapacity()) { RunWaiting(stream); }

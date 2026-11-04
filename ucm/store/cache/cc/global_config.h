@@ -56,6 +56,7 @@ struct Config {
     bool shareBufferEnable{true};
     std::string cacheHostMemoryMode{"default"};
     bool cachePinAllowPageableFallback{false};
+    size_t cacheStagingBufferBytes{8ULL << 20};
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};
@@ -75,6 +76,10 @@ struct Config {
 
     std::string EffectiveHostMemoryMode() const;
     Status ValidateHostMemory() const;
+    size_t EffectiveStagingBytes() const noexcept
+    {
+        return cacheHostMemoryMode == "staged" ? cacheStagingBufferBytes : 0;
+    }
 
     size_t EffectiveStreamNumber() const noexcept { return cacheSdmaDirect ? 1 : streamNumber; }
 };

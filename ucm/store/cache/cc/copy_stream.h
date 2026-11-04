@@ -30,6 +30,7 @@
 #include "logger/logger.h"
 #include "status/status.h"
 #include "trans/device.h"
+#include "staged_copy.h"
 
 namespace UC::CacheStore {
 
@@ -38,19 +39,37 @@ class CopyStream {
     size_t streamNumber_{0};
     size_t streamIndex_{0};
     std::vector<std::shared_ptr<Trans::Stream>> streams_;
+    std::vector<std::unique_ptr<StagedCopy>> staged_;
+
+    Status CancelStaged(Status status) noexcept
+    {
+        for (auto& copy : staged_) { copy->Cancel(status); }
+        // A failed queue task can release its handles immediately after return.
+        // Drop every deferred writeback before draining any remaining stream.
+        for (auto& copy : staged_) { (void)copy->Synchronize(); }
+        return status;
+    }
 
 public:
-    Status Setup(const int32_t deviceId, const size_t streamNumber, const bool useGdr)
+    Status Setup(const int32_t deviceId, const size_t streamNumber, const bool useGdr,
+                 const size_t stagingBytes = 0)
     {
         if (streamNumber == 0) { return Status::InvalidParam("invalid stream number"); }
+        if (stagingBytes && useGdr) {
+            return Status::InvalidParam("staging requires ordinary host-pointer copies");
+        }
         Trans::Device device;
         auto s = device.Setup(deviceId);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
             return s;
         }
+        staged_.clear();
         streams_.clear();
         streams_.reserve(streamNumber);
+        staged_.reserve(stagingBytes ? streamNumber : 0);
+        auto allocator = stagingBytes ? device.MakeBuffer() : nullptr;
+        if (stagingBytes && !allocator) { return Status::OutOfMemory(); }
         for (size_t i = 0; i < streamNumber; ++i) {
             std::shared_ptr<Trans::Stream> stream;
             if (useGdr) {
@@ -61,6 +80,11 @@ public:
             if (!stream) [[unlikely]] {
                 UC_ERROR("Failed to make stream on device({}).", deviceId);
                 return Status::Error();
+            }
+            if (stagingBytes) {
+                auto arena = allocator->MakeHostBuffer(stagingBytes);
+                if (!arena) { return Status::OutOfMemory(); }
+                staged_.push_back(std::make_unique<StagedCopy>(stream, std::move(arena), stagingBytes));
             }
             streams_.push_back(std::move(stream));
         }
@@ -86,6 +110,7 @@ public:
             UC_ERROR("Failed to make cache IO aggregation stream on device({}).", deviceId);
             return Status::Error();
         }
+        staged_.clear();
         streams_.clear();
         streams_.push_back(std::move(stream));
         deviceId_ = deviceId;
@@ -105,6 +130,7 @@ public:
             UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
             return s;
         }
+        staged_.clear();
         streams_.clear();
         auto stream = device.MakeSdmaDirectStream();
         if (!stream) [[unlikely]] {
@@ -132,15 +158,21 @@ public:
     }
     Status HostToDeviceAsync(void* host, void** device, const std::vector<size_t>& sizes) noexcept
     {
+        const auto index = streamIndex_;
         auto stream = NextStream();
         if (!stream) [[unlikely]] { return Status::Error("copy stream is not setup"); }
-        return stream->HostToDeviceAsync(host, device, sizes);
+        if (staged_.empty()) { return stream->HostToDeviceAsync(host, device, sizes); }
+        auto status = staged_[index]->Copy(host, device, sizes, true);
+        return status.Success() ? status : CancelStaged(status);
     }
     Status DeviceToHostAsync(void** device, void* host, const std::vector<size_t>& sizes) noexcept
     {
+        const auto index = streamIndex_;
         auto stream = NextStream();
         if (!stream) [[unlikely]] { return Status::Error("copy stream is not setup"); }
-        return stream->DeviceToHostAsync(device, host, sizes);
+        if (staged_.empty()) { return stream->DeviceToHostAsync(device, host, sizes); }
+        auto status = staged_[index]->Copy(host, device, sizes, false);
+        return status.Success() ? status : CancelStaged(status);
     }
     Status WaitEvent(const Trans::Event& event) noexcept
     {
@@ -156,12 +188,13 @@ public:
     Status Synchronize() noexcept
     {
         auto status = Status::OK();
-        for (auto& stream : streams_) {
-            auto s = stream->Synchronized();
+        for (size_t i = 0; i < streams_.size(); ++i) {
+            auto s = staged_.empty() ? streams_[i]->Synchronized() : staged_[i]->Synchronize();
             if (s.Success()) { continue; }
             UC_ERROR("Failed({}) to synchronize stream on device({}).", s, deviceId_);
             if (status.Success()) { status = s; }
         }
+        if (status.Failure() && !staged_.empty()) { return CancelStaged(status); }
         return status;
     }
 };

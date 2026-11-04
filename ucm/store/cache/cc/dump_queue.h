@@ -57,6 +57,7 @@ private:
     int32_t deviceId_{-1};
     std::vector<size_t> tensorSizes_{};
     size_t streamNumber_{1};
+    size_t stagingBufferBytes_{0};
     bool useGdr_{false};
     bool cacheIOAggregation_{false};
     bool cacheSdmaDirect_{false};

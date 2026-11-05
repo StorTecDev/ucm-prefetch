@@ -9,14 +9,39 @@ The two boolean options below live at the UCM YAML root, alongside
   configurations. An explicit `false` disables PENDING admission even when READY
   preference is on.
 
-To optimize only PENDING batch assembly while disabling READY preference:
+To allow mixed READY/PENDING compute batches, use worker HRRN for prefetch
+loading, and disable READY ordering by estimated uncached computation:
 
 ```yaml
 enable_early_prefetch: true
+early_prefetch_request_first: false
 early_ready_priority: false
 early_pending_hrrn: true
 use_layerwise: true
 ```
+
+These switches control different stages:
+
+- `early_prefetch_request_first: false` selects whole-request HRRN in the
+  prefetch worker for L2-to-L1 reads. `true` selects the oldest eligible request.
+- `early_pending_hrrn: true` permits eligible PENDING requests to enter compute
+  batches and selects them by HRRN. Despite its name, this is not the worker
+  HRRN switch. It installs the admission adapter even with READY preference off.
+- `early_ready_priority: false` disables READY promotion, uncached-suffix
+  ordering and READY bypass fairness. Non-PENDING positions retain native order;
+  READY requests are not gathered ahead of every PENDING request.
+
+To disable mixed compute batches while retaining worker HRRN and native queue
+order, change only `early_pending_hrrn` to `false` in this configuration. Both
+admission options are then off; an already adapted process delegates to the
+original native scheduler for this connector. This does not disable unrelated
+UCM runtime hooks. Apply the YAML at the UCM root and restart all engine members.
+
+Worker HRRN and PENDING admission HRRN both use queue age and a service-work
+estimate. Turning off READY computation ordering does not remove the work term
+from HRRN: `R = 1 + W / max(S, minimum_work)` is not shortest-work-first.
+`test/test_early_hrrn_modes.py` verifies the combined configuration, worker HRRN
+with mixed admission on or off, native READY positions, and stable PENDING gates.
 
 | READY option | PENDING option | Admission policy |
 |---|---|---|

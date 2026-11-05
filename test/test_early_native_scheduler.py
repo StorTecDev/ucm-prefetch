@@ -4,6 +4,7 @@ Run with the locked vLLM source's test helpers on PYTHONPATH. A tiny local
 config is created by the fixture; no model weights or network are needed.
 """
 
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -321,7 +322,7 @@ def test_rejected_request_releases_encoder_references_before_backfill(
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_ready_batch_backfills_closest_pending_prefixes(
+def test_ready_batch_backfills_highest_hrrn_pending_prefixes(
     connector, scheduler_factory, async_scheduling
 ):
     scheduler = scheduler_factory(max_num_seqs=4, max_num_batched_tokens=8192,
@@ -329,16 +330,18 @@ def test_ready_batch_backfills_closest_pending_prefixes(
     requests = requests_of_sizes(*([8192] * 5))
     adapter = attach(connector, scheduler, requests,
                      ("PENDING", "READY", "PENDING", "READY", "PENDING"), [48] * 5)
-    for index, work in ((0, 4), (2, 1), (4, 8)):
+    now = time.monotonic()
+    for index, work, age in ((0, 4, 100), (2, 1, 1), (4, 8, 20)):
         job = connector._early.jobs[requests[index].request_id]
         job.pending_hit, job.remaining_l2_work = 48, work
+        job.entered = now - age
     output = scheduler.schedule()
-    assert list(output.num_scheduled_tokens) == ["1", "3", "2", "0"]
+    assert list(output.num_scheduled_tokens) == ["1", "3", "0", "4"]
     assert output.total_num_scheduled_tokens == 8192
     assert len(scheduler.running) == 4
-    assert connector._early.jobs["2"].state == "PENDING"
+    assert connector._early.jobs["0"].state == "PENDING"
     assert [call.args[0].request_id for call in
-            adapter.get_num_new_matched_tokens.call_args_list] == ["1", "3", "2", "0"]
+            adapter.get_num_new_matched_tokens.call_args_list] == ["1", "3", "0", "4"]
     connector.store.store_.LookupOnPrefix.assert_not_called()
 
 
@@ -350,11 +353,13 @@ def test_all_pending_backfill_respects_switch_and_native_budgets(
     requests = requests_of_sizes(8192, 8192, 8192)
     attach(connector, scheduler, requests, ["PENDING"] * 3, [48] * 3,
            ready_priority=enabled)
-    for index, work in enumerate((8, 2, 1)):
+    now = time.monotonic()
+    for index, (work, age) in enumerate(((8, 200), (2, 20), (1, 1))):
         job = connector._early.jobs[str(index)]
         job.pending_hit, job.remaining_l2_work = 48, work
+        job.entered = now - age
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == ({"2": 2048, "1": 2048} if enabled else {})
+    assert output.num_scheduled_tokens == ({"0": 2048, "1": 2048} if enabled else {})
     assert output.total_num_scheduled_tokens <= 4096
     assert len(scheduler.running) <= 2
     connector.store.store_.LookupOnPrefix.assert_not_called()

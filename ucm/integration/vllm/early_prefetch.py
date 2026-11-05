@@ -13,6 +13,7 @@ import weakref
 
 from .early_control import Control
 from .early_errors import EarlyLookupUnavailable
+from .early_scheduling import hrrn_ratio
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ class Job:
     external_tokens: int | None = None
     pending_hit: int | None = None
     remaining_l2_work: int | None = None
+    # Admission age survives progress notifications and owner retries.
+    entered: float = field(default_factory=time.monotonic)
 
     @property
     def loadable(self):
@@ -817,7 +820,7 @@ class EarlyWorker:
             last = job.batches[-1] if job.batches else None
             known = last.begin + last.reservation["total_hit_blocks"] if last else 0
             work += max(len(job.blocks) - known, 0) * self.block_bytes
-        return 1 + (now - job.entered) / max(work, self.shard_bytes)
+        return hrrn_ratio(job.entered, now, work, self.shard_bytes)
 
     def _choose(self):
         # Condition held; batch boundaries are execution details, not new

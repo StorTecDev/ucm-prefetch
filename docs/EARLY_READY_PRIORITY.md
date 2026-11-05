@@ -149,9 +149,18 @@ external hits. Each unfinished native batch must have exhausted submission and
 must not be waiting for capacity or truncating an incomplete tail. Completed
 batches can contribute their final protected prefix.
 
-Among eligible PENDING requests, fewer remaining L2 shards ranks first. This is
-remaining work, not an estimated completion time or a percentage. Equal-work
-ties retain original queue order. Cache-saving READY ordering is
+Among eligible PENDING requests, the highest HRRN response ratio ranks first:
+`R = 1 + W / max(S, 1)`. `W` is elapsed monotonic time since the logical Early
+request entered PENDING; `S` is its current service-work estimate in L2 shards.
+This shares the worker's HRRN formula, which uses byte work units. A common
+byte/shard scale does not change ordering within one connector. Service work is
+an estimate inside HRRN, never a separate ascending sort key. For example,
+`W=100, S=8` gives 13.5 and precedes `W=1, S=1`, whose ratio is 2.
+
+Queue age survives progress notifications and owner retries. Each admission pass
+freezes one time snapshot for all candidates. Equal HRRN scores retain original
+queue order, without a hidden work or rejection-order tie-breaker.
+Cache-saving READY ordering is
 unchanged, including existing fairness attempts for other requests. Zero-hit
 READY requests are tried before PENDING and fallback requests. An aged
 PENDING request still follows READY. Progress is sent only when its hit/work

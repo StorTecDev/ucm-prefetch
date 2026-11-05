@@ -139,13 +139,20 @@ def test_scheduler_ignores_progress_from_previous_owner_generation():
     assert job.matched_hit == 4
 
 
-def test_pending_ranking_follows_ready_and_uses_remaining_work_with_stable_ties():
+@pytest.mark.parametrize("limit,expected", [
+    (5, [3, 0, 1, 2, 4]), (2, [3, 0])
+])
+def test_pending_hrrn_prefers_older_work_and_keeps_equal_score_queue_order(
+    monkeypatch, limit, expected
+):
     module = __import__(early.__package__ + ".early_scheduling", fromlist=["WaitingPass"])
     policy = module.ReadyPriority({"early_ready_priority": True})
     requests = [type("Request", (), {"num_tokens": 1024, "arrival_time": 0})() for _ in range(5)]
     jobs = [early.Job(request, [], ()) for request in requests]
     for job, work in zip(jobs, [8, 2, 2, 0, 1]):
         job.pending_hit, job.remaining_l2_work = 4, work
+    for job, entered in zip(jobs, (0, 90, 90, 0, 0)):
+        job.entered = entered
     jobs[3].state, jobs[3].hit = "READY", 4
     jobs[4].pending_hit = None
     service = type("Early", (), {})()
@@ -155,11 +162,15 @@ def test_pending_ranking_follows_ready_and_uses_remaining_work_with_stable_ties(
     scheduler = type("Scheduler", (), {"waiting": requests, "policy": "fcfs"})()
     policy.bypasses[requests[0]] = policy.max_bypasses
     policy.last_rejection[requests[1]] = 1
+    policy.max_candidates = limit
+    monotonic = Mock(return_value=100)
+    monkeypatch.setattr(module.time, "monotonic", monotonic)
     waiting = module.WaitingPass(scheduler, service)
     waiting._prepare()
     assert [candidate.request for candidate in waiting.remaining] == [
-        requests[3], requests[1], requests[2], requests[0], requests[4]
+        requests[index] for index in expected
     ]
+    monotonic.assert_called_once_with()
 
 
 def test_published_pending_failure_stops_submission_without_releasing_pins():
@@ -192,3 +203,18 @@ def test_worker_publishes_pending_while_reads_are_still_in_flight(worker):
         assert worker.jobs["pending"].ready
     finally:
         gate.set()
+
+
+def test_owner_retry_and_progress_preserve_pending_hrrn_age():
+    scheduler = object.__new__(early.EarlyScheduler)
+    scheduler.lock = threading.RLock()
+    request = type("Request", (), {})()
+    job = early.Job(request, [], (), key="job", entered=10)
+    job.pending_hit, job.remaining_l2_work = 4, 8
+    scheduler.by_key = {job.key: job}
+    scheduler.receive(dict(op="owner_assigned", key=job.key, owner="w0.0",
+                           attempt="retry", grant=1))
+    assert job.entered == 10 and job.pending_hit is None
+    scheduler.receive(dict(op="progress", key=job.key, attempt="retry", grant=1,
+                           hit=4, remaining_l2_work=2))
+    assert job.entered == 10 and job.remaining_l2_work == 2

@@ -8,8 +8,24 @@ import functools
 import heapq
 import inspect
 import textwrap
+import time
 import weakref
 from dataclasses import dataclass
+
+
+def hrrn_ratio(entered, now, work, minimum_work):
+    """Compute HRRN from queue age and a consistent service-work estimate.
+
+    Args:
+        entered: Monotonic enqueue time of the logical request.
+        now: Monotonic time shared by candidates in the scheduling round.
+        work: Estimated service work in the caller's common work units.
+        minimum_work: Positive floor in the same units, including drained work.
+
+    Returns:
+        A response ratio where larger values receive priority.
+    """
+    return 1 + (now - entered) / max(work, minimum_work)
 
 
 class ReadyPriority:
@@ -52,6 +68,7 @@ class WaitingPass:
         self.candidates = None
         self.remaining = None
         self.selected = None
+        self.now = None
         self.attempted = set()
         self.admissions = []
         self.admitted_requests = set()
@@ -72,9 +89,10 @@ class WaitingPass:
         if job is not None and job.state == "PENDING" and not job.dispatched:
             pending_hit = getattr(job, "pending_hit", None)
             if pending_hit is not None:
-                # Only pinned, stable prefixes are eligible; the worker keeps
-                # reading them while native per-layer/direct waits guard use.
-                return (2, 1, job.remaining_l2_work, 0, 0, candidate.order)
+                # Queue age can outweigh a smaller service estimate. Progress
+                # updates never reset the age of the logical pending request.
+                ratio = hrrn_ratio(job.entered, self.now, job.remaining_l2_work, 1)
+                return (2, 1, -ratio, 0, 0, candidate.order)
         if age_due:
             return (0, arrival, 0, 0, 0, candidate.order)
         if saved:
@@ -93,6 +111,8 @@ class WaitingPass:
         return (3, rejected, 0, candidate.order, 0, candidate.order)
 
     def _prepare(self):
+        # One time snapshot keeps equal-score ties independent of scan order.
+        self.now = time.monotonic()
         self.policy.round += 1
         queues = [self.scheduler.waiting]
         skipped = getattr(self.scheduler, "skipped_waiting", None)

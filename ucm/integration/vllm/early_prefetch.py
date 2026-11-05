@@ -13,7 +13,7 @@ import weakref
 
 from .early_control import Control
 from .early_errors import EarlyLookupUnavailable
-from .early_scheduling import hrrn_ratio
+from .early_scheduling import ReadyPriority, hrrn_ratio
 
 log = logging.getLogger(__name__)
 
@@ -69,8 +69,6 @@ class EarlyScheduler:
         self.sequence = 0
         self.owner_domain_active = False
         launch = getattr(connector, "launch_config", {})
-        from .early_scheduling import ReadyPriority
-
         self.scheduling = ReadyPriority(launch)
         admission_limits = {}
         for name, default in (
@@ -434,8 +432,9 @@ class EarlyWorker:
         self.preparing = []
         self.selected = []
         self.hrrn_requests = []
-        self.pending_backfill = getattr(connector, "launch_config", {}).get(
-            "early_ready_priority", False)
+        self.pending_backfill = ReadyPriority(
+            getattr(connector, "launch_config", {})
+        ).pending_enabled
         self.request_first = getattr(connector, "launch_config", {}).get(
             "early_prefetch_request_first", False)
         if type(self.request_first) is not bool:

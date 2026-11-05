@@ -218,3 +218,29 @@ def test_owner_retry_and_progress_preserve_pending_hrrn_age():
     scheduler.receive(dict(op="progress", key=job.key, attempt="retry", grant=1,
                            hit=4, remaining_l2_work=2))
     assert job.entered == 10 and job.remaining_l2_work == 2
+
+
+@pytest.mark.parametrize("ready,flag,expected", [
+    (False, True, True), (True, False, False), (True, None, True),
+    (False, None, False),
+])
+def test_worker_pending_publication_has_independent_switch(ready, flag, expected):
+    from test_early_batch_pipeline import Control
+
+    store = Mock()
+    store.domain_info.return_value = dict(block_bytes=1, shard_bytes=1)
+    config = {"early_ready_priority": ready}
+    if flag is not None:
+        config["early_pending_hrrn"] = flag
+    connector = SimpleNamespace(
+        store=store, launch_config=config, use_request_async_load=False,
+        tp_rank=0, tp_size=8, is_mla=True, unique_id="pending-switch-unit",
+        request_hasher=Mock(),
+        _vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_index=0)),
+    )
+    instance = early.EarlyWorker(connector, Control)
+    try:
+        assert instance.pending_backfill is expected
+    finally:
+        instance.close()
+    assert not instance.data_thread.is_alive()

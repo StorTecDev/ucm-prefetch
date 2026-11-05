@@ -1,21 +1,61 @@
 # Early READY/PENDING admission in vLLM
 
-`early_ready_priority` is a boolean at the UCM YAML root and defaults to `false`.
-With the default, Early uses the original native waiting-queue admission order,
-including native FCFS/request priorities and stopping conditions after an HBM
-allocation refusal. Set it to `true` to enable the READY admission policy below:
+The two boolean options below live at the UCM YAML root, alongside
+`enable_early_prefetch`, not inside `ucm_connector_config`.
+
+- `early_ready_priority` defaults to `false` and controls READY preference.
+- `early_pending_hrrn` independently controls PENDING admission and HRRN selection.
+  If omitted, it inherits `early_ready_priority` for compatibility with existing
+  configurations. An explicit `false` disables PENDING admission even when READY
+  preference is on.
+
+To optimize only PENDING batch assembly while disabling READY preference:
 
 ```yaml
 enable_early_prefetch: true
-early_ready_priority: true
+early_ready_priority: false
+early_pending_hrrn: true
+use_layerwise: true
 ```
 
-Omitting the option or setting `early_ready_priority: false` selects native order.
-Restart the engine after changing it. Both EarlyDirectConnector and
-EarlyLayerWiseConnector support the switch on vLLM 0.28.0 and 0.30.0, including their native
-Scheduler and AsyncScheduler. The switch changes waiting admission only; Early
-prefetch, PENDING/READY/FAILED handling, request-level HRRN loading and owner
-resource lifetimes remain active in either mode.
+| READY option | PENDING option | Admission policy |
+|---|---|---|
+| false | omitted / false | Original native queue and PENDING gate |
+| false | true | Native non-PENDING order; HRRN in eligible PENDING slots |
+| true | omitted / true | READY preference followed by HRRN PENDING backfill |
+| true | false | READY preference with the original PENDING gate |
+
+Both EarlyDirectConnector and EarlyLayerWiseConnector support these options on
+native vLLM 0.28.0 and 0.30.0 Scheduler/AsyncScheduler. Restart all engine members
+after changing them. Early prefetch, worker HRRN and owner resource lifetimes
+remain active independently of these admission switches. Non-boolean values,
+including strings such as `"true"`, are rejected.
+
+## PENDING-only admission
+
+With READY preference off, FCFS retains skipped-waiting then waiting order.
+PRIORITY uses the native comparison of the two queue heads, including
+skipped-first ties. The pass preserves every non-PENDING candidate position and
+replaces only eligible PENDING positions with the highest HRRN candidates from
+the complete waiting pool. It never promotes READY or applies READY bypass
+fairness. For example, native `[PENDING_A, READY_B, PENDING_C]` can become
+`[PENDING_C, READY_B, PENDING_A]` when C has the higher HRRN.
+
+`early_ready_max_candidates` remains the shared attempt cap (default 64), even
+in PENDING-only mode; it does not enable READY preference. The first bounded
+native candidate window determines how many PENDING slots are available. The
+whole eligible PENDING pool competes for those slots. Non-PENDING requests keep
+their native per-request refusal/stop behavior; an optimized PENDING refusal may
+yield to the next selected candidate with native rollback preserved. A pass does
+not extend beyond the cap, so it can leave unused budget when that window cannot
+fill a batch. Global token, running-slot and prefill-deferral exits stay native.
+
+`test/test_early_pending_switch.py` covers independent options, inherited defaults,
+explicit disable, native FCFS/PRIORITY ordering, cross-queue PENDING selection,
+bounded scans, non-PENDING stopping, PENDING refusal backfill and both scheduler
+modes. Worker publication uses the same PENDING option as the scheduler.
+
+## READY preference
 
 When explicitly enabled, Early requests with a protected, nonzero cache prefix receive an opportunity to
 enter HBM before failed requests consume the native fallback budget. This policy
@@ -43,8 +83,9 @@ particular TTFT.
   candidates exhaust every bounded scan, a smaller fallback candidate outside
   that class can remain unvisited. This boundary is deferred from the current scope.
 
-Both limits take effect only with `early_ready_priority: true`; their types and
-ranges are still validated when it is false. Non-boolean switch values, including
+The candidate limit applies when either option is active; the bypass limit
+applies only with `early_ready_priority: true`. Their types and ranges are
+validated in either mode. Non-boolean switch values, including
 strings such as `"false"`, are rejected.
 
 Both settings are positive integers at the YAML root. Original request arrival
@@ -60,9 +101,9 @@ queue until a later pass; it does not lose its native priority or queue membersh
 
 ## Implementation boundary
 
-Disabled connectors do not install the adapter. Because installation patches a
+Connectors with both options disabled do not install the adapter. Because installation patches a
 shared scheduler class, an already patched method also checks each connector's
-switch and calls the original native method for disabled instances. Enabled and
+active options and calls the original native method for disabled instances. Enabled and
 disabled instances can therefore coexist without sharing admission policy.
 
 The adapter transforms the verified waiting-loop selection and per-request exit
@@ -135,11 +176,10 @@ lifetime and simulated transfers. These checks do not certify accelerator timing
 
 ## PENDING backfill
 
-With `early_ready_priority: true`, a pass tries the existing READY candidates
-first, then fills remaining native token and running-slot budgets with PENDING
-requests. For example, two READY requests can share a four-request batch with
-two PENDING requests. A pass with no READY candidates can also admit PENDING.
-The default/disabled mode retains its original PENDING gate and native order.
+With `early_pending_hrrn` enabled, stable, still-loading PENDING requests can
+enter a batch, including a pass with no READY candidates. READY preference, when
+separately enabled, tries READY first; PENDING-only mode follows the slot rules
+above. Disabling both options retains native order and the original gate.
 
 A PENDING request is eligible only after lookup has finished, the hit prefix is
 stable, and every shard of that prefix has acquired its native cache reference.

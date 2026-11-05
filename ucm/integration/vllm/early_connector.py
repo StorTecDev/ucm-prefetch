@@ -145,7 +145,7 @@ class _EarlyConnectorMixin:
                     )
                 hbm_only = True
         if (job is not None and job.state == "PENDING" and not (
-                getattr(getattr(self._early, "scheduling", None), "enabled", False)
+                getattr(getattr(self._early, "scheduling", None), "pending_enabled", False)
                 and job.loadable)):
             job.pending_probes += 1
             if job.first_pending_ns is None:

@@ -31,6 +31,13 @@ after changing them. Early prefetch, worker HRRN and owner resource lifetimes
 remain active independently of these admission switches. Non-boolean values,
 including strings such as `"true"`, are rejected.
 
+Ascend may export a `BalanceScheduler` wrapper even with DP balancing disabled.
+For its verified disabled fast path, admission adapts the original native base
+method and preserves the wrapper. Active balance scheduling, a changed delegation
+path, or an unknown base class is rejected; no balance option is silently disabled.
+The CPU regressions in `test/test_early_ascend_scheduler.py` cover delegation and
+fail-closed compatibility checks.
+
 ## PENDING-only admission
 
 With READY preference off, FCFS retains skipped-waiting then waiting order.

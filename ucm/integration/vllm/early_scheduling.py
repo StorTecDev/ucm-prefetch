@@ -373,12 +373,57 @@ def patch_scheduler_class(scheduler_class):
     scheduler_class.schedule = schedule
 
 
-def install_scheduler_policy(config, launch_config):
+def _native_admission_scheduler(scheduler_class, vllm_config):
+    """Resolve a verified Ascend pass-through to the native admission method.
+
+    Args:
+        scheduler_class: Scheduler exported by the installed vLLM module.
+        vllm_config: Full configuration used to resolve Ascend balance settings.
+
+    Returns:
+        The native class whose admission loop must be adapted.
+
+    Raises:
+        ValueError: An Ascend wrapper enables balance or changes its fast path.
+    """
+    if (scheduler_class.__module__, scheduler_class.__name__) != (
+        "vllm_ascend.patch.platform.patch_balance_schedule", "BalanceScheduler"
+    ):
+        return scheduler_class
+
+    from vllm_ascend.patch.platform.patch_balance_schedule import (
+        _balance_scheduling_enabled,
+    )
+
+    if vllm_config is None or _balance_scheduling_enabled(vllm_config):
+        raise ValueError("Early admission requires Ascend balance scheduling disabled")
+    bases = scheduler_class.__bases__
+    if len(bases) != 1 or (bases[0].__module__, bases[0].__name__) != (
+        "vllm.v1.core.sched.scheduler", "Scheduler"
+    ):
+        raise ValueError("unrecognized Ascend balance scheduler base")
+    method = scheduler_class.__dict__.get("schedule")
+    if method is None:
+        raise ValueError("unrecognized Ascend balance scheduler fast path")
+    function = ast.parse(textwrap.dedent(inspect.getsource(method))).body[0]
+    expected = ast.parse(
+        "if not self._balance_enabled:\n"
+        "    return super().schedule(throttle_prefills)"
+    ).body[0]
+    if not function.body or ast.dump(function.body[0]) != ast.dump(expected):
+        raise ValueError("unrecognized Ascend balance scheduler fast path")
+    # Adapting the wrapper would lose its __class__ closure and miss the
+    # disabled branch's delegation. Preserve it and adapt the actual callee.
+    return bases[0]
+
+
+def install_scheduler_policy(config, launch_config, *, vllm_config=None):
     """Install admission when either option is enabled for this connector.
 
     Args:
         config: The vLLM scheduler configuration.
         launch_config: The UCM connector configuration at the YAML root.
+        vllm_config: Full configuration for installed platform scheduler wrappers.
     """
     if not ReadyPriority(launch_config).active:
         return
@@ -393,4 +438,5 @@ def install_scheduler_policy(config, launch_config):
     if scheduler_class not in (Scheduler, AsyncScheduler):
         raise ValueError("Early admission requires the native vLLM scheduler")
     # AsyncScheduler inherits admission and retains its native output handling.
-    patch_scheduler_class(Scheduler)
+    native = _native_admission_scheduler(Scheduler, vllm_config)
+    patch_scheduler_class(native)

@@ -524,6 +524,22 @@ class OwnerBroker(BrokerState):
             if op in ("execution_request", "lookup_complete") and peer == job["owner"]:
                 self.execution_message(job, message)
                 return
+            if op == "owner_progress" and peer == job["owner"] and job["status"] == "PENDING":
+                hit, remaining = message.get("hit"), message.get("remaining_l2_work")
+                if (type(hit) is not int or not 0 < hit <= len(job["blocks"])
+                        or type(remaining) is not int or remaining < 0
+                        or type(message.get("capacity_truncated")) is not bool
+                        or (job.get("pending_hit") is not None and job["pending_hit"] != hit)):
+                    self.poison("invalid pending consumption prefix")
+                    return
+                job["pending_hit"] = hit
+                self.send(job["client"], dict(
+                    op="progress", key=job["key"], owner=job["owner"],
+                    attempt=job["attempt"], grant=job["grant"], hit=hit,
+                    remaining_l2_work=remaining,
+                    capacity_truncated=message["capacity_truncated"],
+                ))
+                return
             if op == "owner_answer" and peer == job["owner"] and job["status"] == "PENDING":
                 hit = message.get("hit")
                 valid = (type(hit) is int and 0 <= hit <= len(job["blocks"])
@@ -539,6 +555,9 @@ class OwnerBroker(BrokerState):
                         self.retire(job, "owner failure")
                 else:
                     job["domain"]["execution"].complete(job["key"])
+                    if job.get("pending_hit", hit) != hit:
+                        self.poison("published pending prefix changed at READY")
+                        return
                     job["status"], job["hit"] = "READY", hit
                     self.advance_execution(job["domain"])
                     job["capacity_truncated"] = message["capacity_truncated"]
@@ -547,9 +566,11 @@ class OwnerBroker(BrokerState):
                     self.send(job["client"], dict(op="result", key=job["key"], state="READY", hit=message["hit"],
                                                   owner=job["owner"], attempt=job["attempt"], grant=job["grant"],
                                                   capacity_truncated=job["capacity_truncated"]))
-            elif op == "consumed" and job["status"] == "READY":
+                    if job["consumers"] == self.workers(job["dp"]):
+                        self.retire(job, "all native loads completed")
+            elif op == "consumed" and (job["status"] == "READY" or job.get("pending_hit") is not None):
                 job["consumers"].add(peer)
-                if job["consumers"] == self.workers(job["dp"]):
+                if job["status"] == "READY" and job["consumers"] == self.workers(job["dp"]):
                     self.retire(job, "all native loads completed")
             elif op == "consumer_failed":
                 self.poison("consumer failure did not prove native queue drain")
@@ -585,7 +606,7 @@ class OwnerBroker(BrokerState):
                 self.advance_execution(domain)
                 self._wake_admission()
             return
-        if op in ("owner_answer", "consumed", "quiesced", "owner_drained", "consumer_failed", "worker_retire"):
+        if op in ("owner_progress", "owner_answer", "consumed", "quiesced", "owner_drained", "consumer_failed", "worker_retire"):
             return
         if op in ("finish", "cancel", "handoff") and job and job["client"] != peer:
             return

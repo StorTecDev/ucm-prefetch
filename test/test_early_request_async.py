@@ -80,6 +80,9 @@ def constructor_config(monkeypatch):
         ucm_connector, "get_world_group", lambda: SimpleNamespace(rank=0, local_rank=0)
     )
     monkeypatch.setattr(ucm_connector, "get_current_device_id", lambda: 0)
+    monkeypatch.setattr(
+        ucm_connector, "get_ucm_worker_torch_device", lambda _: torch.device("cpu")
+    )
     monkeypatch.setattr(ucm_connector, "RequestHasher", Mock())
     monkeypatch.setattr(UCMDirectConnector, "_make_other_rank_hashers", lambda *a: [])
     monkeypatch.setattr(

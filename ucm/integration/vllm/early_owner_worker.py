@@ -126,9 +126,9 @@ class OwnerWorker:
             if op == "retire":
                 job.release_reason = message.get("reason", "terminal")
                 self.consumer.retire(key, attempt)
-                # Stop prefetch before READY; native consumption cannot have
-                # begun. After READY keep every pin until all consumers quiesce.
-                if job.owner == self.peer and not job.ready:
+                # Before publishing a consumable prefix no native load can
+                # have begun. Otherwise retain pins until consumers quiesce.
+                if job.owner == self.peer and not job.ready and job.pending_progress is None:
                     self.worker._release(job)
             elif op == "release_owner" and job.owner == self.peer:
                 self.worker._release(job)
@@ -164,7 +164,12 @@ class OwnerWorker:
         if job.cancelled or job.ready:
             return
         if error is not None:
-            self.worker._release(job)
+            # A published PENDING prefix may already have native consumers.
+            # Retirement must collect their receipts before returning pins.
+            if job.pending_progress is None:
+                self.worker._release(job)
+            else:
+                job.cancelled = True
         else:
             job.ready = True
         hit = self.worker._hit(job)

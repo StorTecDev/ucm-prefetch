@@ -1,4 +1,4 @@
-"""UCM control messages for unscheduled jobs and protected READY results.
+"""UCM control messages for unscheduled jobs and protected prefix results.
 
 The endpoint follows the native UCM shared identity. It owns no cache data,
 pins, leases, or L1 identities. Each socket is confined to one control thread.
@@ -72,6 +72,17 @@ class BrokerState:
                 },
             )
 
+    def pending_progress(self, job):
+        progress = job.get("progress", {})
+        if (not self.workers(job["dp"]).issubset(progress)
+                or not all(part[0] > 0 for part in progress.values())):
+            return
+        self.send(job["client"], dict(
+            op="progress", key=job["key"],
+            hit=min(part[0] for part in progress.values()),
+            remaining_l2_work=sum(part[1] for part in progress.values()),
+        ))
+
     def wake(self):
         for job in self.jobs.values():
             self.dispatch(job)
@@ -90,6 +101,22 @@ class BrokerState:
             job = dict(message, client=peer, status="PENDING", created=now)
             self.jobs[key] = job
             self.dispatch(job)
+        elif op == "progress":
+            job = self.jobs.get(message["key"])
+            if (job is None or job["status"] != "PENDING"
+                    or peer not in self.workers(job["dp"])):
+                return
+            hit, remaining = message.get("hit"), message.get("remaining_l2_work")
+            if (type(hit) is not int or not 0 < hit <= len(job["blocks"])
+                    or type(remaining) is not int or remaining < 0):
+                return
+            progress = job.setdefault("progress", {})
+            previous = progress.get(peer)
+            if previous is not None and previous[0] != hit:
+                self.fail(job, "published pending prefix changed")
+                return
+            progress[peer] = (hit, remaining)
+            self.pending_progress(job)
         elif op == "answer":
             job = self.jobs.get(message["key"])
             if job is None or job["status"] != "PENDING" or not job.get("running"):
@@ -100,6 +127,8 @@ class BrokerState:
                 self.fail(job, message.get("reason", "worker failed"))
                 return
             job["answers"][peer] = message["hit"]
+            job.setdefault("progress", {})[peer] = (message["hit"], 0)
+            self.pending_progress(job)
             if self.workers(job["dp"]) == job["answers"].keys():
                 job["status"] = "READY"
                 hit = min(job["answers"].values())

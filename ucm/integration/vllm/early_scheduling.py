@@ -1,4 +1,4 @@
-"""Opt-in bounded READY preference in the vLLM 0.28.0 admission loop."""
+"""Opt-in bounded READY preference in the supported native vLLM admission loops."""
 
 from __future__ import annotations
 
@@ -69,20 +69,28 @@ class WaitingPass:
                 max(0, request.num_tokens - 1),
             )
         remaining = max(1, request.num_tokens - saved)
+        if job is not None and job.state == "PENDING" and not job.dispatched:
+            pending_hit = getattr(job, "pending_hit", None)
+            if pending_hit is not None:
+                # Only pinned, stable prefixes are eligible; the worker keeps
+                # reading them while native per-layer/direct waits guard use.
+                return (2, 1, job.remaining_l2_work, 0, 0, candidate.order)
         if age_due:
             return (0, arrival, 0, 0, 0, candidate.order)
         if saved:
             return (1, rejected, remaining, arrival, 0, candidate.order)
+        if job is not None and job.state == "READY" and not job.dispatched:
+            return (2, 0, 0, 0, 0, candidate.order)
         if getattr(self.scheduler.policy, "value", self.scheduler.policy) == "priority":
             return (
-                2,
+                3,
                 rejected,
                 getattr(request, "priority", 0),
                 arrival,
                 0,
                 candidate.order,
             )
-        return (2, rejected, 0, candidate.order, 0, candidate.order)
+        return (3, rejected, 0, candidate.order, 0, candidate.order)
 
     def _prepare(self):
         self.policy.round += 1
@@ -152,6 +160,7 @@ def _request_rejection(test):
     if expression in (
         "not self.scheduler_config.enable_chunked_prefill and num_new_tokens > request_token_budget",
         "num_new_tokens > request_token_budget or num_computed_tokens + num_new_tokens > self.max_model_len",
+        "padded_num_tokens > request_token_budget",
     ):
         return True
     return False
@@ -295,7 +304,7 @@ def install_scheduler_policy(config, launch_config):
         return
     from vllm import __version__
 
-    if __version__.split("+", 1)[0] != "0.28.0":
+    if __version__.split("+", 1)[0] not in ("0.28.0", "0.30.0"):
         return
     from vllm.v1.core.sched.async_scheduler import AsyncScheduler
     from vllm.v1.core.sched.scheduler import Scheduler

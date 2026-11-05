@@ -39,6 +39,18 @@ class Job:
     match_ns: int = 0
     hbm_tokens: int | None = None
     external_tokens: int | None = None
+    pending_hit: int | None = None
+    remaining_l2_work: int | None = None
+
+    @property
+    def loadable(self):
+        return self.state == "READY" or (
+            self.state == "PENDING" and self.pending_hit is not None
+        )
+
+    @property
+    def matched_hit(self):
+        return self.hit if self.state == "READY" else self.pending_hit
 
 
 class EarlyScheduler:
@@ -222,11 +234,19 @@ class EarlyScheduler:
             if message["op"] == "owner_assigned":
                 if message["grant"] <= job.grant:
                     return
+                job.pending_hit = job.remaining_l2_work = None
                 job.owner, job.attempt, job.grant = message["owner"], message["attempt"], message["grant"]
                 return
             if job.attempt is not None and (
                 message.get("attempt") != job.attempt or message.get("grant") != job.grant
             ):
+                return
+            if message["op"] == "progress":
+                if job.state != "PENDING":
+                    return
+                job.pending_hit = message["hit"]
+                job.remaining_l2_work = message["remaining_l2_work"]
+                job.capacity_truncated = message.get("capacity_truncated", False)
                 return
             job.hit = message.get("hit", 0)
             job.capacity_truncated = message.get("capacity_truncated", False)
@@ -315,12 +335,12 @@ class EarlyScheduler:
             tickets = {}
             for request_id, key in keys.items():
                 job = self.by_key.get(key)
-                if job is not None and job.owner and job.state == "READY":
+                if job is not None and job.owner and job.loadable:
                     if job.expected is None:
                         raise RuntimeError("owner result lacks native consumption plan")
                     tickets[request_id] = dict(key=key, attempt=job.attempt, owner=job.owner,
                                               grant=job.grant, expected=job.expected,
-                                              protected_hit=job.hit, capacity_truncated=job.capacity_truncated)
+                                              protected_hit=job.matched_hit, capacity_truncated=job.capacity_truncated)
             return tickets
 
     def finish(self, request, cancelled=False):
@@ -378,6 +398,7 @@ class WorkerJob:
     lookup_cursor: int = 0
     lookup_count: int = 32
     lookup_paused: bool = False
+    pending_progress: tuple | None = None
 
 
 @dataclass(eq=False)
@@ -410,6 +431,8 @@ class EarlyWorker:
         self.preparing = []
         self.selected = []
         self.hrrn_requests = []
+        self.pending_backfill = getattr(connector, "launch_config", {}).get(
+            "early_ready_priority", False)
         self.request_first = getattr(connector, "launch_config", {}).get(
             "early_prefetch_request_first", False)
         if type(self.request_first) is not bool:
@@ -728,8 +751,8 @@ class EarlyWorker:
 
     @staticmethod
     def _hit(job):
-        # Batches are appended in prefix order. Final lengths replace lookup
-        # lengths only after completion; a partial block is never counted.
+        # Lookup lengths can shrink until every prefix pin exists. Callers
+        # check either that stable boundary or completion before publishing.
         hit = 0
         for part in job.batches:
             if part.discarded:
@@ -739,7 +762,40 @@ class EarlyWorker:
             hit += part.reservation["total_hit_blocks"]
         return hit
 
+    def _publish_progress(self, job):
+        if (not self.pending_backfill or job.cancelled or job.ready or not job.reserve_done
+                or not job.lookup_finished):
+            return
+        parts = [part for part in job.batches if not part.discarded]
+        # Step stops accepting work only after the complete prefix has pins.
+        # Capacity waits also stop submission, but cannot authorize consumption.
+        if not parts or not all(
+            part.done or (
+                part.started and part.stats
+                and not part.stats["can_submit"]
+                and not part.stats.get("waiting_capacity", False)
+                and not part.stats.get("capacity_truncated", False)
+            ) for part in parts
+        ):
+            return
+        hit = self._hit(job)
+        if not hit:
+            return
+        remaining = sum(part.reservation["remaining_l2_work"] for part in parts)
+        progress = (hit, remaining)
+        if progress == job.pending_progress:
+            return
+        job.pending_progress = progress
+        self.control.send(dict(
+            op="owner_progress" if job.owner else "progress",
+            key=job.key, attempt=job.attempt, hit=hit,
+            remaining_l2_work=remaining,
+            capacity_truncated=job.capacity_end is not None
+                and job.truncate_reason != "revalidation_miss",
+        ))
+
     def _maybe_answer(self, job):
+        self._publish_progress(job)
         if (job.reserve_done and job.lookup_finished
                 and all(part.done for part in job.batches)):
             self._answer(job)
@@ -879,7 +935,7 @@ class EarlyWorker:
                              job.key, self.connector.tp_rank, batch.index, batch.reservation["handle"],
                              time.monotonic_ns(), capability.protected_bytes,
                              capability.protection_limit_bytes, stats)
-                    self._maybe_answer(job)
+                self._maybe_answer(job)
                 return stats["advanced"]
         except Exception as error:
             with self.condition:

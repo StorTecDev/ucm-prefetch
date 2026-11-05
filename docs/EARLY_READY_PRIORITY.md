@@ -1,4 +1,4 @@
-# Early READY admission in vLLM 0.28.0
+# Early READY/PENDING admission in vLLM
 
 `early_ready_priority` is a boolean at the UCM YAML root and defaults to `false`.
 With the default, Early uses the original native waiting-queue admission order,
@@ -12,19 +12,19 @@ early_ready_priority: true
 
 Omitting the option or setting `early_ready_priority: false` selects native order.
 Restart the engine after changing it. Both EarlyDirectConnector and
-EarlyLayerWiseConnector support the switch on vLLM 0.28.0, including its native
+EarlyLayerWiseConnector support the switch on vLLM 0.28.0 and 0.30.0, including their native
 Scheduler and AsyncScheduler. The switch changes waiting admission only; Early
 prefetch, PENDING/READY/FAILED handling, request-level HRRN loading and owner
 resource lifetimes remain active in either mode.
 
 When explicitly enabled, Early requests with a protected, nonzero cache prefix receive an opportunity to
 enter HBM before failed requests consume the native fallback budget. This policy
-applies to the native vLLM 0.28.0 Scheduler and AsyncScheduler when an Early
+applies to the native vLLM 0.28.0/0.30.0 Scheduler and AsyncScheduler when an Early
 connector enables it. Other connectors retain the native schedule method.
 
 READY preference can cross native request priorities. Within the preferred
 candidates, a smaller estimated uncached suffix is tried first. A zero-hit READY
-result receives no cache preference. The native prefix-cache and external-match
+result follows cache-saving READY candidates and precedes PENDING and fallback. The native prefix-cache and external-match
 checks remain authoritative; the estimate does not reserve HBM or promise a
 particular TTFT.
 
@@ -78,7 +78,7 @@ cost. Scheduler overhead therefore needs measurement alongside TTFT and throughp
 
 ## Verification
 
-`test/test_early_native_scheduler.py` uses the real vLLM 0.28.0 scheduler and KV
+`test/test_early_native_scheduler.py` uses the real supported vLLM scheduler and KV
 block allocator with the real UCM Python matching path. Storage results and H2D
 transfers are mocked. It covers fallback blocking, a large READY request refusing
 HBM, priority crossing, fairness, bounded scans, native budgets, async scheduling,
@@ -132,3 +132,58 @@ waiting, cancellation, stale generations and real worker classification.
 `test/test_early_batch_binding.py` injects a real backend health failure, checks
 typed rejection and release events, restores health, and validates native batch
 lifetime and simulated transfers. These checks do not certify accelerator timing.
+
+## PENDING backfill
+
+With `early_ready_priority: true`, a pass tries the existing READY candidates
+first, then fills remaining native token and running-slot budgets with PENDING
+requests. For example, two READY requests can share a four-request batch with
+two PENDING requests. A pass with no READY candidates can also admit PENDING.
+The default/disabled mode retains its original PENDING gate and native order.
+
+A PENDING request is eligible only after lookup has finished, the hit prefix is
+stable, and every shard of that prefix has acquired its native cache reference.
+Reads may still be in flight. The worker publishes this bound separately from
+READY; hashing, lookup, activation and capacity waiting alone never authorize
+external hits. Each unfinished native batch must have exhausted submission and
+must not be waiting for capacity or truncating an incomplete tail. Completed
+batches can contribute their final protected prefix.
+
+Among eligible PENDING requests, fewer remaining L2 shards ranks first. This is
+remaining work, not an estimated completion time or a percentage. Equal-work
+ties retain original queue order. Cache-saving READY ordering is
+unchanged, including existing fairness attempts for other requests. Zero-hit
+READY requests are tried before PENDING and fallback requests. An aged
+PENDING request still follows READY. Progress is sent only when its hit/work
+pair changes; the legacy broadcast path waits for every required rank and uses
+the minimum protected hit and the sum of remaining work.
+
+Matching reuses the published prefix and native HBM/missing-block filtering;
+it performs no scheduler-side storage lookup, data wait or HBM reservation.
+Native direct or layerwise loads acquire their own references to the existing
+LOADING buffers and retain their normal readiness waits. The prefix references
+keep those buffers alive while background reads continue. PENDING remains a
+PENDING state until the worker reports completion; it is never relabeled READY
+to gain admission. A batch can therefore include still-loading requests, but
+computation must wait wherever its required KV is not yet available. Completion
+of the next batch's prefetch is workload-dependent, not guaranteed.
+
+Owner metadata carries the same generation and native consumption plan for
+eligible PENDING and READY. Early consumption receipts are retained until READY;
+retirement still requires every consumer to quiesce before owner pins return.
+After publishing a PENDING prefix, owner failure stops new work without releasing
+pins ahead of consumer retirement. Unknown completion still fences the domain.
+Restart all engine members together when updating this protocol.
+
+`test/test_early_pending_protocol.py` covers stable-prefix eligibility, in-flight
+worker progress, rank aggregation, generation validation, ranking, early
+consumption and retirement. The native scheduler and prepared-result tests cover
+mixed READY/PENDING batches, all-PENDING passes, both scheduler modes, both Early
+connectors, the disabled switch, native budgets and filtered owner metadata.
+Additional native regressions cover an unfit READY yielding to a smaller PENDING
+and Mamba alignment refusing one candidate. These are correctness checks; they do not establish an accelerator performance
+gain. The adapter supports the verified native vLLM 0.28.0 and 0.30.0 waiting-loop
+structures. Version 0.30.0 has a separate speculative-padding budget rejection
+and two zero-token rejection sites; their per-request exits also permit backfill.
+Unrecognized waiting-loop stop conditions still reject installation. Custom
+scheduler classes remain unsupported.

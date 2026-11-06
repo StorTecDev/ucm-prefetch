@@ -23,15 +23,17 @@ enable_metrics: true
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`，DeepSeek v4 系列模型推荐设置为 `false`。 |
 | `enable_early_prefetch` | 选填 | bool | 默认 `false` | 启用 Early 预取路径；整块读取和 Early 调度选项要求开启。 |
+| `early_full_block_defaults` | 选填 | bool | 默认 `false` | 仅 Early 开启时，在 `ucm_connector_config` 中将缺失的整块 load/L1/dump 补为 `true`，dump 容量策略补为 `wait`。显式配置优先，仍须满足布局和后端约束；Early 关闭时不生效。 |
 | `early_ready_priority` | 选填 | bool | 默认 `false` | vLLM 0.28.0/0.30.0 启用 Early 时，`false` 保持原生等待队列准入；`true` 启用有效命中的 READY 优先，按估算未缓存后缀排序，并启用有界扫描和公平性补偿。适用于 Direct/LayerWise 及同步/异步 scheduler，修改后重启。与 HRRN 加载调度独立。 |
 | `early_ready_max_candidates` | 选填 | int | 默认 `64`；正整数 | `early_ready_priority: true` 时，每轮等待调度的原生匹配、分配尝试上限。有效命中的 READY 请求可跨原生优先级优先尝试。开关关闭时仍校验格式，但不生效。 |
 | `early_ready_max_bypasses` | 选填 | int | 默认 `8`；正整数 | `early_ready_priority: true` 时，被较晚请求成功越过达到此次数后给予优先尝试；仍放不下时让后续请求推进，不为其预留 HBM。开关关闭时仍校验格式，但不生效。 |
 | `early_owner_max_waiting_jobs` | 选填 | int | 默认 `256`；正整数 | 整个 broker 等待 owner 准入的请求数上限。已进入等待的请求不因资源等待时长而失败。 |
+| `early_owner_max_jobs` | 选填 | int | Early 开启时默认 `16`；正整数 | 每个 owner 的已准入任务上限，适用于受支持的 Early Direct 和 layerwise 路径，与存储预设无关。 |
 | `early_owner_max_waiting_candidate_blocks` | 选填 | int | 默认 `65536`；正整数 | 整个 broker 准入等待队列中的候选 ID 总数上限。限制元数据而非 L1 预留；新请求超过队列上限时回退。 |
 | `early_owner_max_retries` | 选填 | int | 默认 `1`；非负整数 | 首次 deferred 查询在发布批次前被原生健康检查明确拒绝，且旧 generation 已排空时，允许的新执行次数。`0` 禁用重试；资源等待和原批次恢复不计数。 |
 | `early_owner_retry_backoff_ms` | 选填 | int | 默认 `100`；非负整数 | 可恢复执行错误后的最小等待时间；仍须满足旧任务排空和 owner 准入条件。独立的后端健康冷却时间可能更长。 |
 | `early_prefetch_request_first` | 选填 | bool | 默认 `false` | 控制 L2→L1 预取加载，与计算准入独立。`true` 优先最早可提交请求；`false` 完整保留整请求 HRRN、跨数据分块的固定轮次、资源等待补位与恢复、重试年龄。依赖外部前缀的 PENDING 必须等 READY 才进入计算；完整 HBM 命中时取消预取的旁路保留。 |
-| `early_prefetch_min_submit_reads` | 选填 | int | 默认 `1`；1–64 | 补充提交所需的最小空闲读取单元数，自动限制在 owner 窗口内。`1` 不合批；I/O 窗口为空时立即补充。 |
+| `early_prefetch_min_submit_reads` | 选填 | int | Early 开启时默认 `16`；1–64 | 补充提交所需的最小空闲读取单元数，自动限制在 owner 窗口内。`1` 不合批；I/O 窗口为空时立即补充。 |
 | `early_prefetch_submit_max_wait_ms` | 选填 | number | 默认 `2`；(0, 10] | 合批等待的毫秒上限，到期后在下一次执行器调度提交可用读取；不提供实时保证。 |
 | `enable_event_sync` | 选填 | bool | 默认 `true` | 性能优化开关，推荐开启。 |
 | `persist_token_threshold` | 选填 | int | `0` | 当请求长度小于 `persist_token_threshold` 时，UCM 软件不对该请求进行处理。 |
@@ -76,8 +78,10 @@ enable_metrics: true
 | `use_dpc` | 选填 | bool | 默认 `false` | 非共享 buffer 模式下主机缓冲的分配方式。默认大页内存（传统 DirectIO 路径）；`true`：驱动内存接口（DPC 路径），可显式开启。 |
 | `cache_sdma_direct` | 选填 | bool | 依据编译环境变量决定，`PLATFORM=ascend-a3` 时默认 `true`，其他默认 `false` | 启用 SDMA H2D/D2H 传输路径，仅在 A3 设备生效，推荐关闭。 |
 | `cache_load_backend_only` | 选填 | bool | 默认 `false` | 即使在 cache 层命中还是会强制从 SSD 上加载，仅供测试使用。 |
-| `cache_full_block_load` | 选填 | bool | 默认 `false` | 仅限 Early：通过 Posix AIO 整块读入 L1，保留逐层设备搬运。普通 Cache/Posix 拒绝此选项。详见 [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers)。 |
-| `cache_full_block_l1` | 选填 | bool | 默认 `false` | 仅限 Early 整块读取，要求 `cache_full_block_load: true`。使用连续整块 L1 与单次 PREAD，保留逐层 H2D。见[整块 L1](../developer-guide/cache-configuration/pipeline.md#whole-block-l1-with-layerwise-h2d)。 |
+| `cache_full_block_load` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | 仅限 Early：通过 Posix AIO 整块读入 L1，保留逐层设备搬运。普通 Cache/Posix 拒绝此选项。详见 [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers)。 |
+| `cache_full_block_l1` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | 仅限 Early 整块读取，要求 `cache_full_block_load: true`。使用连续整块 L1 与单次 PREAD，保留逐层 H2D。见[整块 L1](../developer-guide/cache-configuration/pipeline.md#whole-block-l1-with-layerwise-h2d)。 |
+| `cache_full_block_dump` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | Early layerwise 整块写回，要求整块 L1、每 chunk 一个 block、PP=1 及普通 DMA；拒绝 GDR、SDMA Direct 和 IO aggregation。 |
+| `cache_dump_capacity_policy` | 选填 | string | 默认 `spill`；Early 整块预设开启时为 `wait` | `wait` 要求整块 dump 且队列深度至少为二；等待 L1 容量时保留源数据依赖。关闭 dump 时须同时显式设为 `spill`。 |
 | `posix_packed_layer_bytes` | 选填 | list[int] | 不设置：均匀磁盘布局 | 仅限 Early 逐层整块管线。按层指定精确的 4096 字节对齐物理长度，并按真实张量验证；默认 L1 采用均匀布局，整块 L1 使用 packed 偏移。详见[紧凑布局](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout)。 |
 | `cache_io_aggregation` | 选填 | bool | 默认 `false`，仅在 `PLATFORM=ascend` 且模型为 V4 时自动开启 | 启用 IO 聚合 h2d 传输，仅在 A2 设备生效。 |
 | `share_buffer_enable` | 选填 | bool | MLA 默认启用，GQA 默认不启用 | 是否启用共享内存。MLA 如果不用 shm 或 GQA 用 shm 都会导致性能下降。 |

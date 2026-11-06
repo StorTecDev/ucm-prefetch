@@ -1,9 +1,80 @@
 # Whole-block L1 → L2 writeback
 
 `cache_full_block_dump` is an opt-in write path for Early layerwise connectors.
-Early prefix reservation, L2 reads, ordinary loads, and owner scheduling keep their
-existing implementation. This option does not change HBM capacity or write-window
-settings, and it does not evict HBM: D2H copies selected cache blocks.
+The preset below changes configuration defaults; Early prefix reservation, L2 reads,
+ordinary loads, and owner scheduling keep their existing algorithms. This option
+does not change HBM capacity or write-window settings, and it does not evict HBM: D2H copies selected cache blocks.
+
+## Conditional Early defaults
+
+The vLLM Early entry point copies the launch configuration before normalizing it.
+Scheduler and worker use the same rules, before layerwise flags, owner capabilities,
+or native stores consume the options. Ordinary connectors and direct storage API
+calls retain their existing defaults; no native Cache/Posix defaults change.
+
+| Option | Level | Early disabled or absent | Early enabled, preset absent/false | Early enabled, preset true |
+| --- | --- | --- | --- | --- |
+| `early_prefetch_min_submit_reads` | Root | Inactive; unchanged | `16` | `16` |
+| `early_owner_max_jobs` | Root | Inactive; unchanged | `16` | `16` |
+| `cache_full_block_load` | `ucm_connector_config` | `false` | `false` | `true` |
+| `cache_full_block_l1` | `ucm_connector_config` | `false` | `false` | `true` |
+| `cache_full_block_dump` | `ucm_connector_config` | `false` | `false` | `true` |
+| `cache_dump_capacity_policy` | `ucm_connector_config` | `spill` | `spill` | `wait` |
+
+The two scheduling defaults apply to all supported Early Direct and Early layerwise
+paths. They do not depend on the preset. To opt into the four storage defaults, add
+both switches at the YAML root of an existing native `Cache|Posix` configuration:
+
+```yaml
+enable_early_prefetch: true
+early_full_block_defaults: true
+```
+
+`early_full_block_defaults` defaults to `false` and must be a boolean when Early is
+active; strings and integers such as `"true"`, `0`, and `1` are rejected. When Early
+is disabled or absent, the preset is not consumed. With Early active and the preset
+absent/false, explicit storage options still reach the existing storage validation
+unchanged, including manual full-block configurations.
+
+Only missing fields are filled. Explicit `false`, `spill`, and other valid values
+win; legitimate zeros such as `cache_dump_reserved_blocks: 0` and
+`early_owner_max_candidate_blocks: 0` are retained. This does not make invalid zeros
+valid: `early_prefetch_min_submit_reads` still requires 1–64 and owner admission
+still requires positive job capacity.
+
+The preset never repairs conflicting overrides. Adjust related fields together:
+
+- Disabling `cache_full_block_dump` also requires
+  `cache_dump_capacity_policy: spill` when the preset would otherwise supply `wait`.
+- Disabling `cache_full_block_l1` also requires dump disabled and policy `spill`.
+- Disabling `cache_full_block_load`, or enabling `cache_load_backend_only`, also
+  requires L1 and dump disabled and policy `spill`.
+- Keeping dump enabled requires layerwise mode, one block per chunk, PP size one,
+  ordinary DMA, and a full-block write backend. Direct, PP, and multi-block chunks
+  fail explicitly if dump remains enabled; these modes are not silently changed.
+- GDR, SDMA Direct, and IO aggregation remain incompatible with dump. SDMA defaults
+  depend on the build; the preset does not override them or any other runtime flag.
+- `wait` requires queue space for finalization (`waiting_queue_depth >= 2`) and can
+  retain HBM sources while waiting for L1 capacity. It cannot reclaim reader pins.
+
+For example, an Early Direct configuration can opt into full-block reads/L1 while
+explicitly excluding the layerwise writeback protocol:
+
+```yaml
+enable_early_prefetch: true
+early_full_block_defaults: true
+use_layerwise: false
+ucm_connectors:
+  - ucm_connector_name: UcmPipelineStore
+    ucm_connector_config:
+      store_pipeline: Cache|Posix
+      cache_full_block_dump: false
+      cache_dump_capacity_policy: spill
+      # Supply the existing backend and capacity settings here.
+```
+
+Other layout/backend requirements, including packed-layout restrictions and shared
+writer compatibility below, still apply.
 
 ## Configuration
 
@@ -44,14 +115,16 @@ holding limit, including blocks awaiting backend write completion. This setting
 never partitions or preallocates a physical write-only region; writers acquire
 ordinary L1 slots, shared with Early prefetch. Zero does not remove actual L1
 capacity, reference protection or queue backpressure. It is separate from
-`early_owner_max_jobs` and `posix_write_inflight_limit`, which are unchanged.
+`early_owner_max_jobs` and `posix_write_inflight_limit`; it does not replace either
+submission limit.
 Queued plus unfinished task descriptors, and unfinished block bookkeeping, are
 each bounded by `waiting_queue_depth`. The existing limit also covers background
 completions so separating I/O cannot create an unbounded queue. Configurations that
 omit this option now use zero; set an explicit positive value to retain a previous
 holding limit.
 
-`cache_dump_capacity_policy` accepts `spill` (the default) or `wait`. Unknown
+`cache_dump_capacity_policy` accepts `spill` (the native default) or `wait` (the
+Early full-block preset default). Unknown
 values fail configuration; `wait` requires `cache_full_block_dump`. Both policies
 use the same reservation budget, which is a per-store holding limit rather than a
 physically isolated region. Other L1 users can reduce the slots actually available.

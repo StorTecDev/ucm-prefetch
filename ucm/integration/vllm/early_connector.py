@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import copy
 import time
 from dataclasses import dataclass, field
 
+from .early_config import normalize_early_config
 from .early_lookup import LookupContext, current_lookup
 from .early_prefetch import EarlyScheduler, EarlyWorker
 from .ucm_connector import (
@@ -13,8 +13,8 @@ from .ucm_connector import (
     UCMConnectorMetadata,
     UCMDirectConnector,
     UCMLayerWiseConnector,
-    logger,
     _get_store_io_sizes,
+    logger,
 )
 
 
@@ -27,6 +27,11 @@ class EarlyConnectorMetadata(UCMConnectorMetadata):
 class _EarlyConnectorMixin:
     _defer_scheduler_store = True
 
+    def _load_launch_config(self, kv_transfer_config):
+        # Layerwise initialization consumes store options inside super().__init__.
+        # Both roles must normalize before that code or any store/owner setup.
+        return normalize_early_config(super()._load_launch_config(kv_transfer_config))
+
     def _create_store(self, kv_cache_layout, cpu_affinity_cores=None):
         """Validate Early disk lengths before any native resource is created.
 
@@ -35,16 +40,31 @@ class _EarlyConnectorMixin:
             cpu_affinity_cores: Optional native worker CPU affinity.
 
         Returns:
-            The native Early pipeline using the original public store defaults.
+            The native Early pipeline using the normalized Early store options.
         """
         from .early_storage_layout import validate_packed_config, validate_packed_layers
 
         config = self.connector_configs[0]["ucm_connector_config"]
         if config.get("cache_full_block_dump", False):
-            if not self.launch_config.get("use_layerwise", True) or self.blocks_per_chunk != 1:
-                raise ValueError("cache_full_block_dump requires layerwise mode and one block per chunk")
-            if kv_cache_layout is not None and kv_cache_layout.pp_size != 1:
-                raise ValueError("cache_full_block_dump does not support pipeline parallelism")
+            if (
+                not self.launch_config.get("use_layerwise", True)
+                or self.blocks_per_chunk != 1
+            ):
+                raise ValueError(
+                    "cache_full_block_dump requires layerwise mode and one block per chunk; "
+                    "for Direct or multi-block chunks, set cache_full_block_dump=false "
+                    "and cache_dump_capacity_policy='spill' together"
+                )
+            pp_size = (
+                kv_cache_layout.pp_size
+                if kv_cache_layout is not None
+                else self._vllm_config.parallel_config.pipeline_parallel_size
+            )
+            if pp_size != 1:
+                raise ValueError(
+                    "cache_full_block_dump does not support pipeline parallelism; "
+                    "set cache_full_block_dump=false and cache_dump_capacity_policy='spill' together"
+                )
         lengths = validate_packed_config(config)
         self._early_disk_block_bytes = sum(lengths) if lengths is not None else None
         if lengths is not None and kv_cache_layout is not None:
@@ -53,8 +73,12 @@ class _EarlyConnectorMixin:
                 kv_cache_layout.block_size * self.blocks_per_chunk,
             )
             validate_packed_layers(
-                dict(config, shard_size=shard,
-                     tensor_size_list=kv_cache_layout.tensor_size_list * self.blocks_per_chunk),
+                dict(
+                    config,
+                    shard_size=shard,
+                    tensor_size_list=kv_cache_layout.tensor_size_list
+                    * self.blocks_per_chunk,
+                ),
                 kv_cache_layout,
                 layerwise=self.use_layerwise,
                 blocks_per_chunk=self.blocks_per_chunk,
@@ -88,7 +112,6 @@ class _EarlyConnectorMixin:
 
     def __init__(self, vllm_config, role, kv_cache_config=None):
         super().__init__(vllm_config, role, kv_cache_config)
-        self.connector_configs = copy.deepcopy(self.connector_configs)
         connector = self.connector_configs[0]
         name = connector["ucm_connector_name"]
         module_path = connector.get("ucm_connector_module_path")
@@ -103,7 +126,9 @@ class _EarlyConnectorMixin:
             from .early_scheduling import install_scheduler_policy
 
             install_scheduler_policy(
-                vllm_config.scheduler_config, self.launch_config, vllm_config=vllm_config
+                vllm_config.scheduler_config,
+                self.launch_config,
+                vllm_config=vllm_config,
             )
             self.store = self._create_store(None)
         self._early = (
@@ -134,7 +159,9 @@ class _EarlyConnectorMixin:
             # rounds down to full blocks. Prefer its <= one-block recompute
             # over waiting for optional external KV when this maximum is met.
             # Aligned prompts can NEVER get their whole length from APC.
-            max_hbm_tokens = (request.num_tokens - 1) // self.block_size * self.block_size
+            max_hbm_tokens = (
+                (request.num_tokens - 1) // self.block_size * self.block_size
+            )
             # Saved IDs are needed by native dump metadata. Never synchronously
             # repeat a still-running background hash just to bypass PENDING.
             if num_computed_tokens >= max_hbm_tokens and job.blocks is not None:
@@ -142,8 +169,12 @@ class _EarlyConnectorMixin:
                     self._early.cancel_unused(job)
                     logger.info(
                         "UCM_EARLY hbm_sufficient key=%s request=%s hbm_tokens=%s "
-                        "tokens=%s ns=%s", job.key, request.request_id,
-                        num_computed_tokens, request.num_tokens, time.monotonic_ns(),
+                        "tokens=%s ns=%s",
+                        job.key,
+                        request.request_id,
+                        num_computed_tokens,
+                        request.num_tokens,
+                        time.monotonic_ns(),
                     )
                 hbm_only = True
         if job is not None and job.state == "PENDING":
@@ -165,11 +196,24 @@ class _EarlyConnectorMixin:
             if job is not None:
                 job.match_calls += 1
                 job.hbm_tokens, job.external_tokens = num_computed_tokens, result[0]
-            if job is not None and job.owner and job.state == "READY" and not job.dispatched:
+            if (
+                job is not None
+                and job.owner
+                and job.state == "READY"
+                and not job.dispatched
+            ):
                 meta = self.requests_meta.get(request.request_id)
-                job.expected = () if meta is None else tuple(meta.ucm_block_ids[
-                    meta.hbm_hit_block_num * self.cp_world_size:
-                    meta.total_hit_block_num * self.cp_world_size])
+                job.expected = (
+                    ()
+                    if meta is None
+                    else tuple(
+                        meta.ucm_block_ids[
+                            meta.hbm_hit_block_num
+                            * self.cp_world_size : meta.total_hit_block_num
+                            * self.cp_world_size
+                        ]
+                    )
+                )
             return result
         finally:
             current_lookup.reset(token)
@@ -210,9 +254,14 @@ class _EarlyConnectorMixin:
         metadata = super().build_connector_meta(scheduler_output)
         for request_id in metadata.preempted_req_ids:
             self._early.finish(request_id, cancelled=True)
-        keys = self._early.scheduled(metadata.request_meta, scheduler_output.num_scheduled_tokens)
-        return EarlyConnectorMetadata(**vars(metadata), early_keys=keys,
-                                      early_owners=self._early.owner_metadata(keys))
+        keys = self._early.scheduled(
+            metadata.request_meta, scheduler_output.num_scheduled_tokens
+        )
+        return EarlyConnectorMetadata(
+            **vars(metadata),
+            early_keys=keys,
+            early_owners=self._early.owner_metadata(keys),
+        )
 
     def request_finished(self, request, block_ids):
         self._early.finish(request, cancelled="ABORT" in str(request.status.name))
@@ -240,11 +289,13 @@ class _EarlyConnectorMixin:
         self._early.owner_protocol.check()
         super().start_load_kv(forward_context, **kwargs)
         if not self.use_layerwise:
-            self._early_load_completed({
-                request_id for request_id, meta in
-                self._get_connector_metadata().request_meta.items()
-                if not meta.load_async
-            })
+            self._early_load_completed(
+                {
+                    request_id
+                    for request_id, meta in self._get_connector_metadata().request_meta.items()
+                    if not meta.load_async
+                }
+            )
 
     def _early_load_completed(self, request_ids):
         if self._early.owner_protocol.fatal:
@@ -283,7 +334,9 @@ class _EarlyConnectorMixin:
             if self._early is not None:
                 early, self._early = self._early, None
                 early.close()
-                fenced = bool(getattr(getattr(early, "owner_protocol", None), "fatal", None))
+                fenced = bool(
+                    getattr(getattr(early, "owner_protocol", None), "fatal", None)
+                )
         finally:
             if not fenced:
                 super().shutdown()

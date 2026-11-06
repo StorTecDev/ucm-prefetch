@@ -1575,6 +1575,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
     cross-rank consistency metadata.
     """
 
+    def _load_launch_config(self, kv_transfer_config):
+        """Load launch options before connector validation and resource setup.
+
+        Args:
+            kv_transfer_config: Engine configuration identifying the UCM options.
+
+        Returns:
+            Launch options, with connector-specific normalization if overridden.
+        """
+        return Config(kv_transfer_config).get_config()
+
     @staticmethod
     def _consistency_manager_enabled(launch_config: dict, is_mla: bool) -> bool:
         return launch_config.get("use_consistency_manager", not is_mla)
@@ -1631,9 +1642,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # save block info, avoid hash request twice, and track them until request finished
         self.requests_meta: dict[str, RequestMeta] = {}
 
-        ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id.rsplit("_dp", 1)[0]
-        self.launch_config = ucm_config.get_config()
+        self.launch_config = self._load_launch_config(vllm_config.kv_transfer_config)
         self.connector_configs = self.launch_config.get("ucm_connectors", [])
         assert len(self.connector_configs) > 0, "no storage connector name in config."
         share_buffer_enable = (
@@ -2826,7 +2836,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         # This state is reset at the start of every connector batch.
         self._dumped_layer_ids: set[int] = set()
         self._block_dump_enabled = bool(
-            self.connector_configs[0]["ucm_connector_config"].get("cache_full_block_dump", False)
+            self.connector_configs[0]["ucm_connector_config"].get(
+                "cache_full_block_dump", False
+            )
         )
         self._block_dump_wait_capacity = (
             self.connector_configs[0]["ucm_connector_config"].get(
@@ -3146,18 +3158,28 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         pending = None
         try:
             task = self._rank_consistency.submit_dump(
-                self.store, context, block_ids * len(layers),
+                self.store,
+                context,
+                block_ids * len(layers),
                 [layer for layer in layers for _ in block_ids],
-                np.ascontiguousarray(np.concatenate(rows, axis=0)), event,
+                np.ascontiguousarray(np.concatenate(rows, axis=0)),
+                event,
                 finalize=True,
             )
-            pending = PendingDumpTask(task=task, request_ids=set(context), event_handle=event)
+            pending = PendingDumpTask(
+                task=task, request_ids=set(context), event_handle=event
+            )
             self._pending_dump_tasks.append(pending)
         except Exception as error:
             logger.error(f"finalize block dump failed: {type(error).__name__}: {error}")
             self._record_counter("connector_dump_submit_errors_total")
         finally:
-            if pending is None and self.enable_event_sync and event and self.device is not None:
+            if (
+                pending is None
+                and self.enable_event_sync
+                and event
+                and self.device is not None
+            ):
                 self.device.destroy_event_handle(event)
         # This fence must propagate unproven-source errors rather than log and
         # release HBM. L2 completion remains in _pending_dump_tasks for polling.
@@ -3703,10 +3725,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
 
         early_enabled = self.launch_config.get("enable_early_prefetch", False)
         if early_enabled and (
-            is_fawa
-            or use_ratio_rate
-            or use_cp_parallel
-            or use_hybrid_linear_attention
+            is_fawa or use_ratio_rate or use_cp_parallel or use_hybrid_linear_attention
         ):
             raise ValueError("Early requires the native direct or layerwise connector")
 
@@ -3739,7 +3758,9 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             if early_enabled:
                 from .early_connector import EarlyDirectConnector
 
-                self.connector = EarlyDirectConnector(vllm_config, role, kv_cache_config)
+                self.connector = EarlyDirectConnector(
+                    vllm_config, role, kv_cache_config
+                )
             else:
                 self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
 

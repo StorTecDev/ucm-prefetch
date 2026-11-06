@@ -4,7 +4,6 @@ Run with the locked vLLM source's test helpers on PYTHONPATH. A tiny local
 config is created by the fixture; no model weights or network are needed.
 """
 
-import time
 from unittest.mock import Mock
 
 import pytest
@@ -225,16 +224,16 @@ def test_failed_request_gets_fair_attempt_after_younger_admissions(
     assert second.num_scheduled_tokens == {"0": 512}
 
 
-def test_zero_hit_ready_precedes_failed_fallback(
+def test_zero_hit_ready_does_not_displace_original_waiting_order(
     connector, scheduler_factory
 ):
     _, output, adapter = schedule(
         connector, scheduler_factory, ("FAILED", "READY"), hit=0
     )
     assert (
-        adapter.get_num_new_matched_tokens.call_args_list[0].args[0].request_id == "1"
+        adapter.get_num_new_matched_tokens.call_args_list[0].args[0].request_id == "0"
     )
-    assert "1" in output.num_scheduled_tokens
+    assert "0" in output.num_scheduled_tokens
 
 
 def test_non_early_connector_keeps_native_scheduler_order(connector, scheduler_factory):
@@ -319,90 +318,3 @@ def test_rejected_request_releases_encoder_references_before_backfill(
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"1": 512}
     assert not touched
-
-
-@pytest.mark.parametrize("async_scheduling", [False, True])
-def test_ready_batch_backfills_highest_hrrn_pending_prefixes(
-    connector, scheduler_factory, async_scheduling
-):
-    scheduler = scheduler_factory(max_num_seqs=4, max_num_batched_tokens=8192,
-                                  async_scheduling=async_scheduling)
-    requests = requests_of_sizes(*([8192] * 5))
-    adapter = attach(connector, scheduler, requests,
-                     ("PENDING", "READY", "PENDING", "READY", "PENDING"), [48] * 5)
-    now = time.monotonic()
-    for index, work, age in ((0, 4, 100), (2, 1, 1), (4, 8, 20)):
-        job = connector._early.jobs[requests[index].request_id]
-        job.pending_hit, job.remaining_l2_work = 48, work
-        job.entered = now - age
-    output = scheduler.schedule()
-    assert list(output.num_scheduled_tokens) == ["1", "3", "0", "4"]
-    assert output.total_num_scheduled_tokens == 8192
-    assert len(scheduler.running) == 4
-    assert connector._early.jobs["0"].state == "PENDING"
-    assert [call.args[0].request_id for call in
-            adapter.get_num_new_matched_tokens.call_args_list] == ["1", "3", "0", "4"]
-    connector.store.store_.LookupOnPrefix.assert_not_called()
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_all_pending_backfill_respects_switch_and_native_budgets(
-    connector, scheduler_factory, enabled
-):
-    scheduler = scheduler_factory(max_num_seqs=2, max_num_batched_tokens=4096)
-    requests = requests_of_sizes(8192, 8192, 8192)
-    attach(connector, scheduler, requests, ["PENDING"] * 3, [48] * 3,
-           ready_priority=enabled)
-    now = time.monotonic()
-    for index, (work, age) in enumerate(((8, 200), (2, 20), (1, 1))):
-        job = connector._early.jobs[str(index)]
-        job.pending_hit, job.remaining_l2_work = 48, work
-        job.entered = now - age
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == ({"0": 2048, "1": 2048} if enabled else {})
-    assert output.total_num_scheduled_tokens <= 4096
-    assert len(scheduler.running) <= 2
-    connector.store.store_.LookupOnPrefix.assert_not_called()
-
-
-def test_zero_hit_ready_precedes_pending_backfill(connector, scheduler_factory):
-    scheduler = scheduler_factory(max_num_seqs=2, max_num_batched_tokens=6144)
-    requests = requests_of_sizes(8192, 4096)
-    attach(connector, scheduler, requests, ("PENDING", "READY"), (48, 0))
-    job = connector._early.jobs["0"]
-    job.pending_hit, job.remaining_l2_work = 48, 1
-    output = scheduler.schedule()
-    assert list(output.num_scheduled_tokens) == ["1", "0"]
-    assert output.num_scheduled_tokens == {"1": 4096, "0": 2048}
-
-
-def test_unfit_ready_yields_to_pending_that_fits(connector, scheduler_factory):
-    scheduler = scheduler_factory(num_blocks=16)
-    requests = requests_of_sizes(8192, 1024)
-    adapter = attach(connector, scheduler, requests, ("READY", "PENDING"), (60, 4))
-    job = connector._early.jobs["1"]
-    job.pending_hit, job.remaining_l2_work = 4, 1
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"1": 512}
-    assert job.state == "PENDING"
-    assert scheduler.waiting.peek_request() is requests[0]
-    assert [call.args[0].request_id for call in
-            adapter.get_num_new_matched_tokens.call_args_list] == ["0", "1"]
-    connector.store.store_.LookupOnPrefix.assert_not_called()
-
-
-def test_mamba_alignment_refusal_yields_to_another_ready(
-    connector, scheduler_factory, monkeypatch
-):
-    scheduler = scheduler_factory()
-    requests = requests_of_sizes(8192, 1024)
-    attach(connector, scheduler, requests, ("READY", "READY"), (60, 4))
-    scheduler.need_mamba_block_aligned_split = True
-
-    def split(request, tokens, *args):
-        return 0 if request is requests[0] else tokens
-
-    monkeypatch.setattr(scheduler, "_mamba_block_aligned_split", split)
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"1": 512}
-    assert scheduler.waiting.peek_request() is requests[0]

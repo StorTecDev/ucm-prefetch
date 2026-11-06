@@ -23,15 +23,14 @@ enable_metrics: true
 | --- | --- | --- | --- | --- |
 | `use_layerwise` | 选填 | bool | 默认 `true` | 是否启用分层（逐层）加载和保存模式。推荐设置为 `true`，DeepSeek v4 系列模型推荐设置为 `false`。 |
 | `enable_early_prefetch` | 选填 | bool | 默认 `false` | 启用 Early 预取路径；整块读取和 Early 调度选项要求开启。 |
-| `early_ready_priority` | 选填 | bool | 默认 `false` | vLLM 0.28.0/0.30.0 启用 Early 时，`true` 启用有效命中的 READY 优先、估算未缓存后缀排序及有界公平性补偿。`false` 关闭该策略；原生队列准入还要求 `early_pending_hrrn: false`。与预取 worker HRRN 独立，适用于 Direct/LayerWise 及同步/异步 scheduler，修改后重启。 |
-| `early_pending_hrrn` | 选填 | bool | 默认继承 `early_ready_priority` | 允许已固定命中前缀并持有引用的 PENDING 进入混合计算 batch，按 HRRN 选择 PENDING。独立启用准入补丁，不控制预取 worker HRRN；设为 `false` 保留原有 PENDING 门禁。 |
-| `early_ready_max_candidates` | 选填 | int | 默认 `64`；正整数 | 任一准入开关启用时，每轮原生匹配、分配的尝试上限。仅开启 PENDING 准入时保留非 PENDING 的原生位置；该上限不启用 READY 优先。两个开关均关闭时仍校验格式，但不生效。 |
+| `early_ready_priority` | 选填 | bool | 默认 `false` | vLLM 0.28.0/0.30.0 启用 Early 时，`false` 保持原生等待队列准入；`true` 启用有效命中的 READY 优先，按估算未缓存后缀排序，并启用有界扫描和公平性补偿。适用于 Direct/LayerWise 及同步/异步 scheduler，修改后重启。与 HRRN 加载调度独立。 |
+| `early_ready_max_candidates` | 选填 | int | 默认 `64`；正整数 | `early_ready_priority: true` 时，每轮等待调度的原生匹配、分配尝试上限。有效命中的 READY 请求可跨原生优先级优先尝试。开关关闭时仍校验格式，但不生效。 |
 | `early_ready_max_bypasses` | 选填 | int | 默认 `8`；正整数 | `early_ready_priority: true` 时，被较晚请求成功越过达到此次数后给予优先尝试；仍放不下时让后续请求推进，不为其预留 HBM。开关关闭时仍校验格式，但不生效。 |
 | `early_owner_max_waiting_jobs` | 选填 | int | 默认 `256`；正整数 | 整个 broker 等待 owner 准入的请求数上限。已进入等待的请求不因资源等待时长而失败。 |
 | `early_owner_max_waiting_candidate_blocks` | 选填 | int | 默认 `65536`；正整数 | 整个 broker 准入等待队列中的候选 ID 总数上限。限制元数据而非 L1 预留；新请求超过队列上限时回退。 |
 | `early_owner_max_retries` | 选填 | int | 默认 `1`；非负整数 | 首次 deferred 查询在发布批次前被原生健康检查明确拒绝，且旧 generation 已排空时，允许的新执行次数。`0` 禁用重试；资源等待和原批次恢复不计数。 |
 | `early_owner_retry_backoff_ms` | 选填 | int | 默认 `100`；非负整数 | 可恢复执行错误后的最小等待时间；仍须满足旧任务排空和 owner 准入条件。独立的后端健康冷却时间可能更长。 |
-| `early_prefetch_request_first` | 选填 | bool | 默认 `false` | 控制 L2→L1 预取加载，与计算 batch 准入独立。`true` 优先读取最早可提交请求；`false` 每轮按整个请求的 HRRN 评分一次，跨数据 batch 保持顺序。空闲 I/O 允许补位，前轮恢复后优先继续。 |
+| `early_prefetch_request_first` | 选填 | bool | 默认 `false` | 控制 L2→L1 预取加载，与计算准入独立。`true` 优先最早可提交请求；`false` 完整保留整请求 HRRN、跨数据分块的固定轮次、资源等待补位与恢复、重试年龄。依赖外部前缀的 PENDING 必须等 READY 才进入计算；完整 HBM 命中时取消预取的旁路保留。 |
 | `early_prefetch_min_submit_reads` | 选填 | int | 默认 `1`；1–64 | 补充提交所需的最小空闲读取单元数，自动限制在 owner 窗口内。`1` 不合批；I/O 窗口为空时立即补充。 |
 | `early_prefetch_submit_max_wait_ms` | 选填 | number | 默认 `2`；(0, 10] | 合批等待的毫秒上限，到期后在下一次执行器调度提交可用读取；不提供实时保证。 |
 | `enable_event_sync` | 选填 | bool | 默认 `true` | 性能优化开关，推荐开启。 |

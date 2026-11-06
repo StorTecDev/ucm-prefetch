@@ -146,9 +146,7 @@ class _EarlyConnectorMixin:
                         num_computed_tokens, request.num_tokens, time.monotonic_ns(),
                     )
                 hbm_only = True
-        if (job is not None and job.state == "PENDING" and not (
-                getattr(getattr(self._early, "scheduling", None), "pending_enabled", False)
-                and job.loadable)):
+        if job is not None and job.state == "PENDING":
             job.pending_probes += 1
             if job.first_pending_ns is None:
                 job.first_pending_ns = time.monotonic_ns()
@@ -167,7 +165,7 @@ class _EarlyConnectorMixin:
             if job is not None:
                 job.match_calls += 1
                 job.hbm_tokens, job.external_tokens = num_computed_tokens, result[0]
-            if job is not None and job.owner and job.loadable and not job.dispatched:
+            if job is not None and job.owner and job.state == "READY" and not job.dispatched:
                 meta = self.requests_meta.get(request.request_id)
                 job.expected = () if meta is None else tuple(meta.ucm_block_ids[
                     meta.hbm_hit_block_num * self.cp_world_size:
@@ -202,7 +200,7 @@ class _EarlyConnectorMixin:
     def _prefetch_direct_hit_key_hotness(self, hbm_hit_block_ids, all_hit_block_ids):
         context = self._lookup_context()
         if context is not None and context.job is not None:
-            if context.hbm_only or context.job.loadable:
+            if context.hbm_only or context.job.state == "READY":
                 return
         return super()._prefetch_direct_hit_key_hotness(
             hbm_hit_block_ids, all_hit_block_ids

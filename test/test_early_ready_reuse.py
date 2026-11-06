@@ -476,7 +476,6 @@ def test_worker_reservation_uses_native_mla_or_rank_local_identity(is_mla, rank)
     worker.owner_protocol = OwnerWorker(worker, {}, f"w0.{rank}")
     worker.condition = threading.Condition()
     worker.closed = False
-    worker.pending_backfill = False
     worker.control = Mock()
     worker.store = Mock()
     worker.store.reserve_prefix.return_value = {
@@ -692,22 +691,3 @@ def test_capacity_ready_never_recovers_unprotected_suffix_in_native_metadata(con
     assert ticket["protected_hit"] == hit and ticket["capacity_truncated"]
     assert ticket["expected"] == tuple(job.blocks[:hit])
     connector.store.store_.LookupOnPrefix.assert_not_called()
-
-
-def test_pending_owner_uses_pinned_hit_and_native_consumption_plan(connector):
-    from ucm.integration.vllm.early_scheduling import ReadyPriority
-
-    connector._early.scheduling = ReadyPriority({"early_ready_priority": True})
-    request = Request(token_count=12)
-    job = prepare(connector, request, state="PENDING")
-    job.blocks.append(b"c" * 16)
-    job.pending_hit, job.remaining_l2_work = 3, 2
-    job.owner, job.attempt, job.grant = "w0.0", "attempt", 1
-    connector._rank_consistency._tracker.mark_missing({job.blocks[2]})
-    assert connector.get_num_new_matched_tokens(request, 4) == (4, False)
-    assert job.state == "PENDING"
-    assert job.expected == (job.blocks[1],)
-    ticket = connector._early.owner_metadata({request.request_id: job.key})[request.request_id]
-    assert ticket["expected"] == job.expected and ticket["protected_hit"] == 3
-    connector.store.store_.LookupOnPrefix.assert_not_called()
-    connector._early.control.send.assert_not_called()

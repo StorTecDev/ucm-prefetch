@@ -165,13 +165,7 @@ class EarlyPipelineStore(UcmPipelineStore):
                 # dump-metadata generation run, without querying external KV.
                 return -1
             job = context.job
-            hit = None
-            if job is not None:
-                if job.state == "READY":
-                    hit = job.hit
-                elif job.state == "PENDING":
-                    hit = getattr(job, "pending_hit", None)
-            if hit is not None:
+            if job is not None and job.state == "READY":
                 # A waiting-request retry may start at the previous hit minus
                 # one block, beyond the HBM boundary. Count relative to the
                 # actual query slice, or native resume accounting double-counts
@@ -184,7 +178,7 @@ class EarlyPipelineStore(UcmPipelineStore):
                     return -1
                 # Rank-consistency filtering may also shorten the query.
                 count = min(
-                    max(hit - start, 0), len(block_ids), len(job.blocks) - start
+                    max(job.hit - start, 0), len(block_ids), len(job.blocks) - start
                 )
                 for index in range(count):
                     if job.blocks[start + index] != block_ids[index]:

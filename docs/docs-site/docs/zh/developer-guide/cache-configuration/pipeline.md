@@ -210,8 +210,8 @@ owner 协议均有变化，不得混用新旧库或 worker。通用测试位于
 `test/test_early_packed_layout.py`、`test/full_block_l2_probe.cc`、
 `test/packed_l2_probe.cc` 和 `test/early_scope_probe.cc`。
 
-连接器顶层配置 `early_prefetch_request_first: true` 可优先读取最早且可提交的请求；
-默认为 `false`，采用请求级分轮 HRRN：对当前可提交请求取快照，按整个请求的
+Early L2 读取采用请求级分轮 HRRN；根级 `early_prefetch_request_first`
+默认为 `false`，不再支持 `true`。基线调度逻辑为：对当前可提交请求取快照，按整个请求的
 剩余 native 加载字节数各评分一次，并在跨数据 batch 推进时保持轮内顺序。
 尚未查询的尾部按冷 native block 保守估算，保留查询与读取重叠。新请求进入后续
 轮次；前轮均无法提交时，后轮可用空闲 I/O 额度补位，前轮恢复后优先继续。
@@ -219,7 +219,7 @@ owner 协议均有变化，不得混用新旧库或 worker。通用测试位于
 其剩余读取全部提交后，下一个请求可在尾部尚未完成时使用空余额度；查询、激活或
 容量等待也允许其他请求补位，等待解除后重新判断可执行请求，不重新评分 HRRN 轮次。READY 仍要求该请求所有
 批次完成。原生读取批量和 L1 到设备的 layerwise 复制保持不变。大请求可能推迟
-后来的请求；此选项本身不保证提升设备带宽，也不保证文件在磁盘上物理连续。
+后来的请求；该调度策略不保证提升设备带宽，也不保证文件在磁盘上物理连续。
 
 已完成 AIO 读取现在会在整个 task 回收前归还其请求字节数对应的 I/O 额度。
 该计数只用于读取准入；pin、lease、错误状态与 READY 仍按原有 Check/Wait
@@ -228,8 +228,8 @@ owner 协议均有变化，不得混用新旧库或 worker。通用测试位于
 连接器可设置 `early_prefetch_min_submit_reads: 16` 与
 `early_prefetch_submit_max_wait_ms: 2` 对补充提交合批。空余额度不足阈值时继续
 轮询完成，到期后的下一次执行器调度即提交；没有在途 I/O 时立即填充。
-阈值自动限制在全局窗口以内，小 owner 配额不会因此死锁。默认最小提交数为 1
-（不合批）；允许 1–64 块及 (0, 10] ms。期限是调度期限，并非操作系统抢占下的
+阈值自动限制在全局窗口以内，小 owner 配额不会因此死锁。Early 开启时默认最小提交数为 16；
+显式设置 1 可关闭合批，允许 1–64 块及 (0, 10] ms。期限是调度期限，并非操作系统抢占下的
 实时保证。即使 I/O 额度已归零，仍需及时回收尚未结束的原生任务并保留其引用。
 
 ### 后台 AIO 写入窗口 { #bounded-background-aio-writes }

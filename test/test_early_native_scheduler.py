@@ -11,15 +11,12 @@ from test_early_ready_reuse import connector
 from tests.v1.core.utils import create_requests, create_scheduler
 from transformers import OPTConfig
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import RequestStatus
 
 from ucm.integration.vllm.early_prefetch import Job
-from ucm.integration.vllm.early_scheduling import ReadyPriority, patch_scheduler_class
 
 
 @pytest.fixture
-def scheduler_factory(tmp_path, monkeypatch):
+def scheduler_factory(tmp_path):
     OPTConfig(
         architectures=["OPTForCausalLM"],
         hidden_size=64,
@@ -29,8 +26,6 @@ def scheduler_factory(tmp_path, monkeypatch):
         max_position_embeddings=131072,
         vocab_size=1000,
     ).to_json_file(tmp_path / "config.json")
-    monkeypatch.setattr(Scheduler, "schedule", Scheduler.schedule)
-    patch_scheduler_class(Scheduler)
 
     def create(**overrides):
         options = dict(
@@ -58,11 +53,8 @@ def schedule(connector, scheduler_factory, states, *, hit=48, same_prompt=False)
     return scheduler, output, adapter
 
 
-def attach(connector, scheduler, requests, states, hits, *, ready_priority=True):
+def attach(connector, scheduler, requests, states, hits):
     connector.block_size = connector.hash_block_size = 128
-    connector._early.scheduling = ReadyPriority(
-        {"early_ready_priority": ready_priority}
-    )
     for request, state, hit in zip(requests, states, hits):
         scheduler.add_request(request)
         job = Job(request, request.all_token_ids, connector._early.identity(request))
@@ -131,190 +123,46 @@ def test_pending_without_hbm_coverage_still_skips(connector, scheduler_factory):
     connector._early.control.send.assert_not_called()
 
 
-def test_ready_uses_budget_before_earlier_failed_fallback(connector, scheduler_factory):
+def test_ready_does_not_jump_earlier_native_fallback(connector, scheduler_factory):
     _, output, adapter = schedule(connector, scheduler_factory, ("FAILED", "READY"))
     assert (
-        adapter.get_num_new_matched_tokens.call_args_list[0].args[0].request_id == "1"
+        adapter.get_num_new_matched_tokens.call_args_list[0].args[0].request_id == "0"
     )
-    assert output.num_scheduled_tokens["1"] == 2048
-    assert output.total_num_scheduled_tokens <= 4096
+    assert output.num_scheduled_tokens == {"0": 4096}
 
 
-def test_ready_can_pass_higher_native_priority_failed_request(
-    connector, scheduler_factory
-):
-    scheduler = scheduler_factory(max_num_batched_tokens=2048)
+def test_native_priority_is_preserved_for_ready_requests(connector, scheduler_factory):
+    scheduler = scheduler_factory(max_num_batched_tokens=512)
     scheduler.policy = SchedulingPolicy.PRIORITY
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.skipped_waiting = create_request_queue(scheduler.policy)
     requests = requests_of_sizes(8192, 8192)
-    requests[0].priority = -10
-    requests[1].priority = 10
-    adapter = attach(connector, scheduler, requests, ("FAILED", "READY"), (0, 48))
+    requests[0].priority, requests[1].priority = -10, 10
+    adapter = attach(connector, scheduler, requests, ("READY", "READY"), (48, 60))
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"1": 2048}
+    assert output.num_scheduled_tokens == {"0": 512}
     assert adapter.get_num_new_matched_tokens.call_count == 1
-    assert scheduler.waiting.peek_request() is requests[0]
-
-
-def test_failed_fair_attempt_cannot_stop_smaller_ready_on_hbm_failure(
-    connector, scheduler_factory
-):
-    scheduler = scheduler_factory(num_blocks=16)
-    requests = requests_of_sizes(8192, 1024)
-    adapter = attach(connector, scheduler, requests, ("FAILED", "READY"), (0, 4))
-    policy = connector._early.scheduling
-    policy.bypasses[requests[0]] = policy.max_bypasses
-    output = scheduler.schedule()
-    assert [
-        call.args[0].request_id
-        for call in adapter.get_num_new_matched_tokens.call_args_list
-    ] == ["0", "1"]
-    assert output.num_scheduled_tokens == {"1": 512}
-    assert scheduler.waiting.peek_request() is requests[0]
-    assert [
-        call.args[0] for call in adapter.update_state_after_alloc.call_args_list
-    ] == [requests[1]]
-
-
-def test_large_ready_allocation_failure_does_not_stop_smaller_ready(
-    connector, scheduler_factory
-):
-    scheduler = scheduler_factory(num_blocks=16)
-    requests = requests_of_sizes(8192, 1024)
-    adapter = attach(connector, scheduler, requests, ("READY", "READY"), (60, 4))
-    output = scheduler.schedule()
-    assert [
-        call.args[0].request_id
-        for call in adapter.get_num_new_matched_tokens.call_args_list
-    ] == ["0", "1"]
-    assert output.num_scheduled_tokens == {"1": 512}
-    assert scheduler.waiting.peek_request() is requests[0]
-    connector.store.store_.LookupOnPrefix.assert_not_called()
-
-
-def test_scan_limit_rotates_requests_when_every_attempt_waits(
-    connector, scheduler_factory
-):
-    scheduler = scheduler_factory()
-    requests = requests_of_sizes(8192, 8192, 8192, 8192)
-    adapter = attach(connector, scheduler, requests, ["PENDING"] * 4, [0] * 4)
-    connector._early.scheduling.max_candidates = 2
-    for _ in range(2):
-        output = scheduler.schedule()
-        assert not output.num_scheduled_tokens
-    assert [
-        call.args[0].request_id
-        for call in adapter.get_num_new_matched_tokens.call_args_list
-    ] == ["0", "1", "2", "3"]
-    assert len(scheduler.waiting) + len(scheduler.skipped_waiting) == 4
-
-
-def test_failed_request_gets_fair_attempt_after_younger_admissions(
-    connector, scheduler_factory
-):
-    scheduler = scheduler_factory(max_num_batched_tokens=512)
-    requests = requests_of_sizes(8192, 1024, 1024)
-    attach(connector, scheduler, requests, ("FAILED", "READY", "READY"), (0, 4, 4))
-    connector._early.scheduling.max_bypasses = 1
-    first = scheduler.schedule()
-    assert first.num_scheduled_tokens == {"1": 512}
-    scheduler.finish_requests(["1"], RequestStatus.FINISHED_STOPPED)
-    second = scheduler.schedule()
-    assert second.num_scheduled_tokens == {"0": 512}
-
-
-def test_zero_hit_ready_does_not_displace_original_waiting_order(
-    connector, scheduler_factory
-):
-    _, output, adapter = schedule(
-        connector, scheduler_factory, ("FAILED", "READY"), hit=0
-    )
-    assert (
-        adapter.get_num_new_matched_tokens.call_args_list[0].args[0].request_id == "0"
-    )
-    assert "0" in output.num_scheduled_tokens
-
-
-def test_non_early_connector_keeps_native_scheduler_order(connector, scheduler_factory):
-    scheduler = scheduler_factory()
-    requests = requests_of_sizes(8192, 8192)
-    adapter = attach(connector, scheduler, requests, ("FAILED", "READY"), (0, 48))
-    adapter.connector = None
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"0": 4096}
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_ready_priority_preserves_global_running_slot_limit(
+def test_native_running_slot_limit_is_preserved(
     connector, scheduler_factory, async_scheduling
 ):
     scheduler = scheduler_factory(max_num_seqs=1, async_scheduling=async_scheduling)
     requests = requests_of_sizes(8192, 8192)
     adapter = attach(connector, scheduler, requests, ("FAILED", "READY"), (0, 48))
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"1": 2048}
+    assert output.num_scheduled_tokens == {"0": 4096}
     assert len(scheduler.running) == 1
     assert adapter.get_num_new_matched_tokens.call_count == 1
 
 
-def test_ready_beyond_scan_budget_is_considered_before_fallback(
+def test_native_hbm_refusal_does_not_backfill_ready_requests(
     connector, scheduler_factory
-):
-    scheduler = scheduler_factory()
-    requests = requests_of_sizes(8192, 8192, 8192, 8192)
-    adapter = attach(
-        connector, scheduler, requests, ["FAILED"] * 3 + ["READY"], [0] * 3 + [48]
-    )
-    connector._early.scheduling.max_candidates = 1
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"3": 2048}
-    assert adapter.get_num_new_matched_tokens.call_count == 1
-
-
-def test_nonchunked_request_too_large_for_budget_yields_to_ready(
-    connector, scheduler_factory
-):
-    scheduler = scheduler_factory()
-    scheduler.scheduler_config.enable_chunked_prefill = False
-    requests = requests_of_sizes(8192, 1024)
-    attach(connector, scheduler, requests, ("FAILED", "READY"), (0, 4))
-    policy = connector._early.scheduling
-    policy.bypasses[requests[0]] = policy.max_bypasses
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"1": 512}
-    assert scheduler.waiting.peek_request() is requests[0]
-
-
-@pytest.mark.parametrize("refusal", ["encoder", "hbm"])
-def test_rejected_request_releases_encoder_references_before_backfill(
-    connector, scheduler_factory, monkeypatch, refusal
 ):
     scheduler = scheduler_factory(num_blocks=16)
     requests = requests_of_sizes(8192, 1024)
-    requests[0].mm_features = [object()]
-    adapter = attach(connector, scheduler, requests, ("FAILED", "READY"), (0, 4))
-    policy = connector._early.scheduling
-    policy.bypasses[requests[0]] = policy.max_bypasses
-    touched = set()
-    original_free = scheduler.encoder_cache_manager.free
-
-    def encoder_inputs(request, computed, tokens, budget, **kwargs):
-        touched.add(request.request_id)
-        return [], 0 if refusal == "encoder" else tokens, budget, []
-
-    def free(request):
-        touched.discard(request.request_id)
-        original_free(request)
-
-    def match(request, computed):
-        if request is requests[1]:
-            assert not touched
-        return connector.get_num_new_matched_tokens(request, computed)
-
-    monkeypatch.setattr(scheduler, "_try_schedule_encoder_inputs", encoder_inputs)
-    monkeypatch.setattr(scheduler.encoder_cache_manager, "free", free)
-    adapter.get_num_new_matched_tokens.side_effect = match
+    adapter = attach(connector, scheduler, requests, ("READY", "READY"), (60, 4))
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"1": 512}
-    assert not touched
+    assert output.num_scheduled_tokens == {}
+    assert adapter.get_num_new_matched_tokens.call_count == 1

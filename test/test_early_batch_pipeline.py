@@ -1,9 +1,10 @@
 """Real worker threads/control callbacks, mocked storage; no SSD/NPU claims."""
+
 import importlib
-from pathlib import Path
 import sys
 import threading
 import time
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -19,7 +20,7 @@ def wait(predicate):
     deadline = time.monotonic() + 3
     while not predicate():
         assert time.monotonic() < deadline, "bounded worker test wait expired"
-        time.sleep(.002)
+        time.sleep(0.002)
 
 
 def wait_answer(worker, key):
@@ -27,8 +28,10 @@ def wait_answer(worker, key):
     # Observing READY without the lock does not imply its answer was sent.
     def answered():
         with worker.condition:
-            return any(m.get("key") == key and m["op"] == "answer"
-                       for m in worker.control.messages)
+            return any(
+                m.get("key") == key and m["op"] == "answer"
+                for m in worker.control.messages
+            )
 
     wait(answered)
 
@@ -94,7 +97,12 @@ class Capability:
             self.protected_bytes = 0
             self.drained.set()
             raise RuntimeError("cancelled after draining")
-        if available and self.work > self.pending and not self.cancelled and not self.discarded:
+        if (
+            available
+            and self.work > self.pending
+            and not self.cancelled
+            and not self.discarded
+        ):
             self.submit()
             self.reads += 1
             if self.gate is None or self.gate.is_set():
@@ -103,17 +111,29 @@ class Capability:
                 self.pending += 1
             advanced = True
         done = self.work == 0 or (self.discarded and not self.pending)
-        return dict(done=done, advanced=advanced, inflight_bytes=self.pending,
-                    can_submit=self.work > self.pending and not self.cancelled and not self.discarded,
-                    remaining_l2_work=self.work, l2_read_bytes=self.reads,
-                    l2_read_shards=self.reads, coalesced_shards=0, total_hit_blocks=self.hit if done else 0,
-                    capacity_truncated=False, discarded=self.discarded)
+        return dict(
+            done=done,
+            advanced=advanced,
+            inflight_bytes=self.pending,
+            can_submit=self.work > self.pending
+            and not self.cancelled
+            and not self.discarded,
+            remaining_l2_work=self.work,
+            l2_read_bytes=self.reads,
+            l2_read_shards=self.reads,
+            coalesced_shards=0,
+            total_hit_blocks=self.hit if done else 0,
+            capacity_truncated=False,
+            discarded=self.discarded,
+        )
 
     def discard(self):
         self.discarded = True
 
     def snapshot(self):
-        return dict(l2_read_bytes=self.reads, completed_read_bytes=self.reads - self.pending)
+        return dict(
+            l2_read_bytes=self.reads, completed_read_bytes=self.reads - self.pending
+        )
 
 
 def result(handle, hit, work):
@@ -150,11 +170,17 @@ def test_first_batch_reads_before_next_reserve_finishes(worker):
     wait_answer(worker, "overlap")
     assert [len(ids) for ids in calls] == [32, 64]
     assert worker.control.messages[-1]["hit"] == 96
-    worker.bind(SimpleNamespace(early_keys={"r": "overlap"}, request_meta={
-        "r": SimpleNamespace(load_block_ids=([b"a" * 16], []))}))
+    worker.bind(
+        SimpleNamespace(
+            early_keys={"r": "overlap"},
+            request_meta={"r": SimpleNamespace(load_block_ids=([b"a" * 16], []))},
+        )
+    )
     worker.store.set_load_reservations.assert_called_with([1, 2])
     worker.loaded({"r"})
-    assert [call.args[0] for call in worker.store.release_reservation.call_args_list] == [1, 2]
+    assert [
+        call.args[0] for call in worker.store.release_reservation.call_args_list
+    ] == [1, 2]
 
 
 def test_all_l1_and_short_prefix_never_use_data_queue(worker):
@@ -189,7 +215,10 @@ def test_late_reservation_after_cancel_is_released_without_more_candidates(worke
 
 
 def test_later_lookup_failure_releases_earlier_batches_and_falls_back(worker):
-    worker.store.reserve_prefix.side_effect = [result(1, 32, 0), RuntimeError("L2 failed")]
+    worker.store.reserve_prefix.side_effect = [
+        result(1, 32, 0),
+        RuntimeError("L2 failed"),
+    ]
     worker.receive(dict(op="reserve", key="failed", blocks=blocks(96)))
     wait(lambda: worker.control.messages)
     assert worker.control.messages[-1]["state"] == "FAILED"
@@ -201,23 +230,42 @@ def test_later_lookup_failure_releases_earlier_batches_and_falls_back(worker):
 def test_each_block_identity_is_computed_once_across_batches(worker, mla, rank):
     worker.connector.is_mla, worker.connector.tp_rank = mla, rank
     handles = iter(range(1, 10))
-    worker.store.reserve_prefix.side_effect = lambda ids: result(next(handles), len(ids), 0)
+    worker.store.reserve_prefix.side_effect = lambda ids: result(
+        next(handles), len(ids), 0
+    )
     message = dict(op="reserve", key="once", blocks=blocks(96))
     worker.receive(message)
     worker.receive(message)
     wait(lambda: worker.jobs["once"].ready)
     assert worker.store.reserve_prefix.call_count == 2
     assert worker.connector.request_hasher.call_count == (96 if not mla and rank else 0)
-    submitted = [block for call in worker.store.reserve_prefix.call_args_list for block in call.args[0]]
-    assert submitted == ([bytes(reversed(block)) for block in message["blocks"]]
-                         if not mla and rank else message["blocks"])
+    submitted = [
+        block
+        for call in worker.store.reserve_prefix.call_args_list
+        for block in call.args[0]
+    ]
+    assert submitted == (
+        [bytes(reversed(block)) for block in message["blocks"]]
+        if not mla and rank
+        else message["blocks"]
+    )
 
 
 def test_hrrn_service_estimate_is_request_work_not_total_prefix(worker):
-    long = early.WorkerJob("long", blocks(512), entered=0, reserve_done=True,
-                          batches=[early.WorkerBatch(0, 0, result(1, 512, 1))])
-    short = early.WorkerJob("short", blocks(2), entered=0, reserve_done=True,
-                           batches=[early.WorkerBatch(0, 0, result(2, 2, 4))])
+    long = early.WorkerJob(
+        "long",
+        blocks(512),
+        entered=0,
+        reserve_done=True,
+        batches=[early.WorkerBatch(0, 0, result(1, 512, 1))],
+    )
+    short = early.WorkerJob(
+        "short",
+        blocks(2),
+        entered=0,
+        reserve_done=True,
+        batches=[early.WorkerBatch(0, 0, result(2, 2, 4))],
+    )
     assert worker.ratio(long, 10) == 11
     assert worker.ratio(long, 10) > worker.ratio(short, 10)
 
@@ -226,8 +274,14 @@ def enqueue(worker, key, handle, capability, age=0):
     reservation = result(handle, 32, capability.work)
     reservation["batch"] = capability
     batch = early.WorkerBatch(0, 0, reservation, entered=time.monotonic() - age)
-    job = early.WorkerJob(key, [], entered=batch.entered, batches=[batch],
-                         reserve_done=True, lookup_finished=True)
+    job = early.WorkerJob(
+        key,
+        [],
+        entered=batch.entered,
+        batches=[batch],
+        reserve_done=True,
+        lookup_finished=True,
+    )
     worker.jobs[key] = job
     worker.preparing.append((job, batch))
     return job, batch
@@ -253,21 +307,23 @@ def test_pending_long_read_does_not_block_another_request(worker):
     worker.store.prefetch_reserved.assert_not_called()  # no synchronous whole-job waits
 
 
-@pytest.mark.parametrize("request_first", [False, True])
 @pytest.mark.parametrize("minimum", [1, 16])
-def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker, request_first, minimum):
-    worker.request_first = request_first
+def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker, minimum):
     worker.min_submit_reads = minimum
     gates = [threading.Event(), threading.Event()]
     submitted = []
-    capabilities = [Capability(4, submit=lambda i=i: submitted.append(i), gate=gates[i])
-                    for i in range(2)]
+    capabilities = [
+        Capability(4, submit=lambda i=i: submitted.append(i), gate=gates[i])
+        for i in range(2)
+    ]
+
     def release(handle):
         cap = capabilities[handle - 1]
         cap.cancelled = True
         if not cap.pending:  # An unstarted reservation has no physical I/O to drain.
             cap.protected_bytes = 0
             cap.drained.set()
+
     worker.store.release_reservation.side_effect = release
     with worker.condition:
         for i, cap in enumerate(capabilities):
@@ -276,7 +332,7 @@ def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker, re
     closer = None
     try:
         wait(lambda: sum(cap.pending for cap in capabilities) == 2)
-        time.sleep(.02)
+        time.sleep(0.02)
         assert len(submitted) == 2  # the window is per worker, not per request
         closer = threading.Thread(target=worker.close)
         closer.start()
@@ -290,7 +346,9 @@ def test_window_is_shared_and_shutdown_drains_without_new_submissions(worker, re
         if closer is not None:
             closer.join(2)
     assert closer is not None and not closer.is_alive()
-    assert all(cap.drained.is_set() and cap.protected_bytes == 0 for cap in capabilities)
+    assert all(
+        cap.drained.is_set() and cap.protected_bytes == 0 for cap in capabilities
+    )
     assert len(submitted) == 2
 
 
@@ -309,22 +367,31 @@ def test_new_arrivals_do_not_preempt_selected_request(worker):
         worker.selected.clear()
 
 
-def test_finish_and_load_failure_are_not_reported_as_completed_handoff(worker, monkeypatch):
+def test_finish_and_load_failure_are_not_reported_as_completed_handoff(
+    worker, monkeypatch
+):
     logger = Mock()
     monkeypatch.setattr(early, "log", logger)
     with worker.condition:
         for key, handle in [("finished", 1), ("failed", 2), ("loaded", 3)]:
-            worker.jobs[key] = early.WorkerJob(key, [], batches=[
-                early.WorkerBatch(0, 0, result(handle, 1, 0), done=True)])
+            worker.jobs[key] = early.WorkerJob(
+                key,
+                [],
+                batches=[early.WorkerBatch(0, 0, result(handle, 1, 0), done=True)],
+            )
             worker.request_keys[key] = key
     worker.finished(["finished"])
     worker.loaded(["failed"], reason="load_failure")
     worker.loaded(["loaded"])
-    releases = [call.args for call in logger.info.call_args_list
-                if call.args[0].startswith("UCM_EARLY released")]
+    releases = [
+        call.args
+        for call in logger.info.call_args_list
+        if call.args[0].startswith("UCM_EARLY released")
+    ]
     assert [args[3] for args in releases] == ["finish", "load_failure", "handoff"]
     assert not worker.jobs
     assert worker.store.release_reservation.call_count == 3
+
 
 class TruncatingCapability(Capability):
     def __init__(self, hit, gate):
@@ -333,34 +400,46 @@ class TruncatingCapability(Capability):
 
     def step(self, available):
         result = super().step(available)
-        result['capacity_truncated'] = result['done'] and not self.discarded
+        result["capacity_truncated"] = result["done"] and not self.discarded
         return result
 
 
-@pytest.mark.parametrize('retained', [0, 7])
-def test_capacity_cutoff_waits_for_submitted_tail_drain_and_never_requeries(worker, retained):
+@pytest.mark.parametrize("retained", [0, 7])
+def test_capacity_cutoff_waits_for_submitted_tail_drain_and_never_requeries(
+    worker, retained
+):
     first_gate, tail_gate = threading.Event(), threading.Event()
-    first, tail = TruncatingCapability(retained, first_gate), Capability(4, gate=tail_gate)
+    first, tail = TruncatingCapability(retained, first_gate), Capability(
+        4, gate=tail_gate
+    )
     first_result, tail_result = result(1, 32, 1), result(2, 64, 4)
-    first_result['batch'], tail_result['batch'] = first, tail
+    first_result["batch"], tail_result["batch"] = first, tail
     worker.store.reserve_prefix.side_effect = [first_result, tail_result]
-    worker.receive(dict(op='reserve', key='cut', request='r', blocks=blocks(96)))
+    worker.receive(dict(op="reserve", key="cut", request="r", blocks=blocks(96)))
     try:
         wait(lambda: first.pending and tail.pending)
         first_gate.set()
-        wait(lambda: worker.jobs['cut'].capacity_end is not None)
-        assert not worker.jobs['cut'].ready
+        wait(lambda: worker.jobs["cut"].capacity_end is not None)
+        assert not worker.jobs["cut"].ready
         assert tail.discarded and not tail.drained.is_set()
         before = tail.reads
         tail_gate.set()
         wait_answer(worker, "cut")
         assert tail.reads == before
-        assert worker.control.messages[-1]['hit'] == retained
+        assert worker.control.messages[-1]["hit"] == retained
         assert worker.store.reserve_prefix.call_count == 2
-        worker.bind(SimpleNamespace(early_keys={'r': 'cut'}, request_meta={
-            'r': SimpleNamespace(load_block_ids=(blocks(retained), []))}))
+        worker.bind(
+            SimpleNamespace(
+                early_keys={"r": "cut"},
+                request_meta={
+                    "r": SimpleNamespace(load_block_ids=(blocks(retained), []))
+                },
+            )
+        )
         worker.store.set_load_reservations.assert_called_with([1] if retained else [])
-        assert any(c.args == (2,) for c in worker.store.release_reservation.call_args_list)
+        assert any(
+            c.args == (2,) for c in worker.store.release_reservation.call_args_list
+        )
     finally:
         first_gate.set()
         tail_gate.set()
@@ -370,37 +449,39 @@ def test_capacity_in_later_batch_preserves_completed_earlier_prefix(worker):
     gate = threading.Event()
     gate.set()
     last = result(2, 10, 1)
-    last['batch'] = TruncatingCapability(3, gate)
+    last["batch"] = TruncatingCapability(3, gate)
     worker.store.reserve_prefix.side_effect = [result(1, 32, 0), last]
-    worker.receive(dict(op='reserve', key='later', blocks=blocks(100)))
+    worker.receive(dict(op="reserve", key="later", blocks=blocks(100)))
     wait_answer(worker, "later")
-    assert worker.control.messages[-1]['hit'] == 35
+    assert worker.control.messages[-1]["hit"] == 35
     worker.store.release_reservation.assert_not_called()
 
 
 def test_late_reserve_after_capacity_cutoff_releases_without_publishing(worker):
     entered, finish, gate = threading.Event(), threading.Event(), threading.Event()
     calls = []
+
     def reserve(ids):
         calls.append(ids)
         if len(calls) == 1:
             r = result(1, 32, 1)
-            r['batch'] = TruncatingCapability(2, gate)
+            r["batch"] = TruncatingCapability(2, gate)
             return r
         entered.set()
         assert finish.wait(2)
         return result(2, len(ids), 0)
+
     worker.store.reserve_prefix.side_effect = reserve
-    worker.receive(dict(op='reserve', key='race', blocks=blocks(512)))
+    worker.receive(dict(op="reserve", key="race", blocks=blocks(512)))
     try:
         assert entered.wait(1)
         gate.set()
-        wait(lambda: worker.jobs['race'].capacity_end == 2)
-        assert not worker.jobs['race'].ready
+        wait(lambda: worker.jobs["race"].capacity_end == 2)
+        assert not worker.jobs["race"].ready
         finish.set()
         wait_answer(worker, "race")
-        assert worker.control.messages[-1]['hit'] == 2
-        assert len(worker.jobs['race'].batches) == 1
+        assert worker.control.messages[-1]["hit"] == 2
+        assert len(worker.jobs["race"].batches) == 1
         worker.store.release_reservation.assert_called_once_with(2)
     finally:
         gate.set()
@@ -412,44 +493,50 @@ def test_real_io_error_in_discarded_tail_is_failure_not_successful_capacity(work
     first = TruncatingCapability(7, first_gate)
     tail = Capability(4, gate=tail_gate)
     original = tail.step
+
     def faulty_step(available):
         result = original(available)
-        if result['done'] and tail.discarded:
-            raise OSError('backend fault after accepted tail I/O drain')
+        if result["done"] and tail.discarded:
+            raise OSError("backend fault after accepted tail I/O drain")
         return result
+
     tail.step = faulty_step
     a, b = result(1, 32, 1), result(2, 64, 4)
-    a['batch'], b['batch'] = first, tail
+    a["batch"], b["batch"] = first, tail
     worker.store.reserve_prefix.side_effect = [a, b]
-    worker.receive(dict(op='reserve', key='fault', blocks=blocks(96)))
+    worker.receive(dict(op="reserve", key="fault", blocks=blocks(96)))
     try:
         wait(lambda: first.pending and tail.pending)
         first_gate.set()
         wait(lambda: tail.discarded)
         tail_gate.set()
         wait_answer(worker, "fault")
-        assert worker.control.messages[-1]['state'] == 'FAILED'
+        assert worker.control.messages[-1]["state"] == "FAILED"
     finally:
         first_gate.set()
         tail_gate.set()
 
 
-@pytest.mark.parametrize("request_first", [False, True])
-@pytest.mark.parametrize("first_work, expected", [(4, ["first", "first"]), (1, ["first", "next"])])
-def test_request_priority_fills_window_and_backfills_unfinished_tail(worker, request_first, first_work, expected):
+@pytest.mark.parametrize(
+    "first_work, expected", [(4, ["first", "first"]), (1, ["first", "next"])]
+)
+def test_hrrn_round_fills_window_and_backfills_unfinished_tail(
+    worker, first_work, expected
+):
     first_gate, next_gate = threading.Event(), threading.Event()
     submitted = []
-    first = Capability(first_work, submit=lambda: submitted.append("first"), gate=first_gate)
+    first = Capability(
+        first_work, submit=lambda: submitted.append("first"), gate=first_gate
+    )
     next_cap = Capability(4, submit=lambda: submitted.append("next"), gate=next_gate)
     with worker.condition:
-        worker.request_first = request_first
         a, _ = enqueue(worker, "first", 1, first)
         b, _ = enqueue(worker, "next", 2, next_cap)
         a.entered, b.entered = 1, 2
         worker.condition.notify_all()
     try:
         wait(lambda: first.pending + next_cap.pending == 2)
-        time.sleep(.02)
+        time.sleep(0.02)
         assert submitted == expected
         assert not a.ready and not b.ready
         first_gate.set()
@@ -462,20 +549,27 @@ def test_request_priority_fills_window_and_backfills_unfinished_tail(worker, req
     wait(lambda: a.ready and b.ready)
 
 
-@pytest.mark.parametrize("request_first", [False, True])
-def test_request_priority_capacity_wait_backfills_and_resumes(worker, request_first):
+def test_hrrn_capacity_wait_backfills_and_resumes(worker):
     released, next_gate = threading.Event(), threading.Event()
+
     class CapacityWait(Capability):
         def step(self, available):
             if not released.is_set():
                 self.steps += 1
-                return dict(done=False, advanced=False, inflight_bytes=0, can_submit=False,
-                            remaining_l2_work=self.work, waiting_capacity=True, wait_epoch=0)
+                return dict(
+                    done=False,
+                    advanced=False,
+                    inflight_bytes=0,
+                    can_submit=False,
+                    remaining_l2_work=self.work,
+                    waiting_capacity=True,
+                    wait_epoch=0,
+                )
             return super().step(available)
+
     first = CapacityWait(1)
     later = Capability(4, gate=next_gate)
     with worker.condition:
-        worker.request_first = request_first
         a, batch = enqueue(worker, "first", 1, first)
         b, _ = enqueue(worker, "next", 2, later)
         a.entered, b.entered = 1, 2
@@ -495,12 +589,14 @@ def test_request_priority_capacity_wait_backfills_and_resumes(worker, request_fi
         next_gate.set()
 
 
-def test_request_first_orders_batches_and_skips_resource_blocked_jobs(worker):
+def test_hrrn_orders_batches_and_skips_resource_blocked_jobs(worker):
     with worker.condition:
-        worker.request_first = True
         a, first = enqueue(worker, "first", 1, Capability(3))
         b, other = enqueue(worker, "next", 2, Capability(3))
-        a.entered, b.entered = 1, 2
+        # The first request has two batches; its age must outweigh that work
+        # to win whole-request HRRN before exercising batch-order recovery.
+        now = time.monotonic()
+        a.entered, b.entered = now - 60, now - 10
         second = early.WorkerBatch(1, 32, result(3, 32, 3))
         a.batches.append(second)
         worker.preparing.insert(0, (a, second))
@@ -519,12 +615,9 @@ def test_request_first_orders_batches_and_skips_resource_blocked_jobs(worker):
         worker.selected.clear()
 
 
-def test_request_first_config_rejects_non_boolean_before_starting_threads():
-    with pytest.raises(ValueError, match="early_prefetch_request_first must be a boolean"):
-        early.EarlyWorker(SimpleNamespace(store=Mock(), launch_config={"early_prefetch_request_first": "true"}), Control)
-
-
-def test_returned_credit_does_not_hide_pending_task_from_completion_polling(worker, monkeypatch):
+def test_returned_credit_does_not_hide_pending_task_from_completion_polling(
+    worker, monkeypatch
+):
     """Credit can reach zero before the last callback publishes task completion."""
     finish, observed = threading.Event(), threading.Event()
     waits = []
@@ -533,12 +626,20 @@ def test_returned_credit_does_not_hide_pending_task_from_completion_polling(work
         def step(self, available):
             self.steps += 1
             done = finish.is_set()
-            return dict(done=done, advanced=self.steps == 1 or done,
-                        inflight_bytes=0, pending_read_tasks=0 if done else 1,
-                        can_submit=False, waiting_capacity=not done, wait_epoch=0,
-                        remaining_l2_work=0 if done else 1, l2_read_bytes=1,
-                        completed_read_bytes=1 if done else 0,
-                        total_hit_blocks=1, capacity_truncated=False)
+            return dict(
+                done=done,
+                advanced=self.steps == 1 or done,
+                inflight_bytes=0,
+                pending_read_tasks=0 if done else 1,
+                can_submit=False,
+                waiting_capacity=not done,
+                wait_epoch=0,
+                remaining_l2_work=0 if done else 1,
+                l2_read_bytes=1,
+                completed_read_bytes=1 if done else 0,
+                total_hit_blocks=1,
+                capacity_truncated=False,
+            )
 
     cap = CreditReturned(1)
     original_wait = worker.condition.wait
@@ -551,11 +652,12 @@ def test_returned_credit_does_not_hide_pending_task_from_completion_polling(work
 
     monkeypatch.setattr(worker.condition, "wait", record_wait)
     worker.store.reserve_prefix.return_value = dict(
-        handle=1, total_hit_blocks=1, remaining_l2_work=1, batch=cap)
+        handle=1, total_hit_blocks=1, remaining_l2_work=1, batch=cap
+    )
     worker.receive(dict(op="reserve", key="credit", blocks=blocks(1)))
     try:
         assert observed.wait(1)
-        assert waits[0] == .001  # Never take the two-second capacity-only sleep.
+        assert waits[0] == 0.001  # Never take the two-second capacity-only sleep.
     finally:
         with worker.condition:
             finish.set()
@@ -568,11 +670,14 @@ def test_returned_credit_does_not_hide_pending_task_from_completion_polling(work
 def test_completed_credit_is_coalesced_but_bounded_in_time(worker, monkeypatch, flush):
     clock, submissions = [10.0], []
     drain = threading.Event()
+
     class GroupedCapability(Capability):
         window_bytes = 8
+
         def __init__(self):
             super().__init__(32)
             self.retired = 0
+
         def step(self, available):
             self.steps += 1
             if drain.is_set():
@@ -585,16 +690,25 @@ def test_completed_credit_is_coalesced_but_bounded_in_time(worker, monkeypatch, 
                 self.pending += count
                 self.reads += count
                 submissions.append(count)
-            return dict(done=self.work == 0, advanced=bool(retired or count),
-                        inflight_bytes=self.pending, can_submit=self.work > self.pending,
-                        remaining_l2_work=self.work, total_hit_blocks=self.hit,
-                        l2_read_bytes=self.reads, l2_read_shards=self.reads,
-                        capacity_truncated=False)
-    monkeypatch.setattr(early, "time", SimpleNamespace(
-        monotonic=lambda: clock[0], monotonic_ns=time.monotonic_ns))
+            return dict(
+                done=self.work == 0,
+                advanced=bool(retired or count),
+                inflight_bytes=self.pending,
+                can_submit=self.work > self.pending,
+                remaining_l2_work=self.work,
+                total_hit_blocks=self.hit,
+                l2_read_bytes=self.reads,
+                l2_read_shards=self.reads,
+                capacity_truncated=False,
+            )
+
+    monkeypatch.setattr(
+        early,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], monotonic_ns=time.monotonic_ns),
+    )
     cap = GroupedCapability()
     with worker.condition:
-        worker.request_first = True
         worker.min_submit_reads, worker.submit_max_wait_ms = 4, 2
         job, batch = enqueue(worker, "coalesce", 1, cap)
         worker.condition.notify_all()
@@ -602,13 +716,13 @@ def test_completed_credit_is_coalesced_but_bounded_in_time(worker, monkeypatch, 
         wait(lambda: submissions == [8])
         cap.retired = 1
         wait(lambda: batch.inflight_bytes == 7)
-        time.sleep(.01)
+        time.sleep(0.01)
         assert submissions == [8]  # One retired unit is not a new tiny task.
         if flush == "threshold":
             cap.retired = 3
             expected = 4
         else:
-            clock[0] += .003
+            clock[0] += 0.003
             expected = 1
         with worker.condition:
             worker.condition.notify_all()
@@ -622,13 +736,16 @@ def test_completed_credit_is_coalesced_but_bounded_in_time(worker, monkeypatch, 
         wait(lambda: job.ready)
 
 
-@pytest.mark.parametrize("config", [
-    {"early_prefetch_min_submit_reads": 0},
-    {"early_prefetch_min_submit_reads": 65},
-    {"early_prefetch_min_submit_reads": True},
-    {"early_prefetch_submit_max_wait_ms": 0},
-    {"early_prefetch_submit_max_wait_ms": float("nan")},
-])
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"early_prefetch_min_submit_reads": 0},
+        {"early_prefetch_min_submit_reads": 65},
+        {"early_prefetch_min_submit_reads": True},
+        {"early_prefetch_submit_max_wait_ms": 0},
+        {"early_prefetch_submit_max_wait_ms": float("nan")},
+    ],
+)
 def test_invalid_coalescing_config_rejected_before_threads(config):
     with pytest.raises(ValueError, match="early_prefetch_"):
         early.EarlyWorker(SimpleNamespace(store=Mock(), launch_config=config), Control)

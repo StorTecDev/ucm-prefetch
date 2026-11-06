@@ -21,8 +21,13 @@ calls retain their existing defaults; no native Cache/Posix defaults change.
 | `cache_full_block_dump` | `ucm_connector_config` | `false` | `false` | `true` |
 | `cache_dump_capacity_policy` | `ucm_connector_config` | `spill` | `spill` | `wait` |
 
-The two scheduling defaults apply to all supported Early Direct and Early layerwise
-paths. They do not depend on the preset. To opt into the four storage defaults, add
+The two numeric scheduling defaults apply to all supported Early Direct and Early layerwise
+paths. They do not depend on the preset. The baseline switches
+`early_prefetch_request_first` and `early_ready_priority` both default to `false`;
+their removed `true` modes fail explicitly. HRRN loading and native compute
+admission remain independent of this preset.
+
+To opt into the four storage defaults, add
 both switches at the YAML root of an existing native `Cache|Posix` configuration:
 
 ```yaml

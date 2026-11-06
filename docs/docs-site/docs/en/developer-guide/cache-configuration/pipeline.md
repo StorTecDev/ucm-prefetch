@@ -276,9 +276,9 @@ changed; do not mix old and new libraries or workers. Generic coverage is in
 `test/test_early_packed_layout.py`, `test/full_block_l2_probe.cc`,
 `test/packed_l2_probe.cc`, and `test/early_scope_probe.cc`.
 
-The connector-level `early_prefetch_request_first: true` option prioritizes the
-oldest eligible request for L2 reads. The default (`false`) uses request-level
-HRRN rounds: snapshot currently eligible requests, score each once by its entire
+Early L2 reads use request-level HRRN rounds. The root
+`early_prefetch_request_first` switch defaults to `false`; `true` is no longer
+supported. Each round follows the baseline policy: snapshot currently eligible requests, score each once by its entire
 remaining load in native bytes, then retain that order across data batches.
 Unqueried tails are conservatively estimated as cold native blocks, preserving
 lookup/read overlap. Later arrivals enter a later round. If earlier rounds cannot
@@ -289,7 +289,7 @@ the tail completes. Lookup, activation and capacity waits also allow backfill;
 eligible work is reconsidered when they clear, without rescoring HRRN rounds.
 READY still requires all request
 batches to complete. L1-to-device layerwise copies and native read batching are
-unchanged. Large requests can delay younger requests; this option does not
+unchanged. Large requests can delay younger requests; this policy does not
 promise greater device bandwidth or physically contiguous files.
 
 Completed AIO reads now return their requested-byte I/O credit before the entire
@@ -303,7 +303,8 @@ and `early_prefetch_submit_max_wait_ms: 2`. Below the read-unit threshold, it
 continues polling completion and flushes at the next executor turn after the
 maximum wait. An empty I/O window is filled immediately. The threshold is
 clamped to the global window, so a small owner quota cannot deadlock. The
-minimum defaults to 1 (no coalescing); supported ranges are 1–64 reads and
+minimum defaults to 16 with Early enabled; 1 disables coalescing. Supported
+ranges are 1–64 reads and
 (0, 10] milliseconds. The wait is a scheduling deadline, not a real-time bound
 under OS descheduling. Completed credit reaching zero does not permit sleeping
 through pending native task completion or releasing their references.

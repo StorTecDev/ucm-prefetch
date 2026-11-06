@@ -164,3 +164,35 @@ def test_normalization_never_repairs_explicit_zero(name):
     config = configuration()
     config[name] = 0
     assert normalize(config)[name] == 0
+
+
+@pytest.mark.parametrize(
+    "flag", ["early_prefetch_request_first", "early_ready_priority"]
+)
+def test_baseline_scheduling_defaults_false_and_preserves_explicit_false(flag):
+    config = configuration()
+    assert normalize(config)[flag] is False
+    config[flag] = False
+    assert normalize(config)[flag] is False
+    config[flag] = True
+    with pytest.raises(ValueError, match=flag + "=true is no longer supported"):
+        normalize(config)
+    assert config[flag] is True
+
+
+@pytest.mark.parametrize(
+    "flag", ["early_prefetch_request_first", "early_ready_priority"]
+)
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
+def test_baseline_scheduling_switches_require_booleans(flag, value):
+    config = configuration()
+    config[flag] = value
+    with pytest.raises(ValueError, match=flag + " must be a boolean"):
+        normalize(config)
+
+
+@pytest.mark.parametrize("early", [MISSING, False])
+def test_disabled_early_keeps_unused_scheduling_options_unchanged(early):
+    config = configuration(early)
+    config.update(early_prefetch_request_first=True, early_ready_priority=True)
+    assert normalize(config) == config

@@ -6,6 +6,8 @@ from typing import Any
 _SCHEDULING_DEFAULTS = {
     "early_prefetch_min_submit_reads": 16,
     "early_owner_max_jobs": 16,
+    "early_prefetch_request_first": False,
+    "early_ready_priority": False,
 }
 _FULL_BLOCK_DEFAULTS = {
     "cache_full_block_load": True,
@@ -26,12 +28,22 @@ def normalize_early_config(config: dict[str, Any]) -> dict[str, Any]:
         options remain inactive when enable_early_prefetch is false or absent.
 
     Raises:
-        ValueError: The active preset switch is not boolean, or explicit store
-            overrides conflict with the enabled full-block preset.
+        ValueError: An active switch is not boolean, a removed scheduling mode
+            is requested, or store overrides conflict with the full-block preset.
     """
     normalized = copy.deepcopy(config)
     if not normalized.get("enable_early_prefetch", False):
         return normalized
+
+    for name in ("early_prefetch_request_first", "early_ready_priority"):
+        value = normalized.get(name, _SCHEDULING_DEFAULTS[name])
+        if type(value) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+        if value:
+            raise ValueError(
+                f"{name}=true is no longer supported; set {name}=false "
+                "to use baseline HRRN loading and native compute admission"
+            )
 
     full_block_defaults = normalized.get("early_full_block_defaults", False)
     if type(full_block_defaults) is not bool:

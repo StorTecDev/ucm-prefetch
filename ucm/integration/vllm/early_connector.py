@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 
@@ -11,6 +12,7 @@ from .early_prefetch import EarlyScheduler, EarlyWorker
 from .ucm_connector import (
     KVConnectorRole,
     UCMConnectorMetadata,
+    UCMCPConnector,
     UCMDirectConnector,
     UCMLayerWiseConnector,
     _get_store_io_sizes,
@@ -358,3 +360,39 @@ class EarlyDirectConnector(_EarlyConnectorMixin, UCMDirectConnector):
 
 class EarlyLayerWiseConnector(_EarlyConnectorMixin, UCMLayerWiseConnector):
     pass
+
+
+class EarlyCPConnector(_EarlyConnectorMixin, UCMCPConnector):
+    """Share one prefetch owner while each PCP worker consumes its native slice."""
+
+    _defer_cp_scheduler_store = True
+    _early_cp_owner_supported = True
+
+    def __init__(self, vllm_config, role, kv_cache_config=None):
+        parallel = vllm_config.parallel_config
+        if (
+            parallel.decode_context_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or not vllm_config.model_config.is_deepseek_mla
+        ):
+            raise ValueError(
+                "Early PCP requires MLA, decode_context_parallel_size=1 "
+                "and pipeline_parallel_size=1"
+            )
+        super().__init__(vllm_config, role, kv_cache_config)
+
+    def _load_launch_config(self, kv_transfer_config):
+        config = super()._load_launch_config(kv_transfer_config)
+        if not config.get("use_layerwise", True):
+            raise ValueError("Early PCP requires use_layerwise=true")
+        return config
+
+    def bind_connector_metadata(self, connector_metadata):
+        # Owner pins cover the global prefix. A consumer may acknowledge only
+        # its own native PCP slice, including an empty slice on short prefixes.
+        metadata = copy.deepcopy(connector_metadata)
+        for ticket in metadata.early_owners.values():
+            ticket["expected"] = tuple(ticket["expected"])[
+                self.current_rank :: self.cp_world_size
+            ]
+        super().bind_connector_metadata(metadata)

@@ -3209,6 +3209,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
 class UCMCPConnector(UCMLayerWiseConnector):
     _defer_scheduler_store = True
+    _defer_cp_scheduler_store = False
 
     @staticmethod
     def _consistency_manager_enabled(launch_config: dict, is_mla: bool) -> bool:
@@ -3266,8 +3267,9 @@ class UCMCPConnector(UCMLayerWiseConnector):
             self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
             self._other_rank_hashers = self._make_other_rank_hashers(vllm_config)
             self._seed = self.request_hasher.seed
-            # init scheduler-side connector
-            self.store = self._create_store(None)
+            # Early selects its pipeline after CP hashing has been initialized.
+            if not self._defer_cp_scheduler_store:
+                self.store = self._create_store(None)
         else:
             self.request_hasher = RequestHasher(
                 build_kv_hash_meta(vllm_config, self.tp_rank)
@@ -3725,7 +3727,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
 
         early_enabled = self.launch_config.get("enable_early_prefetch", False)
         if early_enabled and (
-            is_fawa or use_ratio_rate or use_cp_parallel or use_hybrid_linear_attention
+            is_fawa or use_ratio_rate or use_hybrid_linear_attention
         ):
             raise ValueError("Early requires the native direct or layerwise connector")
 
@@ -3734,7 +3736,12 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         elif use_ratio_rate:
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
-            self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
+            if early_enabled:
+                from .early_connector import EarlyCPConnector
+
+                self.connector = EarlyCPConnector(vllm_config, role, kv_cache_config)
+            else:
+                self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
         elif use_hybrid_linear_attention_layerwise:
             self.connector = UCMHybridLinearAttentionLayerWiseConnector(
                 vllm_config, role, kv_cache_config

@@ -14,12 +14,13 @@ from pathlib import Path
 import time
 import uuid
 
-from .early_control import BrokerState
 from .early_capacity import ExecutionWindow
+from .early_control import BrokerState
 from .early_errors import EarlyLookupUnavailable
+from .early_topology import worker_rank
 
 log = logging.getLogger(__name__)
-VERSION = 11
+VERSION = 12
 
 
 def worker_capability(connector):
@@ -31,8 +32,12 @@ def worker_capability(connector):
             return {"reason": "owner explicitly disabled"}
         if not connector.is_mla or not config.get("share_buffer_enable"):
             return {"reason": "not native MLA shared L1"}
-        if connector.cp_world_size != 1 or not native["backing"]:
-            return {"reason": "unverified shared mapping or CP layout"}
+        if not native["backing"]:
+            return {"reason": "unverified shared mapping"}
+        if connector.cp_world_size != 1 and getattr(
+            connector, "_early_cp_owner_supported", False
+        ) is not True:
+            return {"reason": "unverified CP consumer mapping"}
         if getattr(connector._vllm_config.parallel_config, "pipeline_parallel_size", 1) != 1:
             return {"reason": "PP consumer cohort is not supported by owner protocol"}
         shard, block = native["shard_bytes"], native["block_bytes"]
@@ -86,7 +91,7 @@ def worker_capability(connector):
         full_block_load = bool(config.get("cache_full_block_load", False))
         layout = [connector.unique_id, native, config["tensor_size_list"], full_block_load, packed,
                   connector.use_layerwise, connector.hash_block_size, connector.blocks_per_chunk,
-                  scheduler_hasher("UCM_HASH_SEED").hex()]
+                  scheduler_hasher("UCM_HASH_SEED").hex(), connector.cp_world_size]
         return dict(version=VERSION, domain=json.dumps(domain),
                     layout=hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest(),
                     unique_id=str(connector.unique_id), native=native, layers=layers,
@@ -94,7 +99,7 @@ def worker_capability(connector):
                     max_jobs=int(connector.launch_config.get("early_owner_max_jobs", 4)),
                     max_candidates=int(connector.launch_config.get("early_owner_max_candidate_blocks", 0)),
                     dp=connector._vllm_config.parallel_config.data_parallel_index,
-                    rank=connector.tp_rank % connector.tp_size,
+                    rank=worker_rank(connector),
                     ready=True, pid=os.getpid())
     except Exception as error:
         return {"reason": f"capability unavailable: {type(error).__name__}: {error}"}

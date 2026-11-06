@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from .early_control import Control
 from .early_errors import EarlyLookupUnavailable
+from .early_topology import worker_count, worker_rank
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class EarlyScheduler:
         self.dp_rank = parallel.data_parallel_index
         broker = (
             dict(
-                tp_size=connector.tp_size,
+                tp_size=worker_count(connector),
                 dp_size=getattr(parallel, "data_parallel_size", 1),
                 **admission_limits,
             )
@@ -500,7 +501,7 @@ class EarlyWorker:
         from .early_owner import worker_capability
         from .early_owner_worker import OwnerWorker
 
-        peer = f"w{dp_rank}.{connector.tp_rank % connector.tp_size}"
+        peer = f"w{dp_rank}.{worker_rank(connector)}"
         capability = worker_capability(connector)
         # Split the existing four slots only where deferred owner execution is
         # supported. Private/non-MLA keeps the original four lookup workers.

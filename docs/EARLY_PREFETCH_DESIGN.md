@@ -503,3 +503,26 @@ C++ Batch 仍遵守所选原生 backend 的 Load/Wait 契约：仅成功返回�
 `fast_path` 只计正命中且无需数据批的结果；owner 的 `outcome` 区分 zero_hit、
 l1_ready、prefetched 和 failed。原生 Get 回退数不代表 SSD 读取数，实际读取需核对
 load_l2_read_shards 与 Early 已提交/已完成字节，缺失记录不能记作零。
+
+
+## PCP layerwise integration
+
+Early PCP uses EarlyCPConnector, which retains native UCMCPConnector
+hashing and per-rank block slicing. The supported path is MLA layerwise
+prefill context parallelism with DCP and pipeline parallel sizes both one.
+Other combinations fail explicitly before native store construction.
+
+The control cohort contains every PCP and TP worker. With a verified shared
+MLA L1 mapping, one owner prefetches the global hash prefix once. Native loads
+and each worker's completion ticket use the same PCP slice. Pins are released
+only after every consumer reports successful native completion or retirement;
+an empty per-rank slice does not authorize releasing another rank's work.
+Private or unverified shared mappings retain the existing broadcast fallback,
+which does not guarantee a single L2 read.
+
+The scheduler creates its Early store only after CP hash initialization and
+pipeline selection, avoiding a second native store. PCP does not enable
+request-async loading or alter host-memory transfer configuration.
+
+CPU coverage is in test/test_early_pcp.py; device correctness must additionally
+verify the chosen model runner, graph mode, cache layout and shared mapping.

@@ -78,7 +78,7 @@ enable_metrics: true
 | `cache_load_backend_only` | 选填 | bool | 默认 `false` | 即使在 cache 层命中还是会强制从 SSD 上加载，仅供测试使用。 |
 | `cache_full_block_load` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | 仅限 Early：通过 Posix AIO 整块读入 L1，保留逐层设备搬运。普通 Cache/Posix 拒绝此选项。详见 [Pipeline Store](../developer-guide/cache-configuration/pipeline.md#full-block-l2-reads-with-layerwise-device-transfers)。 |
 | `cache_full_block_l1` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | 仅限 Early 整块读取，要求 `cache_full_block_load: true`。使用连续整块 L1 与单次 PREAD，保留逐层 H2D。见[整块 L1](../developer-guide/cache-configuration/pipeline.md#whole-block-l1-with-layerwise-h2d)。 |
-| `cache_full_block_dump` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | Early layerwise 整块写回，要求整块 L1、每 chunk 一个 block、PP=1 及普通 DMA；拒绝 GDR、SDMA Direct 和 IO aggregation。 |
+| `cache_full_block_dump` | 选填 | bool | 默认 `false`；Early 整块预设开启时为 `true` | Early layerwise 整块写回，要求整块 L1、每 chunk 一个 block、PP=1 及普通 DMA 或 A3 SDMA Direct（仅均匀布局）；拒绝 GDR 和 IO aggregation。 |
 | `cache_dump_capacity_policy` | 选填 | string | 默认 `spill`；Early 整块预设开启时为 `wait` | `wait` 要求整块 dump 且队列深度至少为二；等待 L1 容量时保留源数据依赖。关闭 dump 时须同时显式设为 `spill`。 |
 | `posix_packed_layer_bytes` | 选填 | list[int] | 不设置：均匀磁盘布局 | 仅限 Early 逐层整块管线。按层指定精确的 4096 字节对齐物理长度，并按真实张量验证；默认 L1 采用均匀布局，整块 L1 使用 packed 偏移。详见[紧凑布局](../developer-guide/cache-configuration/pipeline.md#packed-l2-layout)。 |
 | `cache_io_aggregation` | 选填 | bool | 默认 `false`，仅在 `PLATFORM=ascend` 且模型为 V4 时自动开启 | 启用 IO 聚合 h2d 传输，仅在 A2 设备生效。 |

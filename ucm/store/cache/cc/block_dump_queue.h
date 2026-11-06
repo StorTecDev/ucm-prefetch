@@ -314,8 +314,10 @@ private:
     void Run(std::promise<Status>& started)
     {
         CopyStream stream;
-        auto status = stream.Setup(config_.deviceId, config_.EffectiveStreamNumber(), false,
-                                   config_.EffectiveStagingBytes());
+        auto status = config_.cacheSdmaDirect
+            ? stream.SetupSdmaDirect(config_.deviceId, false)
+            : stream.Setup(config_.deviceId, config_.EffectiveStreamNumber(), false,
+                           config_.EffectiveStagingBytes());
         started.set_value(status);
         if (status.Failure()) { return; }
         if (WaitForCapacity()) { RunWaiting(stream); }
@@ -539,7 +541,12 @@ private:
         if (TestHooks::blockDumpCopyHook) { status = TestHooks::blockDumpCopyHook(shard); }
 #endif
         if (status.Success()) {
-            status = stream.DeviceToHostAsync(addresses.data(), handle.Data(), config_.tensorSizes);
+            // SDMA addresses the device alias; CPU padding and POSIX I/O still
+            // use the host view of the same pinned layer.
+            auto* destination = config_.cacheSdmaDirect ? handle.DeviceData() : handle.Data();
+            status = destination
+                ? stream.DeviceToHostAsync(addresses.data(), destination, config_.tensorSizes)
+                : Status::InvalidParam("block dump has no mapped destination");
         }
         auto drained = Drain(stream);
         if (status.Failure() || drained.Failure()) {

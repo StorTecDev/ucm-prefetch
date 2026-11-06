@@ -467,7 +467,9 @@ TEST_F(UCCacheBlockDumpTest, SchedulerStillRejectsInvalidBlockDumpConfiguration)
              c.Set("cache_full_block_dump", false);
          }},
         {"GDR", [](auto& c) { c.Set("use_gdr", true); }},
+#if !UCM_RUNTIME_ASCEND_SDMA_DIRECT
         {"SDMA direct", [](auto& c) { c.Set("cache_sdma_direct", true); }},
+#endif
     };
     for (const auto& [name, mutate] : invalid) {
         SCOPED_TRACE(name);
@@ -494,6 +496,22 @@ Detail::Dictionary IoAggregationConfig(StoreV1* backend, int32_t device)
     config.Set("cache_sdma_direct", false);
     return config;
 }
+
+#if !UCM_RUNTIME_ASCEND_SDMA_DIRECT
+TEST_F(UCCacheBlockDumpTest, UnsupportedSdmaDirectIsRejectedForBothRoles)
+{
+    ASSERT_NO_FATAL_FAILURE(Start());
+    for (int32_t device : {-1, 0}) {
+        SCOPED_TRACE(device);
+        auto config = IoAggregationConfig(backend.get(), device);
+        config.Set("cache_sdma_direct", true);
+        std::unique_ptr<StoreV1> store{MakeEarlyCacheStore()};
+        auto status = store->Setup(config);
+        EXPECT_EQ(status, Status::InvalidParam());
+        EXPECT_NE(status.ToString().find("SDMA Direct"), std::string::npos);
+    }
+}
+#endif
 
 TEST_F(UCCacheBlockDumpTest, FullBlockDumpRejectsRequestedIoAggregationForBothRoles)
 {

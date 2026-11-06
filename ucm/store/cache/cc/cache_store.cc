@@ -248,6 +248,12 @@ private:
                 "cache_io_aggregation is unsupported by this runtime build");
         }
 #endif
+#if !UCM_RUNTIME_ASCEND_SDMA_DIRECT
+        // Scheduler and worker must reject an unsupported transfer mode alike.
+        if (config.cacheSdmaDirect) {
+            return Status::InvalidParam("Cache SDMA Direct requires RUNTIME_ENVIRONMENT=ascend-a3");
+        }
+#endif
         if (!EarlyLayoutEnabled() && (config.cacheFullBlockLoad || config.cacheFullBlockL1 ||
                                       config.storeBackend->PackedLayerBytes(0))) {
             return Status::InvalidParam("full-block and packed layouts require EarlyCache");
@@ -267,9 +273,9 @@ private:
         }
         if (config.cacheFullBlockDump &&
             (!EarlyLayoutEnabled() || !config.cacheFullBlockL1 || config.useGdr ||
-             config.cacheIOAggregation || config.cacheSdmaDirect)) {
+             config.cacheIOAggregation)) {
             return Status::InvalidParam(
-                "block dump requires Early whole L1 and normal DMA");
+                "block dump requires Early whole L1 and ordinary DMA or A3 SDMA Direct");
         }
         // Scheduler stores may lack KV dimensions and never create a dump queue.
         if (config.deviceId >= 0 && config.cacheFullBlockDump &&
@@ -310,11 +316,6 @@ private:
                 return Status::InvalidParam("packed L2 block size disagrees with L1 layers");
             }
         }
-#if !UCM_RUNTIME_ASCEND_SDMA_DIRECT
-        if (config.cacheSdmaDirect) {
-            return Status::InvalidParam("Cache SDMA Direct requires RUNTIME_ENVIRONMENT=ascend-a3");
-        }
-#endif
         const auto nodeBytes = config.cacheFullBlockL1 ? config.storeBackend->FullBlockReadBytes() : config.shardSize;
         if (!nodeBytes) { return Status::InvalidParam("invalid physical L1 node size"); }
         auto bufferNumber = config.bufferCapacity / nodeBytes;

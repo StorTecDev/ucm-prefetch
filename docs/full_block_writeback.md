@@ -55,10 +55,11 @@ The preset never repairs conflicting overrides. Adjust related fields together:
 - Disabling `cache_full_block_load`, or enabling `cache_load_backend_only`, also
   requires L1 and dump disabled and policy `spill`.
 - Keeping dump enabled requires layerwise mode, one block per chunk, PP size one,
-  ordinary DMA, and a full-block write backend. Direct, PP, and multi-block chunks
+  ordinary DMA or A3 SDMA Direct, and a full-block write backend. Direct, PP, and multi-block chunks
   fail explicitly if dump remains enabled; these modes are not silently changed.
-- GDR, SDMA Direct, and IO aggregation remain incompatible with dump. SDMA defaults
-  depend on the build; the preset does not override them or any other runtime flag.
+- GDR and IO aggregation remain incompatible with dump. A3 SDMA Direct supports
+  uniform whole-block layouts using the mapped device alias; packed L2 remains
+  unsupported. SDMA defaults depend on the build and are not changed by the preset.
 - `wait` requires queue space for finalization (`waiting_queue_depth >= 2`) and can
   retain HBM sources while waiting for L1 capacity. It cannot reclaim reader pins.
 
@@ -95,9 +96,9 @@ posix_io_engine: aio
 ```
 
 Keep `use_layerwise: true` and one block per chunk. This implementation requires
-EarlyCache/EarlyPosix, whole-block L1, and ordinary DMA. Pipeline parallelism,
-GDR, SDMA direct and IO aggregation are rejected. Uniform and packed layouts are
-supported. Do not mix legacy layerwise writers and the new transactional writers
+EarlyCache/EarlyPosix, whole-block L1, and ordinary DMA or A3 SDMA Direct.
+Pipeline parallelism, GDR and IO aggregation are rejected. Ordinary DMA supports
+uniform and packed layouts; A3 SDMA Direct supports only uniform layouts. Do not mix legacy layerwise writers and the new transactional writers
 in one live storage namespace: legacy writers do not take the new writer lease.
 Existing archived blocks can be reused. Every participating writer must use the
 same mode. Unsupported configurations fail explicitly rather than selecting a
@@ -335,3 +336,15 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
 Use an interpreter with pytest for Python tests and a compatible Python development
 installation for the native binding. No GPU, vLLM service, model or downloaded weights
 are required for these tests.
+
+## A3 SDMA regression
+
+On an otherwise idle A3 device with an ascend-a3 build, run
+
+```sh
+python ucm/store/test/e2e/early_sdma_roundtrip.py --device 0 --directory TEST_DIRECTORY
+```
+
+The test uses separate writer and reader L1 pools to force persisted L2 reads,
+checks both spill and wait policies, null tensor slots, and three layer offsets.
+It verifies bytes after D2H → L2 → H2D; it is not a performance measurement.

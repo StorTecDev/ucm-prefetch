@@ -363,7 +363,7 @@ class EarlyLayerWiseConnector(_EarlyConnectorMixin, UCMLayerWiseConnector):
 
 
 class EarlyCPConnector(_EarlyConnectorMixin, UCMCPConnector):
-    """Share one prefetch owner while each PCP worker consumes its native slice."""
+    """Share one owner across all PCP consumers of the selected KV layout."""
 
     _defer_cp_scheduler_store = True
     _early_cp_owner_supported = True
@@ -388,8 +388,8 @@ class EarlyCPConnector(_EarlyConnectorMixin, UCMCPConnector):
         return config
 
     def bind_connector_metadata(self, connector_metadata):
-        # Owner pins cover the global prefix. A consumer may acknowledge only
-        # its own native PCP slice, including an empty slice on short prefixes.
+        # Owner pins cover the global prefix. Sharded consumers acknowledge
+        # their native slice; replicated consumers must finish the full prefix.
         metadata = copy.deepcopy(connector_metadata)
         for ticket in metadata.early_owners.values():
             ticket["expected"] = tuple(ticket["expected"])[

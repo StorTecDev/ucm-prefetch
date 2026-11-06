@@ -526,3 +526,27 @@ request-async loading or alter host-memory transfer configuration.
 
 CPU coverage is in test/test_early_pcp.py; device correctness must additionally
 verify the chosen model runner, graph mode, cache layout and shared mapping.
+
+
+### Replicated PCP cache layouts
+
+PCP compute topology does not necessarily describe KV storage topology.
+Ascend model runner V2 can gather each prefill shard into every PCP rank's
+cache, with the scheduler retaining the physical block token size. For that
+backend use `pcp_kv_cache_layout: replicated` in the UCM launch configuration.
+The default remains `sharded` for existing deployments; this is an explicit
+backend contract, not a device-name or version guess.
+
+The replicated mode requires Ascend MLA, layerwise transfer, and DCP=1.
+It leaves the model's PCP group intact, keeps UCM token accounting at the
+physical block size, and loads the complete prefix into every replica.
+Only PCP rank zero persists the shared KV copy; the existing MLA TP writer
+selection still applies. A worker's writer decision uses copied metadata.
+
+Owner control identities continue to cover PCP × TP independently of the
+KV data partition. Every replica must finish its full native load before
+the owner can retire, quiesce all consumers, and release shared L1 pins.
+Tests cover the full-prefix load plan, unique control peers, single writer,
+unchanged scheduler metadata, legacy sharded routing, and rejection of
+unsupported replicated modes. Model inference replay must additionally be
+validated on the selected backend before accepting performance results.

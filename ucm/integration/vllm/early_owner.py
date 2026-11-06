@@ -17,7 +17,7 @@ import uuid
 from .early_capacity import ExecutionWindow
 from .early_control import BrokerState
 from .early_errors import EarlyLookupUnavailable
-from .early_topology import worker_rank
+from .early_topology import worker_count, worker_rank
 
 log = logging.getLogger(__name__)
 VERSION = 12
@@ -34,7 +34,8 @@ def worker_capability(connector):
             return {"reason": "not native MLA shared L1"}
         if not native["backing"]:
             return {"reason": "unverified shared mapping"}
-        if connector.cp_world_size != 1 and getattr(
+        cp_size = getattr(connector, "cp_worker_world_size", connector.cp_world_size)
+        if cp_size != 1 and getattr(
             connector, "_early_cp_owner_supported", False
         ) is not True:
             return {"reason": "unverified CP consumer mapping"}
@@ -91,7 +92,8 @@ def worker_capability(connector):
         full_block_load = bool(config.get("cache_full_block_load", False))
         layout = [connector.unique_id, native, config["tensor_size_list"], full_block_load, packed,
                   connector.use_layerwise, connector.hash_block_size, connector.blocks_per_chunk,
-                  scheduler_hasher("UCM_HASH_SEED").hex(), connector.cp_world_size]
+                  scheduler_hasher("UCM_HASH_SEED").hex(), connector.cp_world_size,
+                  worker_count(connector)]
         return dict(version=VERSION, domain=json.dumps(domain),
                     layout=hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest(),
                     unique_id=str(connector.unique_id), native=native, layers=layers,

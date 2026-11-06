@@ -3219,6 +3219,25 @@ class UCMCPConnector(UCMLayerWiseConnector):
             )
         return False
 
+    def _load_launch_config(self, kv_transfer_config):
+        config = super()._load_launch_config(kv_transfer_config)
+        layout = config.get("pcp_kv_cache_layout", "sharded")
+        if layout not in ("sharded", "replicated"):
+            raise ValueError("pcp_kv_cache_layout must be sharded or replicated")
+        parallel = self._vllm_config.parallel_config
+        if layout == "replicated" and (
+            getattr(current_platform, "device_type", None) != "npu"
+            or parallel.decode_context_parallel_size != 1
+            or not self.is_mla
+            or not config.get("use_layerwise", True)
+        ):
+            raise ValueError(
+                "Replicated PCP cache requires Ascend MLA layerwise and "
+                "decode_context_parallel_size=1"
+            )
+        self.pcp_kv_cache_layout = layout
+        return config
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -3253,6 +3272,13 @@ class UCMCPConnector(UCMLayerWiseConnector):
             * self._vllm_config.parallel_config.decode_context_parallel_size
         )
         self.current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
+        # Ascend MRV2 can partition computation while replicating the KV cache.
+        # Control peers still span PCP, but KV addresses must not be divided.
+        self.cp_worker_world_size = self.cp_world_size
+        self.cp_worker_rank = self.current_rank
+        if self.pcp_kv_cache_layout == "replicated":
+            self.cp_world_size = 1
+            self.current_rank = 0
         old_tp_size = vllm_config.parallel_config.tensor_parallel_size
         logger.info(
             f"pcp_world_size: {self.pcp_world_size}, pcp_rank: {self.pcp_rank}, dcp_world_size: {self.dcp_world_size}, dcp_rank: {self.dcp_rank}"
@@ -3280,15 +3306,22 @@ class UCMCPConnector(UCMLayerWiseConnector):
         logger.info("Init UCMCPConnector.")
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        # When DCP/PCP features are enabled,
-        # the blocks that each device can process are [current_rank :: cp_world_size],
-        # where current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank.
+        replicated = getattr(self, "pcp_kv_cache_layout", "sharded") == "replicated"
+        if replicated:
+            # A worker's writer decision must not mutate shared scheduler data.
+            connector_metadata = copy.deepcopy(connector_metadata)
+        # For replicated KV the data partition is rank 0 of 1; the actual PCP
+        # rank remains available separately for control membership and writes.
         for _, request in connector_metadata.request_meta.items():
             if len(request.load_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.load_block_ids
                 ucm_block_ids = ucm_block_ids[self.current_rank :: self.cp_world_size]
                 request.load_block_ids = (ucm_block_ids, vllm_block_ids)
 
+            if replicated and self.pcp_rank != 0:
+                # PCP replicas carry identical MLA KV. Persist one shared copy,
+                # as the existing MLA path already does for TP replicas.
+                request.dump_block_ids = ([], [])
             if len(request.dump_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.dump_block_ids
                 ucm_block_ids = ucm_block_ids[self.current_rank :: self.cp_world_size]

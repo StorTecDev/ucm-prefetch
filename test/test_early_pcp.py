@@ -182,7 +182,10 @@ def test_missing_pcp_peer_cannot_be_replaced_by_duplicate_tp_identity():
     assert not any(message["op"] == "owner_reserve" for _, message in cluster.out)
 
 
-def test_verified_pcp_owner_capability_has_unique_rank_and_shared_layout(monkeypatch):
+@pytest.mark.parametrize("replicated", [False, True])
+def test_verified_pcp_owner_capability_has_unique_rank_and_shared_layout(
+    monkeypatch, replicated
+):
     import sys
 
     from test_early_owner_protocol import owner, package
@@ -234,12 +237,126 @@ def test_verified_pcp_owner_capability_has_unique_rank_and_shared_layout(monkeyp
             model_config=SimpleNamespace(max_model_len=4096),
         ),
     )
+    if replicated:
+        c.cp_world_size = 1
+        c.cp_worker_world_size = 16
+        c.block_size = c.hash_block_size
     capabilities = []
     for rank in range(16):
-        c.current_rank = rank
+        if replicated:
+            c.cp_worker_rank = rank
+        else:
+            c.current_rank = rank
         capabilities.append(owner.worker_capability(c))
     assert all(cap.get("ready") for cap in capabilities)
     assert {cap["rank"] for cap in capabilities} == set(range(16))
     assert len({cap["layout"] for cap in capabilities}) == 1
     c._early_cp_owner_supported = False
     assert not owner.worker_capability(c).get("ready", False)
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_replicated_pcp_loads_full_prefix_and_persists_one_copy(
+    constructor_config, monkeypatch, early
+):
+    import vllm.distributed as distributed
+    from ucm.integration.vllm import ucm_connector
+
+    config, launch, _ = constructor_config
+    config.parallel_config.prefill_context_parallel_size = 16
+    config.cache_config.block_size = 128
+    launch.update(
+        use_layerwise=True,
+        enable_early_prefetch=early,
+        pcp_kv_cache_layout="replicated",
+    )
+    monkeypatch.setattr(
+        ucm_connector.current_platform, "device_type", "npu", raising=False
+    )
+    rank = 0
+    monkeypatch.setattr(
+        distributed,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=16, rank_in_group=rank),
+    )
+    monkeypatch.setattr(
+        distributed,
+        "get_dcp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+    )
+    # This prefix was previously advertised as 38,912 tokens while each
+    # replica restored only 19 physical blocks (2,432 tokens).
+    blocks = [i.to_bytes(16, "little") for i in range(304)]
+    physical = list(range(1, 305))
+    metadata = SimpleNamespace(
+        request_meta={
+            "r": SimpleNamespace(
+                load_block_ids=(blocks, physical),
+                dump_block_ids=(blocks, physical),
+            )
+        },
+        early_owners={
+            "r": {"key": "job", "attempt": "generation", "expected": tuple(blocks)}
+        },
+        early_keys={"r": "job"},
+    )
+    before = copy.deepcopy(metadata)
+    observed = []
+    monkeypatch.setattr(
+        UCMLayerWiseConnector,
+        "bind_connector_metadata",
+        lambda self, value: observed.append(value),
+    )
+    peers, writers = set(), []
+    for rank in range(16):
+        connector = UCMConnector(config, KVConnectorRole.WORKER).connector
+        assert connector.block_size == connector.hash_block_size == 128
+        assert connector.cp_world_size == 1 and connector.current_rank == 0
+        assert worker_count(connector) == 16
+        peers.add(worker_rank(connector))
+        if early:
+            connector._early = Mock()
+        connector.bind_connector_metadata(metadata)
+        local = observed[-1]
+        assert local.request_meta["r"].load_block_ids == (blocks, physical)
+        if local.request_meta["r"].dump_block_ids[0]:
+            writers.append(rank)
+            assert local.request_meta["r"].dump_block_ids == (blocks, physical)
+        else:
+            assert local.request_meta["r"].dump_block_ids == ([], [])
+        if early:
+            assert local.early_owners["r"]["expected"] == tuple(blocks)
+            connector._early.bind.assert_called_once()
+            bound = connector._early.bind.call_args.args[0]
+            assert bound.early_owners == local.early_owners
+            assert bound.request_meta["r"].load_block_ids == (blocks, physical)
+    assert peers == set(range(16))
+    assert writers == [0]
+    assert metadata == before
+
+
+@pytest.mark.parametrize("unsupported", ["layout", "dcp", "non_mla", "direct", "cuda"])
+def test_replicated_pcp_rejects_unverified_modes_before_store(
+    constructor_config, monkeypatch, unsupported
+):
+    from ucm.integration.vllm import ucm_connector
+
+    config, launch, _ = constructor_config
+    config.parallel_config.prefill_context_parallel_size = 16
+    launch.update(use_layerwise=True, pcp_kv_cache_layout="replicated")
+    monkeypatch.setattr(
+        ucm_connector.current_platform, "device_type", "npu", raising=False
+    )
+    if unsupported == "layout":
+        launch["pcp_kv_cache_layout"] = "unknown"
+    elif unsupported == "dcp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif unsupported == "non_mla":
+        config.model_config.is_deepseek_mla = False
+    elif unsupported == "direct":
+        launch["use_layerwise"] = False
+    else:
+        monkeypatch.setattr(ucm_connector.current_platform, "device_type", "cuda")
+    with pytest.raises(ValueError, match="pcp_kv_cache_layout|Replicated PCP cache"):
+        UCMCPConnector(config, KVConnectorRole.SCHEDULER)
+    UCMDirectConnector._create_store.assert_not_called()

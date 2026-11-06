@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 from test_early_owner_protocol import Cluster, capability
 from test_early_request_async import constructor_config
+
 from ucm.integration.vllm.early_connector import EarlyCPConnector
 from ucm.integration.vllm.early_consumer import Consumer, load_scope
 from ucm.integration.vllm.early_topology import worker_count, worker_rank
@@ -260,6 +261,7 @@ def test_replicated_pcp_loads_full_prefix_and_persists_one_copy(
     constructor_config, monkeypatch, early
 ):
     import vllm.distributed as distributed
+
     from ucm.integration.vllm import ucm_connector
 
     config, launch, _ = constructor_config
@@ -360,3 +362,88 @@ def test_replicated_pcp_rejects_unverified_modes_before_store(
     with pytest.raises(ValueError, match="pcp_kv_cache_layout|Replicated PCP cache"):
         UCMCPConnector(config, KVConnectorRole.SCHEDULER)
     UCMDirectConnector._create_store.assert_not_called()
+
+
+@pytest.mark.parametrize("full_block", [False, True])
+@pytest.mark.parametrize("early", [False, True])
+def test_replicated_nonwriters_acknowledge_without_waiting_for_native_dump(
+    constructor_config, monkeypatch, full_block, early
+):
+    import vllm.distributed as distributed
+
+    from ucm.integration.vllm import ucm_connector
+
+    config, launch, _ = constructor_config
+    config.parallel_config.prefill_context_parallel_size = 16
+    launch.update(
+        use_layerwise=True,
+        enable_early_prefetch=early,
+        pcp_kv_cache_layout="replicated",
+    )
+    monkeypatch.setattr(
+        ucm_connector.current_platform, "device_type", "npu", raising=False
+    )
+    rank = 0
+    monkeypatch.setattr(
+        distributed,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=16, rank_in_group=rank),
+    )
+    monkeypatch.setattr(
+        distributed,
+        "get_dcp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+    )
+    metadata = SimpleNamespace(
+        request_meta={
+            "dump": SimpleNamespace(
+                load_block_ids=([], []), dump_block_ids=([b"x" * 16], [5])
+            ),
+            "read_only": SimpleNamespace(
+                load_block_ids=([b"y" * 16], [6]), dump_block_ids=([], [])
+            ),
+        },
+        early_owners={},
+        early_keys={},
+    )
+    monkeypatch.setattr(
+        UCMLayerWiseConnector,
+        "bind_connector_metadata",
+        lambda self, value: setattr(self, "_connector_metadata", value),
+    )
+    confirmations = []
+    for rank in range(16):
+        connector = UCMConnector(config, KVConnectorRole.WORKER).connector
+        connector._block_dump_enabled = full_block
+        connector._early = Mock()
+        connector._rank_consistency = Mock()
+        connector._poll_pending_load_tasks = Mock(return_value=set())
+        connector._poll_pending_dump_tasks = Mock()
+        connector._wait_pending_dump_sources = Mock()
+        connector._pending_dump_tasks = []
+        connector.bind_connector_metadata(metadata)
+        local = connector._connector_metadata
+        if rank == 0:
+            # The real writer registers the transfer in wait_for_save.
+            connector._async_dump_req_ids.add("dump")
+            if not full_block:
+                pending = SimpleNamespace(request_ids={"dump"})
+                connector._pending_dump_tasks = [pending]
+                connector._wait_pending_dump_task = Mock()
+        else:
+            assert local.request_meta["dump"].dump_block_ids == ([], [])
+        assert connector.get_finished(set()) == (None, None)
+        sent, received = connector.get_finished({"dump", "read_only"})
+        confirmations.append(sent)
+        assert received is None
+        assert sent == {"dump"}
+        assert connector.get_finished({"dump"}) == (None, None)
+        if rank == 0:
+            if full_block:
+                connector._wait_pending_dump_sources.assert_any_call({"dump"})
+            else:
+                connector._wait_pending_dump_task.assert_called_once_with(pending)
+        else:
+            assert not connector._pending_dump_tasks
+    # vLLM's transfer aggregator requires all PCP workers, not only the writer.
+    assert sum("dump" in (sent or set()) for sent in confirmations) == 16

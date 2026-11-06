@@ -348,3 +348,12 @@ python ucm/store/test/e2e/early_sdma_roundtrip.py --device 0 --directory TEST_DI
 The test uses separate writer and reader L1 pools to force persisted L2 reads,
 checks both spill and wait policies, null tensor slots, and three layer offsets.
 It verifies bytes after D2H → L2 → H2D; it is not a performance measurement.
+
+### Replicated PCP completion
+
+Replicated PCP persists one KV copy from PCP rank 0, but every PCP worker must
+acknowledge a completed request to vLLM's transfer aggregator. Non-writers retain
+the request's asynchronous completion token while omitting their duplicate
+dump. They report it only when vLLM supplies the finished request ID. Rank 0
+still fences its source buffers before acknowledging, so aggregate completion
+cannot release HBM while its native copy remains in flight.

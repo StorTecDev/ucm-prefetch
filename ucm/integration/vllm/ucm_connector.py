@@ -3312,15 +3312,18 @@ class UCMCPConnector(UCMLayerWiseConnector):
             connector_metadata = copy.deepcopy(connector_metadata)
         # For replicated KV the data partition is rank 0 of 1; the actual PCP
         # rank remains available separately for control membership and writes.
-        for _, request in connector_metadata.request_meta.items():
+        for request_id, request in connector_metadata.request_meta.items():
             if len(request.load_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.load_block_ids
                 ucm_block_ids = ucm_block_ids[self.current_rank :: self.cp_world_size]
                 request.load_block_ids = (ucm_block_ids, vllm_block_ids)
 
             if replicated and self.pcp_rank != 0:
-                # PCP replicas carry identical MLA KV. Persist one shared copy,
-                # as the existing MLA path already does for TP replicas.
+                # vLLM still needs every PCP rank's completion acknowledgement.
+                # Keep the lifecycle token even though only rank 0 writes KV;
+                # its source fence gates the aggregate before HBM is recycled.
+                if request.dump_block_ids[0]:
+                    self._async_dump_req_ids.add(request_id)
                 request.dump_block_ids = ([], [])
             if len(request.dump_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.dump_block_ids
@@ -3759,9 +3762,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
                 use_hybrid_linear_attention_layerwise = False
 
         early_enabled = self.launch_config.get("enable_early_prefetch", False)
-        if early_enabled and (
-            is_fawa or use_ratio_rate or use_hybrid_linear_attention
-        ):
+        if early_enabled and (is_fawa or use_ratio_rate or use_hybrid_linear_attention):
             raise ValueError("Early requires the native direct or layerwise connector")
 
         if is_fawa:

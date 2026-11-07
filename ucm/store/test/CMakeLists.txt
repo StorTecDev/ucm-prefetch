@@ -45,3 +45,13 @@ endif()
 if(BUILD_UNIT_TESTS AND RUNTIME_ENVIRONMENT STREQUAL "simu")
     target_compile_definitions(ucmstore.test PRIVATE UCM_HOST_REGISTRATION_SIMU_TEST)
 endif()
+
+if(BUILD_UNIT_TESTS AND RUNTIME_ENVIRONMENT STREQUAL "simu")
+    add_executable(cache_a5_host_memory.test
+        ascend_a5/host_memory_config_test.cc
+        ../cache/cc/host_memory_config.cc)
+    target_compile_definitions(cache_a5_host_memory.test PRIVATE UCM_ASCEND_PINNED_SHARED_L1=1)
+    target_include_directories(cache_a5_host_memory.test PRIVATE ../cache/cc)
+    target_link_libraries(cache_a5_host_memory.test PRIVATE storeintf gtest_main)
+    gtest_discover_tests(cache_a5_host_memory.test)
+endif()

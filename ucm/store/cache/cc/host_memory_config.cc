@@ -30,8 +30,8 @@ std::string Config::EffectiveHostMemoryMode() const
 {
     if (cacheHostMemoryMode == "staged") { return "pageable"; }
     if (cacheHostMemoryMode != "default") { return cacheHostMemoryMode; }
-#if defined(UCM_ASCEND_PAGEABLE_SHARED_L1)
-    if (shareBufferEnable) { return "pageable"; }
+#if defined(UCM_ASCEND_PINNED_SHARED_L1)
+    if (shareBufferEnable) { return "pin_only"; }
 #endif
     return "mapped";
 }

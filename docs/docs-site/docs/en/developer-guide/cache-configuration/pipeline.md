@@ -340,21 +340,29 @@ The cache supports explicit registration modes for shared L1 buffers:
 | cache_host_memory_mode | default | Select default, pageable, pin_only, or staged. Explicit modes require share_buffer_enable=true. |
 | cache_pin_allow_pageable_fallback | false | Allow failed pin_only registration to continue with pageable memory, with a warning. |
 
-The default mode preserves pageable shared buffers for ascend-a5 builds and mapped
-registration for other runtimes. Pin-only registration calls aclrtHostRegisterV2
-with ACL_HOST_REG_PINNED alone: it does not request a device alias. This requires
-SDK support for that API; unsupported builds fail explicitly. Runtime registration
-success does not guarantee asynchronous DMA or higher bandwidth.
+The default mode selects pin_only for shared buffers in ascend-a5 builds and
+mapped registration otherwise. Pin-only registration calls aclrtHostRegisterV2
+with ACL_HOST_REG_PINNED alone: it does not request a device alias. Ordinary
+aclrtMemcpyAsync calls then use the registered host pointer without an application
+staging copy. Registration failure is fatal by default; there is no automatic
+pageable or staged fallback. This requires both SDK support for that API and a
+driver/runtime combination that supports asynchronous copies from registered host
+memory. Registration success alone does not prove DMA correctness or bandwidth.
+
+On A5, leave cache_sdma_direct, cache_io_aggregation, and use_gdr disabled.
+cache_sdma_direct selects the separate A3 mapped SDMA implementation; disabling
+it does not disable ordinary ACL DMA.
 
 Pageable and pin_only modes use ordinary host-pointer copies. They reject GDR,
 I/O aggregation, and direct SDMA options that require a mapped device pointer.
 Registration failure is fatal unless fallback is explicitly enabled. A successful
 registration is released before its shared mapping is unmapped.
 
-To roll back the opt-in, use cache_host_memory_mode=default and
-cache_pin_allow_pageable_fallback=false. The configurable A5 default replaces any
-external patch that unconditionally bypasses shared-buffer registration; applying
-that patch again would bypass the pin-only opt-in as well.
+For an explicit compatibility fallback on older environments, set
+cache_host_memory_mode=pageable with share_buffer_enable=true and
+cache_pin_allow_pageable_fallback=false. This disables registration and is not the
+native registered-DMA path. Do not apply external patches that unconditionally
+skip shared-buffer registration: they also bypass the A5 default and pin_only.
 
 ### Bounded pinned host staging
 

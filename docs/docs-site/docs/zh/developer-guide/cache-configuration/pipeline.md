@@ -259,17 +259,23 @@ lease 和写入提交语义保持不变。
 | cache_host_memory_mode | default | 可选 default、pageable、pin_only、staged；显式模式要求 share_buffer_enable=true。 |
 | cache_pin_allow_pageable_fallback | false | 仅允许 pin_only 注册失败后继续使用 pageable 内存，并输出警告。 |
 
-default 在 ascend-a5 构建中保留共享缓冲区的 pageable 行为，其他运行时保留映射注册。
+default 在 ascend-a5 构建中为共享缓冲区选择 pin_only，其他情况保留映射注册。
 pin_only 调用 aclrtHostRegisterV2，仅传 ACL_HOST_REG_PINNED，不申请设备地址别名。
-SDK 不支持该接口时明确失败。注册成功并不保证实际异步 DMA 或带宽提升。
+随后普通 aclrtMemcpyAsync 使用已注册的主机指针，不增加应用侧中转复制。
+默认注册失败即报错，不会自动退回 pageable 或 staged。SDK 必须支持该接口，
+驱动与运行时也必须支持已注册主机内存的异步拷贝；注册成功本身不能证明 DMA 正确性或带宽。
+
+A5 上应关闭 cache_sdma_direct、cache_io_aggregation 和 use_gdr。
+cache_sdma_direct 选择的是另一套 A3 映射 SDMA 实现；关闭它不会关闭普通 ACL DMA。
 
 pageable 和 pin_only 使用普通主机指针拷贝，拒绝依赖设备映射地址的 GDR、
 I/O 聚合和直接 SDMA 配置。未显式开启回退时，注册失败会终止初始化。
 仅在注册成功后注销，并在解除共享内存映射之前完成注销。
 
-回退配置为 cache_host_memory_mode=default、
-cache_pin_allow_pageable_fallback=false。本实现包含 A5 的可配置默认行为；
-不要再次叠加无条件跳过共享缓冲区注册的外部补丁，否则会同时跳过 pin_only。
+旧环境若需显式兼容回退，可设置 cache_host_memory_mode=pageable、
+share_buffer_enable=true、cache_pin_allow_pageable_fallback=false。
+这会关闭注册，不属于原生注册 DMA 路径。不要叠加无条件跳过共享缓冲区注册的外部补丁，
+否则会同时跳过 A5 默认注册和 pin_only。
 
 ### 有界锁页主机中转
 

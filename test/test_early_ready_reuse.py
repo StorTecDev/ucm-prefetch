@@ -121,8 +121,11 @@ def connector(request, monkeypatch):
     c._rank_consistency = RankConsistencyManager(is_scheduler=True)
     c.store = object.__new__(EarlyPipelineStore)
     c.store._native_store = Mock()
+    c.store._fallback_lookup_leases = {}
     c.store.store_ = early_store._ReservedLoad(c.store._native_store)
     c.store.store_.LookupOnPrefix.return_value = 1
+    monkeypatch.setattr(early_store.ucmpipelinestore, "EarlyLookupWithLease",
+                        lambda pipeline, ids: (pipeline.LookupOnPrefix(ids), object()))
     c._early = object.__new__(EarlyScheduler)
     c._early.connector = c
     c._early.lock = threading.RLock()

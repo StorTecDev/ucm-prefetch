@@ -356,3 +356,39 @@ def test_late_activation_returns_unsubmitted_pins_and_does_not_run_ahead_of_wait
             assert worker.selected == [(job, second)]
     finally:
         worker.close()
+
+
+def test_wait_writeback_headroom_is_not_multiplied_by_replicated_workers():
+    c = Cluster(tp=16)
+    for cap in c.b.capabilities.values():
+        cap["native"].update(nodes=12, reservable_nodes=10, shard_bytes=8, block_bytes=8)
+        cap["writeback_headroom_blocks"] = 3
+    j = c.job(count=7)
+    request(c, j, 0, 0, 7)
+    c.ready(j)
+    domain = j["domain"]
+    assert domain["writeback_headroom_blocks"] == 3
+    assert domain["physical_limit"] == 80
+    assert domain["execution"].used == domain["execution"].capacity == 7
+    # Waiting consumers retain all seven pins, but the current HBM generation
+    # still has three ordinary slots for its independent writeback.
+    assert domain["physical_limit"] // 8 - domain["execution"].used == 3
+
+
+def test_wait_writeback_headroom_sums_distinct_dp_generations():
+    c = Cluster(dp=2)
+    for cap in c.b.capabilities.values():
+        cap["native"].update(nodes=14, reservable_nodes=12, shard_bytes=8, block_bytes=8)
+        cap["writeback_headroom_blocks"] = 2 + cap["dp"]
+    j = c.job(count=7)
+    assert j["domain"]["writeback_headroom_blocks"] == 5
+    request(c, j, 0, 0, 7)
+    assert grants(c, j)[0]["count"] == 7
+
+
+def test_writeback_bound_cannot_silently_disable_capacity_protection():
+    c = Cluster()
+    for cap in c.b.capabilities.values():
+        cap["writeback_headroom_blocks"] = 56
+    c.job()
+    assert c.b.fenced

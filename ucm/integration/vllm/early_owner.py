@@ -20,7 +20,7 @@ from .early_errors import EarlyLookupUnavailable
 from .early_topology import worker_count, worker_rank
 
 log = logging.getLogger(__name__)
-VERSION = 12
+VERSION = 13
 
 
 def worker_capability(connector):
@@ -90,6 +90,31 @@ def worker_capability(connector):
             build_kv_hash_meta(connector._vllm_config, 0)
         )
         full_block_load = bool(config.get("cache_full_block_load", False))
+        writeback_headroom = 0
+        if (config.get("cache_full_block_dump", False)
+                and config.get("cache_dump_capacity_policy") == "wait"):
+            physical_blocks = connector.kv_cache_layout.num_blocks
+            if type(physical_blocks) is not int or physical_blocks <= 0:
+                return {"reason": "writeback physical HBM span is not bounded"}
+            # A live source generation cannot exceed the addressable HBM pages.
+            # Replicated PCP normalizes cp_world_size to one; sharded PCP may
+            # expose a distinct hash identity per rank and must retain that factor.
+            hashes_per_page = (connector.block_size + token_unit - 1) // token_unit
+            writeback_headroom = physical_blocks * hashes_per_page * connector.cp_world_size
+            scheduler = connector._vllm_config.scheduler_config
+            tokens = getattr(scheduler, "max_num_batched_tokens", None)
+            sequences = getattr(scheduler, "max_num_seqs", None)
+            if (connector.use_layerwise and connector.cp_world_size == 1
+                    and connector.block_size == connector.hash_block_size
+                    and getattr(scheduler, "async_scheduling", None) is False
+                    and type(tokens) is int and tokens > 0
+                    and type(sequences) is int and sequences > 0):
+                # Synchronous layerwise finalization drains each step's sources.
+                # Dispatch dumps only newly completed blocks: each sequence can
+                # contribute one boundary-crossing block in addition to tokens/B.
+                page = connector.block_size
+                step_blocks = (tokens + min(sequences, tokens) * (page - 1)) // page
+                writeback_headroom = min(writeback_headroom, step_blocks)
         layout = [connector.unique_id, native, config["tensor_size_list"], full_block_load, packed,
                   connector.use_layerwise, connector.hash_block_size, connector.blocks_per_chunk,
                   scheduler_hasher("UCM_HASH_SEED").hex(), connector.cp_world_size,
@@ -98,6 +123,7 @@ def worker_capability(connector):
                     layout=hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest(),
                     unique_id=str(connector.unique_id), native=native, layers=layers,
                     task_shards=task_shards, full_block_load=full_block_load, full_block_l1=full_block_l1,
+                    writeback_headroom_blocks=writeback_headroom,
                     max_jobs=int(connector.launch_config.get("early_owner_max_jobs", 4)),
                     max_candidates=int(connector.launch_config.get("early_owner_max_candidate_blocks", 0)),
                     dp=connector._vllm_config.parallel_config.data_parallel_index,
@@ -178,11 +204,25 @@ class OwnerBroker(BrokerState):
             return None, "legacy reservations still belong to this cohort"
         if domain not in self.domains:
             native = group[0]["native"]
-            # Native allocation enforces the actual shared capacity. Early load
-            # and dump pre-acquire handles with a finite allocation bound and
-            # reject before I/O, so no maximum-task subtraction is necessary.
             slots = native["reservable_nodes"]
-            limit = slots * native["shard_bytes"]
+            physical_limit = slots * native["shard_bytes"]
+            # READY prefetch pins need a future model step to be released, while
+            # wait-policy writeback may block that step. Keep its bounded live
+            # source generation outside their budget. Older writes can drain
+            # independently; their temporary pins need no model progress.
+            per_dp = {}
+            for peer in members:
+                cap = self.capabilities[peer]
+                bound = cap.get("writeback_headroom_blocks", 0)
+                if type(bound) is not int or bound < 0:
+                    self.poison("invalid writeback progress bound")
+                    return None, "invalid writeback progress bound"
+                per_dp[cap["dp"]] = max(per_dp.get(cap["dp"], 0), bound)
+            headroom = sum(per_dp.values())
+            if headroom and headroom >= physical_limit // native["block_bytes"]:
+                self.poison("physical L1 cannot cover the writeback progress bound")
+                return None, "physical L1 cannot cover the writeback progress bound"
+            limit = physical_limit - headroom * native["block_bytes"]
             # Submission window only. Actual allocation/pins enforce capacity,
             # including zero reservable slots; no per-worker capacity division.
             # Match the native window in physical read units; a full-block
@@ -193,6 +233,8 @@ class OwnerBroker(BrokerState):
             io = len(members) * quota
             self.domains[domain] = dict(execution=ExecutionWindow(limit // native["block_bytes"]), limit=limit, io_limit=io,
                                         io_quota=quota, members=members, owners={},
+                                        writeback_headroom_blocks=headroom,
+                                        physical_limit=physical_limit,
                                         native_load_headroom_bytes=(native["nodes"] - slots) * native["shard_bytes"])
             for peer in self.peers:
                 self.send(peer, dict(op="domain_active"))
@@ -359,10 +401,10 @@ class OwnerBroker(BrokerState):
                   owner=owner, attempt=job["attempt"], grant=job["grant"]))
         log.info("UCM_EARLY owner_assigned key=%s attempt=%s dp=%s owner=%s candidates=%s "
                  "physical_reservable_bytes=%s io_quota_bytes=%s io_limit_bytes=%s assignments=%s ns=%s "
-                 "native_load_headroom_bytes=%s",
+                 "native_load_headroom_bytes=%s writeback_headroom_blocks=%s",
                  job["key"], job["attempt"], job["dp"], owner, work, domain["limit"],
                  domain["io_quota"], domain["io_limit"], load["assignments"], job["assigned_ns"],
-                 domain["native_load_headroom_bytes"])
+                 domain["native_load_headroom_bytes"], domain["writeback_headroom_blocks"])
 
     def capacity_wait(self, job, token, waiting, now=None):
         now = time.monotonic() if now is None else now

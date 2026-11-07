@@ -259,8 +259,12 @@ class _EarlyConnectorMixin:
         )
 
     def request_finished(self, request, block_ids):
-        self._early.finish(request, cancelled="ABORT" in str(request.status.name))
-        return super().request_finished(request, block_ids)
+        status = str(request.status.name)
+        cancelled = "ABORT" in status or "ERROR" in status
+        self._early.finish(request, cancelled=cancelled)
+        result = super().request_finished(request, block_ids)
+        self.store.release_lookup_leases(request.request_id, cancelled=cancelled)
+        return result
 
     def register_kv_caches(self, kv_caches):
         super().register_kv_caches(kv_caches)

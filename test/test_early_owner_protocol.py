@@ -663,6 +663,32 @@ def test_worker_capability_checks_actual_native_layout_and_configuration(field, 
         assert full_cap["native"] == cap["native"]
         c.tp_rank = 0
         assert "dump_task_shards" not in owner.worker_capability(c)
+        c.kv_cache_layout = SimpleNamespace(num_blocks=3)
+        c.store.config.update(cache_full_block_dump=True, cache_dump_capacity_policy="wait")
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 3
+        c.hash_block_size = 2
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 6
+        c.kv_cache_layout.num_blocks = 0
+        assert "physical HBM span" in owner.worker_capability(c)["reason"]
+        c.store.config["cache_dump_capacity_policy"] = "skip"
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 0
+        c.store.config["cache_dump_capacity_policy"] = "wait"
+        c.kv_cache_layout.num_blocks = 2787
+        c.block_size = c.hash_block_size = 128
+        scheduler = c._vllm_config.scheduler_config
+        scheduler.max_num_batched_tokens = 8192
+        scheduler.max_num_seqs = 12
+        scheduler.async_scheduling = False
+        # Twelve requests can each straddle a page boundary. Reserving all HBM
+        # would unnecessarily remove thousands of ordinary prefetch slots.
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 75
+        scheduler.max_num_batched_tokens = 1
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 1
+        scheduler.async_scheduling = True
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 2787
+        scheduler.async_scheduling = False
+        scheduler.max_num_batched_tokens = None
+        assert owner.worker_capability(c)["writeback_headroom_blocks"] == 2787
         c.launch_config["enable_early_owner"] = False
         assert not owner.worker_capability(c).get("ready", False)
 

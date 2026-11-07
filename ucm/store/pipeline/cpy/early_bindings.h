@@ -81,6 +81,39 @@ void BindOperations(pybind11::module_& module)
     module.attr("EARLY_BLOCK_DUMP_PROTOCOL_VERSION") = 2;
     py::register_exception<CapacityRejected>(module, "EarlyCapacityRejected",
                                              module.attr("StoreNotFoundError").ptr());
+    module.def("EarlyLookupWithLease", [](Pipeline& pipeline, const py::buffer& ids) {
+        const auto info = ids.request(false);
+        if (info.ndim != 1 || info.itemsize <= 0 ||
+            (info.size * info.itemsize) % sizeof(Detail::BlockId) != 0) {
+            throw std::invalid_argument("invalid block identity buffer");
+        }
+        const auto* blocks = static_cast<const Detail::BlockId*>(info.ptr);
+        const auto count = static_cast<size_t>(info.size * info.itemsize) / sizeof(Detail::BlockId);
+        auto* store = reinterpret_cast<StoreV1*>(pipeline.Self());
+        std::shared_ptr<ReadLease> lease;
+        ssize_t hit = -1;
+        {
+            py::gil_scoped_release release;
+            auto acquired = store->AcquireReadLease(blocks, count);
+            // An active deletion wins this lookup. Recompute instead of claiming
+            // a hit whose deletion exclusion was never established.
+            const bool unavailable = !acquired && (acquired.Error() == Status::Retry() ||
+                                                    acquired.Error() == Status::StoreUnhealthy());
+            if (!unavailable) {
+                lease = ValueOrThrow<NotFoundError, UnhealthyError>(std::move(acquired));
+                if (!lease) { throw std::runtime_error("read lease unavailable"); }
+                hit = ValueOrThrow<NotFoundError, UnhealthyError>(store->LookupOnPrefix(blocks, count));
+            }
+        }
+        if (hit < 0) { return py::make_tuple(hit, py::none()); }
+        // PosixReadLease owns its lock fd independently of the native Store.
+        auto held = std::make_unique<std::shared_ptr<ReadLease>>(std::move(lease));
+        py::capsule capsule(held.get(), [](void* ptr) {
+            delete static_cast<std::shared_ptr<ReadLease>*>(ptr);
+        });
+        held.release();
+        return py::make_tuple(hit, std::move(capsule));
+    });
     module.def("EarlyDomainInfo", [](Pipeline& pipeline) {
         auto domain = LoadBinding::Domain(pipeline);
         py::dict out;

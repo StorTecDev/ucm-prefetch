@@ -403,6 +403,7 @@ private:
 // Reservations are destroyed before the base store releases those resources.
 class EarlyCacheStore final : public CacheStore, public Early::DomainProvider {
     std::unique_ptr<ReservedPrefetch> early_;
+    StoreV1* readLeaseBackend_{nullptr};
     std::unique_ptr<EarlyNativeTransfer> transfers_;
     size_t earlyBlockBytes_{0}, earlyShardBytes_{0}, diskBlockBytes_{0};
     size_t consumerBlockBytes_{0}, consumerShardBytes_{0};
@@ -418,6 +419,7 @@ public:
         if (status.Failure()) { return status; }
 
         const auto param = ParseConfig(config);
+        readLeaseBackend_ = param.storeBackend;
         earlyBlockBytes_ = consumerBlockBytes_ = param.blockSize;
         earlyShardBytes_ = consumerShardBytes_ = param.shardSize;
         fullBlockL1_ = param.cacheFullBlockL1;
@@ -446,6 +448,12 @@ public:
         result.consumerShardBytes = consumerShardBytes_;
         result.fullBlockL1 = fullBlockL1_;
         return result;
+    }
+
+    Expected<std::shared_ptr<ReadLease>> AcquireReadLease(
+        const Detail::BlockId* blocks, size_t num) override
+    {
+        return readLeaseBackend_->AcquireReadLease(blocks, num);
     }
 
     Expected<PrefixReservation> ReserveDeferred(const Detail::BlockId* blocks, size_t num) override

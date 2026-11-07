@@ -146,6 +146,7 @@ class EarlyPipelineStore(UcmPipelineStore):
             "EarlyLoad", "EarlyDump", "EarlyCapacityRejected",
             "EarlyBatch",
             "EarlyDomainInfo", "EarlyWaitRelease", "EarlyReleaseEpoch",
+            "EarlyLookupWithLease",
         )
         if not all(callable(getattr(ucmpipelinestore, name, None)) for name in required):
             raise RuntimeError(
@@ -156,6 +157,7 @@ class EarlyPipelineStore(UcmPipelineStore):
         self.store_ = _ReservedLoad(self._native_store)
         # The internal builder key changes selection only, not the user's config.
         self.config = config
+        self._fallback_lookup_leases = {}
 
     def lookup_on_prefix(self, block_ids: list[bytes]) -> int:
         context = current_lookup.get()
@@ -184,7 +186,24 @@ class EarlyPipelineStore(UcmPipelineStore):
                     if job.blocks[start + index] != block_ids[index]:
                         return index - 1
                 return count - 1
+            hit, lease = ucmpipelinestore.EarlyLookupWithLease(
+                self._native_store, np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+            )
+            if lease is not None:
+                self._fallback_lookup_leases.setdefault(context.request.request_id, []).append(lease)
+            return hit
         return super().lookup_on_prefix(block_ids)
+
+    def release_lookup_leases(self, request_id, *, cancelled=False):
+        """Release a completed request's fallback L2 snapshot.
+
+        Args:
+            request_id: Scheduler request whose normal model execution finished.
+            cancelled: Retain aborted generations until Store destruction because
+                cancellation alone does not prove remote worker I/O has drained.
+        """
+        if not cancelled:
+            self._fallback_lookup_leases.pop(request_id, None)
 
     def reserve_prefix(self, block_ids: list[bytes], *, deferred=False) -> dict:
         try:

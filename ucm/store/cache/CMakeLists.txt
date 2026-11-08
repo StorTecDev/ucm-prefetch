@@ -8,11 +8,6 @@ set_target_properties(cachestore PROPERTIES
 file(RELATIVE_PATH INSTALL_REL_PATH ${UCM_ROOT_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 install(TARGETS cachestore LIBRARY DESTINATION ${INSTALL_REL_PATH} COMPONENT ucm)
 
-# A5 shared buffers use host-pointer DMA without a mapped device alias.
-if(RUNTIME_ENVIRONMENT STREQUAL "ascend-a5")
-    target_compile_definitions(cachestore PRIVATE UCM_ASCEND_PINNED_SHARED_L1=1)
-endif()
-
 if(BUILD_UNIT_TESTS)
     target_compile_definitions(cachestore PUBLIC UCM_ENABLE_TEST_HOOKS)
 endif()

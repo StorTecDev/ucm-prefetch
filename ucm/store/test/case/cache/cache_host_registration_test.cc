@@ -174,6 +174,27 @@ TEST(HostMemoryConfig, DefaultIsValidAndExplicitModesRequireSharedBuffer)
     }
 }
 
+TEST(HostMemoryConfig, DefaultPreservesMappedRegistrationForSharedAndLocalBuffers)
+{
+    Config config;
+    for (bool shared : {false, true}) {
+        config.shareBufferEnable = shared;
+        ASSERT_TRUE(config.ValidateHostMemory().Success());
+        EXPECT_EQ(config.EffectiveHostMemoryMode(), "mapped");
+    }
+}
+
+TEST(HostMemoryConfig, DefaultPermitsDeviceAliasConsumers)
+{
+    Config config;
+    config.shareBufferEnable = true;
+    config.useGdr = true;
+    config.cacheIOAggregation = true;
+    config.cacheSdmaDirect = true;
+    EXPECT_EQ(config.EffectiveHostMemoryMode(), "mapped");
+    EXPECT_TRUE(config.ValidateHostMemory().Success());
+}
+
 TEST(HostMemoryConfig, RejectsUnknownModeAndImplicitFallback)
 {
     Config config;

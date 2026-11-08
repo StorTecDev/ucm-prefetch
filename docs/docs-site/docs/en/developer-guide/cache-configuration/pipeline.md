@@ -340,8 +340,13 @@ The cache supports explicit registration modes for shared L1 buffers:
 | cache_host_memory_mode | default | Select default, pageable, pin_only, or staged. Explicit modes require share_buffer_enable=true. |
 | cache_pin_allow_pageable_fallback | false | Allow failed pin_only registration to continue with pageable memory, with a warning. |
 
-The default mode selects pin_only for shared buffers in ascend-a5 builds and
-mapped registration otherwise. Pin-only registration calls aclrtHostRegisterV2
+The default mode preserves mapped registration, including shared buffers in
+ascend-a5 builds. To match the v0.9.0 release build, set
+ASCEND_SUPPORTS_REGISTER_PIN=ON: mapped registration then uses
+aclrtHostRegisterV2 with ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED, followed by
+aclrtHostGetDevicePointer. A build with this option OFF uses the legacy mapped
+registration API instead; record the build option when comparing results.
+An explicit pin_only selection calls aclrtHostRegisterV2
 with ACL_HOST_REG_PINNED alone: it does not request a device alias. Ordinary
 aclrtMemcpyAsync calls then use the registered host pointer without an application
 staging copy. Registration failure is fatal by default; there is no automatic

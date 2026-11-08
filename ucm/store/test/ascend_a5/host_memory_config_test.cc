@@ -27,12 +27,12 @@
 namespace UC::CacheStore {
 namespace {
 
-TEST(A5HostMemoryConfig, DefaultRegistersSharedMemoryWithoutStagingOrFallback)
+TEST(A5HostMemoryConfig, DefaultMapsSharedMemoryWithoutStagingOrFallback)
 {
     Config config;
     EXPECT_EQ(config.cacheHostMemoryMode, "default");
     ASSERT_TRUE(config.shareBufferEnable);
-    EXPECT_EQ(config.EffectiveHostMemoryMode(), "pin_only");
+    EXPECT_EQ(config.EffectiveHostMemoryMode(), "mapped");
     EXPECT_EQ(config.EffectiveStagingBytes(), 0);
     EXPECT_FALSE(config.cachePinAllowPageableFallback);
     EXPECT_TRUE(config.ValidateHostMemory().Success());
@@ -57,17 +57,17 @@ TEST(A5HostMemoryConfig, ExplicitModesOverrideThePlatformDefault)
     }
 }
 
-TEST(A5HostMemoryConfig, DefaultRejectsDeviceAliasConsumers)
+TEST(A5HostMemoryConfig, DefaultPermitsDeviceAliasConsumers)
 {
     Config config;
     config.useGdr = true;
-    EXPECT_TRUE(config.ValidateHostMemory().Failure());
+    EXPECT_TRUE(config.ValidateHostMemory().Success());
     config.useGdr = false;
     config.cacheIOAggregation = true;
-    EXPECT_TRUE(config.ValidateHostMemory().Failure());
+    EXPECT_TRUE(config.ValidateHostMemory().Success());
     config.cacheIOAggregation = false;
     config.cacheSdmaDirect = true;
-    EXPECT_TRUE(config.ValidateHostMemory().Failure());
+    EXPECT_TRUE(config.ValidateHostMemory().Success());
 }
 
 TEST(A5HostMemoryConfig, FallbackMustBeExplicitlyOptedIntoWithPinOnly)

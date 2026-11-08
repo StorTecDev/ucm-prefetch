@@ -186,3 +186,15 @@ allocations alive to exercise allocator alignment. The POSIX store regressions
 check that buffered PSync accepts unaligned buffers, while AIO retains
 `O_DIRECT` and round-trips aligned data. Existing whole-block tests retain their
 byte comparisons and error-recovery assertions.
+
+## Release-compatible default host registration
+
+HostMemoryConfig.DefaultPreservesMappedRegistrationForSharedAndLocalBuffers
+keeps default mapped for both buffer kinds, including A5 builds.
+HostMemoryConfig.DefaultPermitsDeviceAliasConsumers prevents default from being
+silently changed to a host-pointer-only mode. Existing HostRegistrationTest
+cases cover ownership, missing aliases, registration failure, and explicit fallback.
+Run ctest -R 'HostMemoryConfig|HostRegistrationTest' in the simulation build,
+then the full CTest suite. These CPU checks do not validate an ACL implementation;
+a release-compatible Ascend build also needs ASCEND_SUPPORTS_REGISTER_PIN=ON
+and device validation of mapped registration and transfers.

@@ -259,8 +259,12 @@ lease 和写入提交语义保持不变。
 | cache_host_memory_mode | default | 可选 default、pageable、pin_only、staged；显式模式要求 share_buffer_enable=true。 |
 | cache_pin_allow_pageable_fallback | false | 仅允许 pin_only 注册失败后继续使用 pageable 内存，并输出警告。 |
 
-default 在 ascend-a5 构建中为共享缓冲区选择 pin_only，其他情况保留映射注册。
-pin_only 调用 aclrtHostRegisterV2，仅传 ACL_HOST_REG_PINNED，不申请设备地址别名。
+default 保留映射注册，包括 ascend-a5 构建中的共享缓冲区。
+若要匹配 v0.9.0 release 构建，需设置 ASCEND_SUPPORTS_REGISTER_PIN=ON：
+映射注册使用 aclrtHostRegisterV2，传入 ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED，
+随后调用 aclrtHostGetDevicePointer。该构建选项为 OFF 时使用旧版映射注册接口；
+对比实验必须记录实际构建选项。
+显式选择 pin_only 时调用 aclrtHostRegisterV2，仅传 ACL_HOST_REG_PINNED，不申请设备地址别名。
 随后普通 aclrtMemcpyAsync 使用已注册的主机指针，不增加应用侧中转复制。
 默认注册失败即报错，不会自动退回 pageable 或 staged。SDK 必须支持该接口，
 驱动与运行时也必须支持已注册主机内存的异步拷贝；注册成功本身不能证明 DMA 正确性或带宽。

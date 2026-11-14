@@ -1,8 +1,11 @@
 #ifndef UCM_CACHE_RESERVED_PREFETCH_H
 #define UCM_CACHE_RESERVED_PREFETCH_H
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <memory_resource>
 #include <deque>
 #include <mutex>
 #include <list>
@@ -271,7 +274,12 @@ public:
         }
         // Resolve each requested block once. Plans contain weak references and
         // are invalidated on READY/release; they never keep a consumer alive.
-        std::unordered_map<Detail::BlockId, std::shared_ptr<BlockPins>, Detail::BlockIdHasher> selected;
+        // Keep common per-layer scratch allocations local; larger tasks may
+        // spill to the upstream allocator without extending any pin lifetime.
+        alignas(std::max_align_t) std::array<std::byte, 8192> storage;
+        std::pmr::monotonic_buffer_resource arena(storage.data(), storage.size());
+        std::pmr::unordered_map<Detail::BlockId, std::shared_ptr<BlockPins>, Detail::BlockIdHasher> selected{&arena};
+        selected.reserve(std::min(task.size(), plan->blocks.size()));
         const Detail::BlockId* previous = nullptr;
         std::shared_ptr<BlockPins> group;
         std::vector<TransBuffer::Handle> handles;

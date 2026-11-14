@@ -324,3 +324,64 @@ def test_real_binding_capacity_returns_protected_prefix_not_entire_lookup(tmp_pa
     assert warm["total_hit_blocks"] == 1 and warm["remaining_l2_work"] == 0
     native.EarlyReleaseReservation(pipeline, warm["handle"])
     native.EarlyReleaseReservation(pipeline, held["handle"])
+
+
+@pytest.mark.parametrize("block_count", [1, 115, 384])
+def test_reserved_load_scratch_lifetime_with_repeated_blocks(tmp_path, block_count):
+    """Returned DMA pins outlive task-local lookup storage and reservations."""
+    store_dir = Path(native.__file__).resolve().parent.parent
+    shard_bytes, layers = 4096, 4
+    config = dict(storage_backends=[str(tmp_path)], device_id=0,
+                  tensor_size=shard_bytes, shard_size=shard_bytes,
+                  block_size=layers * shard_bytes, data_dir_shard_bytes=1,
+                  posix_data_trans_concurrency=1, posix_lookup_concurrency=1,
+                  posix_io_engine="psync", io_direct=False,
+                  store_health={"enabled": False})
+    blocks = [uuid.uuid4().bytes for _ in range(block_count)]
+    source = np.arange(block_count * layers * shard_bytes, dtype=np.uint8)
+    source = source.reshape(block_count * layers, shard_bytes)
+    source ^= (np.arange(block_count * layers) % 251).astype(np.uint8)[:, None]
+    ids = np.frombuffer(b"".join(b for b in blocks for _ in range(layers)), dtype=np.uint8)
+    addresses = np.array([[row.ctypes.data] for row in source], dtype=np.uint64)
+    seed = native.PipelineStore()
+    seed.Stack("Posix", str(store_dir / "posix/libposixstore.so"), config)
+    seed.Wait(seed.Dump(ids, array.array("Q", list(range(layers)) * block_count), addresses))
+    del seed
+
+    config.update(posix_io_engine="aio", io_direct=True,
+                  cache_full_block_load=True, cache_full_block_l1=True)
+    pipeline = native.PipelineStore()
+    pipeline.Stack("EarlyPosix", str(store_dir / "posix/libposixstore.so"), config)
+    pipeline.Stack("EarlyCache", str(store_dir / "cache/libcachestore.so"),
+                   dict(config, unique_id=uuid.uuid4().hex,
+                        cache_buffer_capacity_gb=1, share_buffer_enable=False,
+                        cache_load_exclusive_buffer_number=512,
+                        waiting_queue_depth=8, running_queue_depth=16,
+                        cache_stream_number=1))
+    reservation = native.EarlyReservePrefix(
+        pipeline, np.frombuffer(b"".join(blocks), dtype=np.uint8))
+    batch = reservation["batch"]
+    deadline = time.monotonic() + 10
+    while True:
+        progress = batch.step(batch.window_bytes)
+        if progress["done"]:
+            break
+        assert time.monotonic() < deadline
+        time.sleep(.001)
+    assert progress["total_hit_blocks"] == block_count
+    # Nonconsecutive duplicates share one lookup but retain separate layer views.
+    # The largest case also exceeds the small task-local allocation buffer.
+    order = list(range(block_count)) + list(reversed(range(block_count)))
+    layer_ids = [i % layers for i in range(len(order))]
+    target = np.zeros((len(order), shard_bytes), dtype=np.uint8)
+    task = native.EarlyLoad(
+        pipeline, np.frombuffer(b"".join(blocks[i] for i in order), dtype=np.uint8),
+        array.array("Q", layer_ids),
+        np.array([[row.ctypes.data] for row in target], dtype=np.uint64),
+        [reservation["handle"]])
+    native.EarlyReleaseReservation(pipeline, reservation["handle"])
+    del reservation, batch
+    gc.collect()
+    pipeline.Wait(task)
+    expected = source[[block * layers + layer for block, layer in zip(order, layer_ids)]]
+    np.testing.assert_array_equal(target, expected)

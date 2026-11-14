@@ -165,8 +165,9 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
         running_.Push(std::move(shardTask));
     }
-    if (!task->desc.loadReservations.empty() || task->desc.brief == "EarlyConsumer") {
-        UC_INFO_UNLIMITED("UCM_EARLY stage=load_dispatch task={} shards={} native_get_fallback={} "
+    if ((!task->desc.loadReservations.empty() || task->desc.brief == "EarlyConsumer") &&
+        UC::Logger::isEnabledFor(UC::Logger::Level::DEBUG)) {
+        UC_DEBUG_UNLIMITED("UCM_EARLY stage=load_dispatch task={} shards={} native_get_fallback={} "
                          "load_l2_read_shards={} references_acquired_by_ns={}",
                 task->id, nShard, nativeGetCount, backendSubmitCount,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

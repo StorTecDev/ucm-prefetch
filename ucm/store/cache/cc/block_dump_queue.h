@@ -18,8 +18,9 @@ namespace UC::CacheStore {
 
 #ifdef UCM_ENABLE_TEST_HOOKS
 namespace TestHooks {
-// Set/clear only while no test task is running. A failure models rejected D2H.
+// Install failure-injection hooks only while no test task is running.
 inline std::function<Status(const Detail::Shard&)> blockDumpCopyHook;
+inline std::function<Status()> blockDumpSyncHook;
 }
 #endif
 
@@ -62,6 +63,24 @@ class BlockDumpQueue final : public Detail::TaskWrapper<TransTask, Detail::TaskH
         bool prepared{false};
         bool eventQueued{false};
         explicit SourceTask(TaskPair value) : pair(std::move(value)) { sources.Set(1); }
+    };
+    struct GroupProgress {
+        SourceGroup* group;
+        Status status{Status::OK()};
+        bool waiting{false};
+        bool publish{false};
+    };
+    struct PendingCopy {
+        TransBuffer::Handle handle;
+        Status submitted;
+        Status* result;
+    };
+    struct CopyBatch {
+        std::vector<PendingCopy> copies;
+        std::unordered_set<Detail::BlockId, Detail::BlockIdHasher> blocks;
+        size_t layer{0};
+        bool dirty{false};
+        Status failure{Status::OK()};
     };
     using Work = std::shared_ptr<SourceTask>;
     using Blocks = std::unordered_map<Detail::BlockId, Block, Detail::BlockIdHasher>;
@@ -211,16 +230,48 @@ private:
         // pending source work and already accepted DMA/I/O must all drain.
     }
 
+    Status Synchronize(CopyStream& stream)
+    {
+#ifdef UCM_ENABLE_TEST_HOOKS
+        if (TestHooks::blockDumpSyncHook) {
+            auto status = TestHooks::blockDumpSyncHook();
+            if (status.Failure()) { return status; }
+        }
+#endif
+        return stream.Synchronize();
+    }
+
     Status Drain(CopyStream& stream)
     {
-        auto first = stream.Synchronize();
+        auto first = Synchronize(stream);
         if (first.Success()) { return first; }
         // Do not release either DMA endpoint on an unproven stream error.
-        while (stream.Synchronize().Failure()) {
+        while (Synchronize(stream).Failure()) {
             UC_ERROR("Block dump DMA completion unknown; retaining source and L1 pins");
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return first;
+    }
+
+    void FlushCopies(CopyStream& stream, CopyBatch& batch)
+    {
+        if (!batch.dirty) { return; }
+        const auto drained = Drain(stream);
+        if (drained.Failure() && batch.failure.Success()) { batch.failure = drained; }
+        // Keep every destination pinned until the entire batch is proven drained.
+        // READY also permits the I/O worker to read it, so publication follows DMA.
+        for (auto& copy : batch.copies) {
+            const auto status = copy.submitted.Failure() ? copy.submitted : drained;
+            if (status.Failure()) {
+                copy.handle.MarkLayerFailed(status);
+                if (copy.result->Success()) { *copy.result = status; }
+            } else {
+                copy.handle.MarkReady();
+            }
+        }
+        batch.copies.clear();
+        batch.blocks.clear();
+        batch.dirty = false;
     }
 
     void RunIo()
@@ -380,19 +431,10 @@ private:
             std::unordered_set<Detail::BlockId, Detail::BlockIdHasher> blocked;
             for (auto it = active.begin(); it != active.end();) {
                 auto& work = *it;
-                PrepareGroups(*work);
-                for (auto& group : work->groups) {
-                    if (group.done || blocked.count(group.id)) { continue; }
-                    bool waiting = false;
-                    auto status = ProcessGroup(stream, *work, group, waiting, pollReadiness);
-                    if (waiting) { blocked.insert(group.id); continue; }
-                    if (status.Failure()) { work->pair.first->Fail(status); }
-                    group.done = true;
-                    advanced = true;
-                }
+                auto status = ProcessGroups(stream, *work, &blocked, advanced, pollReadiness);
                 if (std::all_of(work->groups.begin(), work->groups.end(),
                                 [](const auto& group) { return group.done; })) {
-                    FinishSources(work, Drain(stream));
+                    FinishSources(work, status);
                     it = active.erase(it);
                     advanced = true;
                 } else { ++it; }
@@ -484,8 +526,10 @@ private:
     }
 
     Status Fill(CopyStream& stream, const Detail::Shard& shard, Block& block,
-                bool& waiting, bool& pollReadiness)
+                bool& waiting, bool& pollReadiness, CopyBatch& batch, Status& result)
     {
+        if (!batch.copies.empty() && batch.layer != shard.index) { FlushCopies(stream, batch); }
+        if (batch.blocks.count(shard.owner)) { return Status::OK(); }
         ApplyWrite(block);
         if (block.complete || block.persisted[shard.index]) { return Status::OK(); }
         if (block.pin && block.pin.LayerView(shard.index).Ready()) { return Status::OK(); }
@@ -548,14 +592,16 @@ private:
                 ? stream.DeviceToHostAsync(addresses.data(), destination, config_.tensorSizes)
                 : Status::InvalidParam("block dump has no mapped destination");
         }
-        auto drained = Drain(stream);
-        if (status.Failure() || drained.Failure()) {
-            auto error = status.Failure() ? status : drained;
-            handle.MarkLayerFailed(error);
-            return error;
+        batch.layer = shard.index;
+        batch.dirty = true;
+        batch.blocks.insert(shard.owner);
+        batch.copies.push_back({std::move(handle), status, &result});
+        if (status.Failure()) {
+            if (batch.failure.Success()) { batch.failure = status; }
+            // A rejected tensor may follow accepted copies in the same submission.
+            FlushCopies(stream, batch);
         }
-        handle.MarkReady();
-        return Status::OK();
+        return status;
     }
 
     Status Publish(const Detail::BlockId& id, Block& block, SourceTask& task)
@@ -592,9 +638,11 @@ private:
         work.prepared = true;
     }
 
-    Status ProcessGroup(CopyStream& stream, SourceTask& work, const SourceGroup& group,
-                        bool& waiting, bool& pollReadiness)
+    Status PrepareGroup(CopyStream& stream, SourceTask& work, GroupProgress& progress,
+                        bool& pollReadiness, CopyBatch& batch)
     {
+        const auto& group = *progress.group;
+        auto& waiting = progress.waiting;
         const auto& desc = work.pair.first->desc;
         const auto& id = group.id;
         auto it = blocks_.find(id);
@@ -617,16 +665,28 @@ private:
         block.closing = false;
         if (desc.prerequisiteHandle && !work.eventQueued) {
             auto status = stream.WaitEvent(Trans::Event{desc.prerequisiteHandle});
-            if (status.Failure()) { Drain(stream); return status; }
+            batch.dirty = true;
+            if (status.Failure()) { FlushCopies(stream, batch); return status; }
             work.eventQueued = true;
         }
-        auto status = Status::OK();
+        progress.publish = true;
+        auto& status = progress.status;
         for (const auto* shard : group.shards) {
-            auto copied = Fill(stream, *shard, block, waiting, pollReadiness);
+            auto copied = Fill(stream, *shard, block, waiting, pollReadiness, batch, status);
             if (waiting) { return status; }
             // A failed layer must not suppress other independent valid layers.
             if (copied.Failure() && status.Success()) { status = copied; }
         }
+        return status;
+    }
+
+    Status CompleteGroup(SourceTask& work, GroupProgress& progress)
+    {
+        auto status = progress.status;
+        if (!progress.publish) { return status; }
+        const auto& desc = work.pair.first->desc;
+        const auto& id = progress.group->id;
+        auto& block = blocks_.at(id);
         if (status.Success()) {
             status = Publish(id, block, work);
             if (status == Status::NotFound() && !desc.finalizeBlockDump) { status = Status::OK(); }
@@ -645,17 +705,55 @@ private:
         return status;
     }
 
-    Status Process(CopyStream& stream, SourceTask& work)
+    Status ProcessGroups(
+        CopyStream& stream, SourceTask& work,
+        std::unordered_set<Detail::BlockId, Detail::BlockIdHasher>* blocked,
+        bool& advanced, bool& pollReadiness)
     {
         PrepareGroups(work);
+        std::vector<GroupProgress> progress;
+        // Pending copies refer to these results until the task-local batch drains.
+        progress.reserve(work.groups.size());
+        CopyBatch batch;
         auto result = Status::OK();
-        for (const auto& group : work.groups) {
-            bool waiting = false, pollReadiness = false;
-            auto status = ProcessGroup(stream, work, group, waiting, pollReadiness);
-            if (status.Failure() && result.Success()) { result = status; }
+        for (auto& group : work.groups) {
+            if (group.done || (blocked && blocked->count(group.id))) { continue; }
+            progress.push_back({&group});
+            auto& current = progress.back();
+            auto status = PrepareGroup(stream, work, current, pollReadiness, batch);
+            if (status.Failure() && current.status.Success()) { current.status = status; }
+            if (current.waiting && blocked) { blocked->insert(group.id); }
+            if (!WaitForCapacity()) {
+                // Spill may reclaim a preceding block before acquiring the next one.
+                FlushCopies(stream, batch);
+                current.status = CompleteGroup(work, current);
+                current.publish = false;
+            }
         }
-        auto drained = Drain(stream);
-        return result.Failure() ? result : drained;
+        // Do not wait for unavailable capacity while holding an uncompleted batch.
+        FlushCopies(stream, batch);
+        for (auto& current : progress) {
+            if (!current.waiting) {
+                current.status = CompleteGroup(work, current);
+                current.group->done = true;
+                advanced = true;
+            }
+            if (current.status.Failure()) {
+                work.pair.first->Fail(current.status);
+                if (result.Success()) { result = current.status; }
+            }
+        }
+        if (batch.failure.Failure()) {
+            work.pair.first->Fail(batch.failure);
+            if (result.Success()) { result = batch.failure; }
+        }
+        return result;
+    }
+
+    Status Process(CopyStream& stream, SourceTask& work)
+    {
+        bool advanced = false, pollReadiness = false;
+        return ProcessGroups(stream, work, nullptr, advanced, pollReadiness);
     }
 
 };

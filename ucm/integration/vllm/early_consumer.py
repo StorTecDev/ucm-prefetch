@@ -34,10 +34,12 @@ class Consumer:
         self.serial = 0
         self.fenced = None
         self.domain_active = False
+        self._range_cache = {}
 
     def bind(self, tickets, layers):
         with self.lock:
             self.requests = {}
+            self._range_cache.clear()
             for request_id, ticket in tickets.items():
                 identity = (ticket["key"], ticket["attempt"])
                 self.requests[request_id] = identity
@@ -72,15 +74,48 @@ class Consumer:
             shards = list(indexes)
             if len(raw) != len(shards) * 16:
                 raise ValueError("native block identity width mismatch")
-            ranges = {}
-            for i, shard in enumerate(shards):
-                ranges.setdefault(int(shard), set()).add(raw[16*i:16*(i+1)])
+            ranges, matched = self._load_ranges(identities, raw, shards)
             self.serial += 1
             token = self.serial
-            self.tasks[token] = (identities, ranges, time.monotonic_ns())
+            self.tasks[token] = (identities, ranges, time.monotonic_ns(), matched)
             for identity in identities:
                 self.generations[identity]["active"] += 1
             return token
+
+    def _load_ranges(self, identities, raw, shards):
+        """Reuse immutable block coverage across layers of the same load plan."""
+        if shards and shards.count(shards[0]) == len(shards):
+            layer = int(shards[0])
+            key = (identities, raw)
+            cached = self._range_cache.get(key)
+            if cached is None:
+                blocks = frozenset(raw[i:i + 16] for i in range(0, len(raw), 16))
+                covered = {
+                    identity: blocks.intersection(self.generations[identity]["expected"])
+                    for identity in identities
+                }
+                cached = (blocks, covered)
+                # Only metadata is retained, never native pins. Bound partial
+                # chunk variants and discard them on the next metadata bind.
+                if len(self._range_cache) >= max(1, len(self.requests)):
+                    self._range_cache.pop(next(iter(self._range_cache)))
+                self._range_cache[key] = cached
+            blocks, covered = cached
+            return {layer: blocks}, {
+                identity: {layer: subset} for identity, subset in covered.items()
+            }
+
+        ranges = {}
+        for i, shard in enumerate(shards):
+            ranges.setdefault(int(shard), set()).add(raw[16*i:16*(i+1)])
+        ranges = {layer: frozenset(blocks) for layer, blocks in ranges.items()}
+        return ranges, {
+            identity: {
+                layer: blocks.intersection(self.generations[identity]["expected"])
+                for layer, blocks in ranges.items()
+            }
+            for identity in identities
+        }
 
     def check_task(self, operation, shards):
         with self.lock:
@@ -102,20 +137,21 @@ class Consumer:
             receipt = self.tasks.pop(token, None)
             if receipt is None:
                 return
-            identities, ranges, submitted = receipt
+            identities, ranges, submitted, matched = receipt
             for identity in identities:
                 state = self.generations[identity]
                 state["active"] -= 1
                 if success:
-                    for shard, blocks in ranges.items():
+                    for shard, blocks in matched[identity].items():
                         if shard not in state["layers"]:
                             continue
-                        done = state["completed"].setdefault(shard, set())
-                        # A native task may batch several requests. Count only
-                        # this generation's newly completed expected range;
-                        # duplicate chunks/receipts cannot retire later layers.
-                        new = blocks.intersection(state["expected"]) - done
-                        done.update(new)
+                        done = state["completed"].get(shard)
+                        # Immutable coverage can be shared by successive layers.
+                        # Overlapping chunks still contribute only new blocks;
+                        # only a successful native Wait reaches this update.
+                        new = blocks if done is None else blocks.difference(done)
+                        if done is None or new:
+                            state["completed"][shard] = blocks if done is None else done.union(new)
                         state["remaining"] -= len(new)
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug("UCM_EARLY native_load_completed key=%s attempt=%s consumer=%s task=%s "
@@ -137,7 +173,7 @@ class Consumer:
             receipt = self.tasks.pop(token, None)
             if receipt is None:
                 return
-            identities, _, _ = receipt
+            identities, _, _, _ = receipt
             for identity in identities:
                 state = self.generations[identity]
                 state["active"] -= 1
@@ -148,29 +184,34 @@ class Consumer:
                 self._notify(state)
 
     def submitted(self, token, task):
+        if not log.isEnabledFor(logging.DEBUG):
+            return
         with self.lock:
-            identities, ranges, started = self.tasks[token]
+            identities, ranges, started, _ = self.tasks[token]
             for key, attempt in identities:
-                if log.isEnabledFor(logging.DEBUG):
-                    log.debug("UCM_EARLY native_load_submitted key=%s attempt=%s consumer=%s task=%s "
-                             "layers=%s block_count=%s start_ns=%s ns=%s pid=%s",
-                             key, attempt, self.peer, task, sorted(ranges), sum(map(len, ranges.values())),
-                             started, time.monotonic_ns(), os.getpid())
+                log.debug("UCM_EARLY native_load_submitted key=%s attempt=%s consumer=%s task=%s "
+                          "layers=%s block_count=%s start_ns=%s ns=%s pid=%s",
+                          key, attempt, self.peer, task, sorted(ranges), sum(map(len, ranges.values())),
+                          started, time.monotonic_ns(), os.getpid())
 
     def _notify(self, state):
         if self.fenced:
             return
-        ticket = state["ticket"]
-        envelope = dict(key=ticket["key"], attempt=ticket["attempt"], consumer=self.peer)
         # Completion is maintained by actual successful native Wait receipts.
         # Do not rescan the entire prefix across all prior layers on each Wait.
         complete = state["remaining"] == 0
-        if not state["stopped"] and not state["consumed"] and complete and not state["active"]:
+        consumed = not state["stopped"] and not state["consumed"] and complete and not state["active"]
+        quiesced = state["stopped"] and not state["active"] and not state["quiesced"]
+        if not consumed and not quiesced:
+            return
+        ticket = state["ticket"]
+        envelope = dict(key=ticket["key"], attempt=ticket["attempt"], consumer=self.peer)
+        if consumed:
             state["consumed"] = True
             self.send(dict(envelope, op="consumed", ns=time.monotonic_ns()))
             log.info("UCM_EARLY native_consumed key=%s attempt=%s consumer=%s ns=%s",
                      ticket["key"], ticket["attempt"], self.peer, time.monotonic_ns())
-        if state["stopped"] and not state["active"] and not state["quiesced"]:
+        if quiesced:
             state["quiesced"] = True
             self.send(dict(envelope, op="quiesced", ns=time.monotonic_ns()))
             log.info("UCM_EARLY native_quiesced key=%s attempt=%s consumer=%s ns=%s",

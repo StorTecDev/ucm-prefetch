@@ -260,3 +260,66 @@ TEST(UCEarlyNativeTransferTest, UndispatchedAliasStillRollsBackLoadingOwner)
     }
     EXPECT_EQ(follower.GetState(), TransBuffer::State::FAILED);
 }
+
+TEST(UCEarlyNativeTransferTest, CompletionNotificationBeforeWaitIsNotLost)
+{
+    using namespace UC::CacheStore;
+    NativeCompletionEvent event;
+    const auto observed = event.Snapshot();
+    event.Notify();
+    EXPECT_TRUE(event.Wait(observed, std::chrono::milliseconds(0)));
+    EXPECT_FALSE(event.Wait(event.Snapshot(), std::chrono::milliseconds(0)));
+}
+
+TEST(UCEarlyNativeTransferTest, CompletionWakesConcurrentConsumer)
+{
+    using namespace UC::CacheStore;
+    auto event = std::make_shared<NativeCompletionEvent>();
+    std::promise<void> ready;
+    auto waiting = std::async(std::launch::async, [event, &ready] {
+        const auto observed = event->Snapshot();
+        ready.set_value();
+        return event->Wait(observed, std::chrono::seconds(2));
+    });
+    ready.get_future().wait();
+    event->Notify();
+    EXPECT_TRUE(waiting.get());
+}
+
+TEST(UCEarlyNativeTransferTest, MovedNativeTaskRetainsCompletionEvent)
+{
+    using namespace UC::CacheStore;
+    testing::NiceMock<UC::Test::Detail::MockStore> backend;
+    EXPECT_CALL(backend, Load).Times(0);
+    Config config;
+    config.uniqueId = UC::Test::Detail::Random().RandomString(16);
+    config.deviceId = 0;
+    config.tensorSizes = {4096};
+    config.shardSize = config.blockSize = 4096;
+    config.bufferCapacity = 4 * config.blockSize;
+    config.shareBufferEnable = false;
+    config.loadExclusiveBufferNumber = 0;
+    config.storeBackend = &backend;
+    TransBuffer buffer;
+    ASSERT_TRUE(buffer.Setup(config).Success());
+    TransManager native;
+    ASSERT_TRUE(native.Setup(config, &buffer).Success());
+    UC::Detail::BlockId block{};
+    auto seed = buffer.Get(block, 0);
+    ASSERT_TRUE(seed);
+    std::memset(seed.Data(), 0x52, config.shardSize);
+    seed.MarkReady();
+    std::array<unsigned char, 4096> destination{};
+    TransTask prepared(TransTask::Type::LOAD, {{block, 0, {destination.data()}}});
+    prepared.loadHandles.push_back(seed);
+    auto event = std::make_shared<NativeCompletionEvent>();
+    const auto observed = event->Snapshot();
+    prepared.completion = event;
+    TransTask moved(std::move(prepared));
+    EXPECT_FALSE(prepared.completion);
+    auto submitted = native.Submit(std::move(moved));
+    ASSERT_TRUE(submitted);
+    EXPECT_TRUE(event->Wait(observed, std::chrono::seconds(2)));
+    EXPECT_TRUE(native.Wait(submitted.Value()).Success());
+    for (auto byte : destination) { EXPECT_EQ(byte, 0x52); }
+}

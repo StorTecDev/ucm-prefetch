@@ -29,6 +29,7 @@
 #include <string>
 #include "status/status.h"
 #include "early_task_pins.h"
+#include "native_completion_event.h"
 #include "type/types.h"
 
 namespace UC::CacheStore {
@@ -42,6 +43,7 @@ public:
     Type type{Type::DUMP};
     Detail::TaskDesc desc;
     EarlyTaskPins loadHandles;  // optional pre-acquired handles for either native task kind
+    std::shared_ptr<NativeCompletionEvent> completion;  // optional early consumer wakeup
     std::atomic<int32_t> failureStatus{Status::OK().Underlying()};
 
 public:
@@ -51,6 +53,7 @@ public:
           type{other.type},
           desc{std::move(other.desc)},
           loadHandles{std::move(other.loadHandles)},
+          completion{std::move(other.completion)},
           failureStatus{other.failureStatus.load()}
     {
     }

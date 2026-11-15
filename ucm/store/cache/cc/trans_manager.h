@@ -59,7 +59,7 @@ protected:
         const auto tp = w->startTp;
         const auto isLoad = t->type == TransTask::Type::LOAD;
         UC_DEBUG("Cache task({},{},{},{}) dispatching.", id, brief, num, size);
-        w->SetEpilog([id, brief = std::move(brief), num, size, tp, isLoad] {
+        w->SetEpilog([id, brief = std::move(brief), num, size, tp, isLoad, completion = t->completion] {
             auto cost = NowTime::Now() - tp;
             auto costMs = cost * 1e3;
             auto bwGbps = cost > 0 ? static_cast<double>(size) / cost / 1e9 : 0.0;
@@ -78,6 +78,9 @@ protected:
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_bytes_total"),
                                          static_cast<double>(size));
             }
+            // Latch has already reached zero. The receiver still checks the
+            // receipt/error state; notification does not publish READY.
+            if (completion) { completion->Notify(); }
         });
         if (t->type == TransTask::Type::LOAD) {
             loadQ_.Submit(t, w);

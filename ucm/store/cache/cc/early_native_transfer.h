@@ -50,6 +50,7 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
     std::mutex pendingMutex_;
     std::mutex nativeSubmitMutex_;
     std::condition_variable wake_;
+    std::shared_ptr<NativeCompletionEvent> completion_ = std::make_shared<NativeCompletionEvent>();
     std::deque<TaskPair> pending_;
     std::vector<TaskPtr> quarantined_;
     bool stopping_{false};
@@ -81,8 +82,13 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
             pending_.emplace_back(std::move(task), std::move(waiter));
         }
         wake_.notify_one();
+        completion_->Notify();
     }
-    void Cancel(TaskPtr) override { wake_.notify_one(); } // failureSet_ stops new reads
+    void Cancel(TaskPtr) override
+    {
+        wake_.notify_one();
+        completion_->Notify(); // failureSet_ stops new reads
+    }
     Status FailureStatus(const TaskPtr& task) const override { return task->status; }
 
     void SubmitNative(EarlyNativeTask& t)
@@ -91,6 +97,7 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
         // thread share its producer; serialize only the nonblocking enqueue,
         // never SSD completion or H2D/D2H execution.
         std::lock_guard producer(nativeSubmitMutex_);
+        if (t.task.type == TransTask::Type::LOAD) { t.task.completion = completion_; }
         auto submitted = native_.Submit(std::move(t.task));
         if (!submitted) { t.Fail(submitted.Error()); }
         else { t.submitted = true; }
@@ -195,6 +202,7 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
     {
         std::deque<TaskPair> active;
         for (;;) {
+            const auto observed = completion_->Snapshot();
             bool stopping;
             {
                 std::unique_lock lock(pendingMutex_);
@@ -235,8 +243,9 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
                 } else { active.emplace_back(std::move(task), std::move(waiter)); }
             }
             if (!progress) {
-                std::unique_lock lock(pendingMutex_);
-                wake_.wait_for(lock, std::chrono::milliseconds(1));
+                // Keep the existing retry bound for L2 reads and shared followers.
+                // A completed native load can wake its receipt consumer immediately.
+                completion_->Wait(observed, std::chrono::milliseconds(1));
             }
         }
     }
@@ -253,6 +262,7 @@ public:
     {
         { std::lock_guard lock(pendingMutex_); stopping_ = true; }
         wake_.notify_one();
+        completion_->Notify();
         thread_.join();
         if (!quarantined_.empty()) {
             UC_ERROR("UCM_EARLY shutdown blocked: native stream drain unknown; "

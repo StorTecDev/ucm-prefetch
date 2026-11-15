@@ -10,9 +10,9 @@ namespace UC::CacheStore {
 struct EarlyNativeTask {
     TransTask task;
     const Detail::TaskHandle id;
-    // Extra references cover native error paths whose stream drain is unproven.
-    // These are plain handles: they never claim ownership or publish FAILED.
-    std::vector<TransBuffer::Handle> guards;
+    // The task's original pins protect both queued I/O and uncertain completion.
+    // Aliases share this lifetime without reacquiring each shared node lock.
+    std::shared_ptr<std::vector<TransBuffer::Handle>> guards;
     std::vector<size_t> owners, followers;
     size_t cursor{0};
     struct Read { Detail::TaskHandle id; std::vector<size_t> indices; };
@@ -22,12 +22,17 @@ struct EarlyNativeTask {
     Status status{Status::OK()};
     explicit EarlyNativeTask(TransTask prepared)
         : task(std::move(prepared)), id(task.id),
-          guards(task.loadHandles.begin(), task.loadHandles.end())
+          guards(std::make_shared<std::vector<TransBuffer::Handle>>(
+              std::make_move_iterator(task.loadHandles.begin()),
+              std::make_move_iterator(task.loadHandles.end())))
     {
+        for (size_t i = 0; i < guards->size(); ++i) {
+            task.loadHandles[i] = (*guards)[i].WithLifetime(guards);
+        }
         if (task.type == TransTask::Type::LOAD) {
-            for (size_t i = 0; i < guards.size(); ++i) {
-                if (!guards[i].Ready()) {
-                    (guards[i].Owner() ? owners : followers).push_back(i);
+            for (size_t i = 0; i < guards->size(); ++i) {
+                if (!(*guards)[i].Ready()) {
+                    ((*guards)[i].Owner() ? owners : followers).push_back(i);
                 }
             }
         }
@@ -107,7 +112,7 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
             }
             if (!check.Value()) { ++it; continue; }
             auto status = CompleteEarlyRead(backend_, it->id, it->indices,
-                [&](size_t i) -> TransBuffer::Handle& { return t.guards[i]; });
+                [&](size_t i) -> TransBuffer::Handle& { return (*t.guards)[i]; });
             inflight_ -= it->indices.size();
             if (status.Failure()) { t.Fail(status); }
             it = t.reads.erase(it);
@@ -149,7 +154,7 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
                 auto i = t.owners[t.cursor + n];
                 const auto& shard = t.task.desc[i];
                 indices.push_back(i);
-                desc.push_back({shard.owner, shard.index, {t.guards[i].Data()}});
+                desc.push_back({shard.owner, shard.index, {(*t.guards)[i].Data()}});
             }
             // Allocate bookkeeping before Load can accept any I/O.
             t.reads.push_back({0, std::move(indices)});
@@ -166,9 +171,9 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
         // Followers never obstruct submission or completion of our own reads.
         for (size_t i = 0; i < t.followers.size();) {
             const auto index = t.followers[i];
-            const auto state = t.guards[index].GetState();
+            const auto state = (*t.guards)[index].GetState();
             if (state == TransBuffer::State::FAILED) {
-                t.Fail(t.guards[index].FailureStatus()); break;
+                t.Fail((*t.guards)[index].FailureStatus()); break;
             }
             if (state == TransBuffer::State::READY) {
                 // Observation order has no transfer/ownership semantics. Avoid
@@ -211,18 +216,18 @@ class EarlyNativeTransfer final : public Detail::TaskWrapper<EarlyNativeTask, De
                     if (task->status.Failure()) { failureSet_.Insert(task->id); }
                     if (task->quarantined) {
                         UC_ERROR("UCM_EARLY native task={} drain unproven; retaining {} pins; "
-                                 "shared domain restart required", task->id, task->guards.size());
+                                 "shared domain restart required", task->id, task->guards->size());
                         quarantined_.push_back(task);
                     } else {
                         if (task->status.Failure() && !task->submitted) {
-                            for (auto& pin : task->guards) {
+                            for (auto& pin : *task->guards) {
                                 if (pin.Owner() && pin.GetState() == TransBuffer::State::LOADING) {
                                     pin.MarkFailed(task->status);
                                 }
                             }
                         }
                         task->task.loadHandles.clear();
-                        task->guards.clear();
+                        task->guards.reset();
                         task->lease.reset();
                     }
                     waiter->Done();

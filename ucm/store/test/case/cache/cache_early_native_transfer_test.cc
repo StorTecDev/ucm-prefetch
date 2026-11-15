@@ -184,3 +184,79 @@ TEST(UCEarlyNativeTransferTest, FailedHeadDrainsTailWhileAnotherRequestAndDumpAd
     EXPECT_EQ(first[0], 0);   // No H2D was submitted for the failed complete task
     tail = {};
 }
+
+TEST(UCEarlyNativeTransferTest, SharedTaskPinsRetainLayersUntilLastAlias)
+{
+    using namespace UC::CacheStore;
+    Config config;
+    config.uniqueId = UC::Test::Detail::Random().RandomString(16);
+    config.deviceId = 0;
+    testing::NiceMock<UC::Test::Detail::MockStore> backend;
+    config.storeBackend = &backend;
+    config.tensorSizes = {4096};
+    config.shardSize = 4096;
+    config.blockSize = 8192;
+    config.bufferCapacity = 2 * config.blockSize;
+    config.cacheFullBlockL1 = true;
+    config.shareBufferEnable = false;
+    config.loadExclusiveBufferNumber = 0;
+    TransBuffer buffer;
+    ASSERT_TRUE(buffer.Setup(config).Success());
+    UC::Detail::BlockId block{}, other{}, replacement{};
+    other[0] = std::byte{1};
+    replacement[0] = std::byte{2};
+    auto seed = EarlyBufferPins::Acquire(buffer, block, 0, true);
+    ASSERT_TRUE(seed);
+    std::memset(seed.Data(), 0x41, config.blockSize);
+    seed.LayerView(0).MarkReady();
+    seed.LayerView(1).MarkReady();
+    TransTask prepared(TransTask::Type::LOAD, {{block, 0, {nullptr}}, {block, 1, {nullptr}}});
+    prepared.loadHandles.push_back(seed.LayerView(0));
+    prepared.loadHandles.push_back(seed.LayerView(1));
+    seed = {};
+    EarlyNativeTask task(std::move(prepared));
+    auto first = task.task.loadHandles[0];
+    auto second = std::move(task.task.loadHandles[1]);
+    task.task.loadHandles.clear();
+    task.guards.reset();
+    auto held = buffer.TryGet(other, 0);
+    ASSERT_TRUE(held);
+    held.MarkReady();
+    EXPECT_FALSE(buffer.TryGet(replacement, 0));
+    EXPECT_EQ(static_cast<unsigned char*>(second.Data()) -
+              static_cast<unsigned char*>(first.Data()), 4096);
+    EXPECT_EQ(*static_cast<unsigned char*>(first.Data()), 0x41);
+    EXPECT_TRUE(first.Ready());
+    first = {};
+    EXPECT_FALSE(buffer.TryGet(replacement, 0));
+    second = {};
+    EXPECT_TRUE(buffer.TryGet(replacement, 0));
+}
+
+TEST(UCEarlyNativeTransferTest, UndispatchedAliasStillRollsBackLoadingOwner)
+{
+    using namespace UC::CacheStore;
+    Config config;
+    config.uniqueId = UC::Test::Detail::Random().RandomString(16);
+    config.deviceId = 0;
+    config.tensorSizes = {4096};
+    config.shardSize = config.blockSize = 4096;
+    config.bufferCapacity = 4 * config.blockSize;
+    config.shareBufferEnable = false;
+    config.loadExclusiveBufferNumber = 0;
+    TransBuffer buffer;
+    ASSERT_TRUE(buffer.Setup(config).Success());
+    UC::Detail::BlockId block{};
+    TransBuffer::Handle follower;
+    {
+        TransTask prepared(TransTask::Type::LOAD, {{block, 0, {nullptr}}});
+        prepared.loadHandles.push_back(EarlyBufferPins::Acquire(buffer, block, 0, true));
+        ASSERT_TRUE(prepared.loadHandles[0]);
+        follower = buffer.TryGet(block, 0);
+        ASSERT_TRUE(follower);
+        EXPECT_FALSE(follower.Owner());
+        EarlyNativeTask task(std::move(prepared));
+        EXPECT_EQ(follower.GetState(), TransBuffer::State::LOADING);
+    }
+    EXPECT_EQ(follower.GetState(), TransBuffer::State::FAILED);
+}

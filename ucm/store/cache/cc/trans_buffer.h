@@ -50,9 +50,10 @@ public:
     class Handle {
     public:
         Handle() = default;
-        Handle(const Handle& other) : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}, view_{other.view_}
+        Handle(const Handle& other) : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}, view_{other.view_},
+            lifetime_{other.lifetime_}
         {
-            if (Valid()) { buf_->Acquire(pos_); }
+            if (Valid() && !lifetime_) { buf_->Acquire(pos_); }
         }
         Handle& operator=(const Handle& other)
         {
@@ -62,7 +63,8 @@ public:
             }
             return *this;
         }
-        Handle(Handle&& other) noexcept : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}, view_{other.view_}
+        Handle(Handle&& other) noexcept : buf_{other.buf_}, pos_{other.pos_}, owner_{other.owner_}, view_{other.view_},
+            lifetime_{std::move(other.lifetime_)}
         {
             other.buf_ = nullptr;
             other.pos_ = npos;
@@ -76,7 +78,7 @@ public:
         }
         ~Handle()
         {
-            if (Valid()) { buf_->Release(pos_); }
+            if (Valid() && !lifetime_) { buf_->Release(pos_); }
         }
         explicit operator bool() const { return Valid(); }
         bool Owner() const { return owner_; }
@@ -110,6 +112,20 @@ public:
     private:
         friend class TransBuffer;
         friend class EarlyBufferPins;
+        friend struct EarlyNativeTask;
+        // Only aliases of an already-owned task pin may avoid a second shared
+        // node reference. The guard outlives both normal I/O and quarantine.
+        Handle WithLifetime(std::shared_ptr<const void> lifetime) const
+        {
+            Handle result;
+            if (!Valid() || !lifetime) { return result; }
+            result.buf_ = buf_;
+            result.pos_ = pos_;
+            result.owner_ = owner_;
+            result.view_ = view_;
+            result.lifetime_ = std::move(lifetime);
+            return result;
+        }
         Handle(TransBuffer* buf, Index pos, bool owner) : buf_{buf}, pos_{pos}, owner_{owner} {};
         bool Valid() const { return buf_ && pos_ != npos; }
         void Swap(Handle& other) noexcept
@@ -118,11 +134,13 @@ public:
             std::swap(pos_, other.pos_);
             std::swap(owner_, other.owner_);
             std::swap(view_, other.view_);
+            lifetime_.swap(other.lifetime_);
         }
         TransBuffer* buf_{nullptr};
         Index pos_{npos};
         bool owner_{false};
         size_t view_{npos};
+        std::shared_ptr<const void> lifetime_;
     };
 
 public:

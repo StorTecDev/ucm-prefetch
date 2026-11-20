@@ -109,11 +109,11 @@ def test_hints_do_not_publish_ready_and_ignore_stale_sessions():
         broker = Broker()
         tickets = set()
         _, answer = message("owner_answer", "candidate")
-        sender.notify("worker", "previous", answer)
+        sender.notify("worker", "previous", [(answer["key"], answer["attempt"])])
         receiver.receive(broker, tickets)
         assert not tickets
         for _ in range(2):
-            sender.notify("worker", "current", answer)
+            sender.notify("worker", "current", [(answer["key"], answer["attempt"])])
         receiver.receive(broker, tickets)
         assert tickets == {("worker", "candidate", "generation")}
         assert not broker.received
@@ -121,3 +121,49 @@ def test_hints_do_not_publish_ready_and_ignore_stale_sessions():
     finally:
         receiver.socket.close()
         sender.socket.close()
+
+def test_barrier_does_not_read_past_the_formal_head():
+    broker = Broker()
+    inbox = ready.ReadyInbox(ready.ReadyReserve(2))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    head = message("execution_request", "ordinary")
+    items = iter([head, message("owner_answer", "candidate")])
+    inbox.service(broker, lambda: next(items, None))
+    assert broker.received == [head]
+    assert next(items)[1]["op"] == "owner_answer"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux local IPC")
+def test_hint_batch_filters_each_attempt_before_use():
+    endpoint = "ipc://" + uuid4().hex
+    sender = ready.ReadyHints(endpoint, receiver=False)
+    receiver = ready.ReadyHints(endpoint, receiver=True)
+    try:
+        sender.notify("worker", "current", [("ordinary", "generation"), ("candidate", "old"),
+                                            ("third", "generation")])
+        tickets = set()
+        receiver.receive(Broker(), tickets)
+        assert tickets == {("worker", "ordinary", "generation"), ("worker", "third", "generation")}
+    finally:
+        sender.socket.close()
+        receiver.socket.close()
+
+def test_producer_enqueues_formal_ready_and_wakes_without_advisory_io():
+    import queue
+    import threading
+    from collections import deque
+    from unittest.mock import Mock
+
+    control_type = importlib.import_module(package.__name__ + ".early_control").Control
+    control = control_type.__new__(control_type)
+    control.stopping = threading.Event()
+    control.outbound = queue.SimpleQueue()
+    control.hint_outbound = deque(maxlen=32)
+    control.hint_sender = Mock()
+    control.writer = Mock()
+    _, answer = message("owner_answer", "candidate")
+    control.send(answer)
+    assert control.outbound.get_nowait() is answer
+    assert list(control.hint_outbound) == [("candidate", "generation")]
+    control.writer.send.assert_called_once_with(b"x")
+    control.hint_sender.notify.assert_not_called()

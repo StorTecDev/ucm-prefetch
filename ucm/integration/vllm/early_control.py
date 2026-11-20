@@ -6,6 +6,7 @@ pins, leases, or L1 identities. Each socket is confined to one control thread.
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 import os
 import queue
@@ -148,6 +149,7 @@ class Control:
         self.endpoint, self.identity, self.callback = endpoint, identity, callback
         self.ready_inbox = ReadyInbox(ready_reserve) if ready_reserve is not None else None
         self.hint_sender = None
+        self.hint_outbound = deque(maxlen=32)
         self.broker_config = broker_config
         import uuid
         self.hello = dict(hello or {}, session=uuid.uuid4().hex)
@@ -164,9 +166,8 @@ class Control:
         if self.stopping.is_set():
             return
         self.outbound.put(message)
-        sender = self.hint_sender
-        if sender is not None and message["op"] == "owner_answer" and message["state"] == "READY":
-            sender.notify(self.identity, self.hello["session"], message)
+        if self.hint_sender is not None and message["op"] == "owner_answer" and message["state"] == "READY":
+            self.hint_outbound.append((message["key"], message["attempt"]))
         try:
             self.writer.send(b"x")
         except BlockingIOError:
@@ -237,15 +238,30 @@ class Control:
                 )  # control deadlines only; no storage polling
                 if self.reader.fileno() in events:
                     self.reader.recv(65536)
+                    if self.hint_outbound:
+                        # Wake the ordered transport first. If READY is behind normal
+                        # messages, its hint can still pass the rest of that backlog.
+                        if not self.outbound.empty():
+                            dealer.send(encode(self.outbound.get()))
+                        tickets = [self.hint_outbound.popleft()
+                                   for _ in range(len(self.hint_outbound))]
+                        self.hint_sender.notify(self.identity, self.hello["session"], tickets)
                     while not self.outbound.empty():
                         dealer.send(encode(self.outbound.get()))
                 if hint_receiver is not None and hint_receiver.socket.fileno() in events:
                     hint_receiver.receive(broker, inbox.tickets)
-                if inbox is not None and (inbox.pending or router in events):
+                if inbox is not None and inbox.pending:
                     inbox.service(broker, read_next)
                 elif router is not None and router in events:
                     peer, payload = router.recv_multipart()
-                    broker.receive(peer.decode(), decode(payload))
+                    identity, message = peer.decode(), decode(payload)
+                    if inbox is not None and inbox.tickets and inbox.can_cross(broker, message):
+                        inbox.pending.append((identity, message))
+                        inbox.service(broker, read_next)
+                    else:
+                        if inbox is not None and message["op"] == "owner_answer":
+                            inbox.tickets.discard((identity, message["key"], message.get("attempt")))
+                        broker.receive(identity, message)
                 if dealer in events:
                     message = decode(dealer.recv())
                     last_reply = time.monotonic()

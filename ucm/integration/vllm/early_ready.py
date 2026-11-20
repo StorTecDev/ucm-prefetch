@@ -26,6 +26,8 @@ class ReadyReserve:
         self.snapshot = len(self.attempts), processed_sequence
 
     def discard(self, job):
+        if not self.attempts:
+            return
         ticket = (job.key, job.attempt, job.grant)
         if ticket in self.attempts:
             self.attempts.remove(ticket)
@@ -55,34 +57,45 @@ class ReadyHints:
             self.socket.close()
             raise
 
-    def notify(self, peer, session, message):
-        data = msgspec.msgpack.encode((peer, session, message["key"], message["attempt"]))
+    def notify(self, peer, session, tickets):
+        if len(tickets) == 1:
+            # Existing receivers understand the original single-ticket datagram.
+            message = (peer, session, *tickets[0])
+        else:
+            message = (peer, session, tickets)
         try:
-            self.socket.sendto(data, self.address)
+            self.socket.sendto(msgspec.msgpack.encode(message), self.address)
         except OSError:
-            # A full datagram queue or a closing peer must never delay formal READY.
-            pass
+            pass  # The formal notification is already in the ordered transport.
 
     def receive(self, broker, tickets):
-        for _ in range(32):
+        for _ in range(8):
             try:
-                data = self.socket.recv(1024)
+                data = self.socket.recv(8192)
             except BlockingIOError:
                 break
             try:
                 fields = msgspec.msgpack.decode(data)
             except msgspec.DecodeError:
                 continue
-            if not isinstance(fields, list) or len(fields) != 4 or not all(
-                isinstance(field, str) for field in fields
-            ):
+            if not isinstance(fields, list) or len(fields) not in (3, 4):
                 continue
-            peer, session, key, attempt = fields
-            job = broker.jobs.get(key)
-            if (broker.sessions.get(peer) == session and job is not None
-                    and job.get("owner") == peer and job.get("attempt") == attempt
-                    and job["status"] == "PENDING" and len(tickets) < 256):
-                tickets.add((peer, key, attempt))
+            peer, session = fields[:2]
+            if not isinstance(peer, str) or not isinstance(session, str) or broker.sessions.get(peer) != session:
+                continue
+            entries = [fields[2:]] if len(fields) == 4 else fields[2]
+            if not isinstance(entries, list) or len(entries) > 32:
+                continue
+            for entry in entries:
+                if (not isinstance(entry, list) or len(entry) != 2
+                        or not all(isinstance(value, str) for value in entry)):
+                    continue
+                key, attempt = entry
+                job = broker.jobs.get(key)
+                if (job is not None and job.get("owner") == peer
+                        and job.get("attempt") == attempt and job["status"] == "PENDING"
+                        and len(tickets) < 256):
+                    tickets.add((peer, key, attempt))
 
 
 class ReadyInbox:
@@ -110,12 +123,12 @@ class ReadyInbox:
 
     @staticmethod
     def can_cross(broker, message):
+        if message["op"] not in ("resource_wait", "handoff"):
+            return False
         job = broker.jobs.get(message.get("key"))
         # Both operations are local bookkeeping for a live owner job. Neither
         # changes admissions, execution grants, claims, nor the domain lifetime.
-        return job is not None and job.get("owner") and message["op"] in (
-            "resource_wait", "handoff",
-        )
+        return job is not None and bool(job.get("owner"))
 
     def next_index(self, broker):
         earlier_keys = set()
@@ -146,22 +159,26 @@ class ReadyInbox:
             if item is None:
                 return
             self.pending.append(item)
-        quota = min(self.MAX_PROMOTIONS, self.reserve.promotion_budget(self.last_sent_ready_sequence))
-        if not self.tickets or quota == 0 or broker.fenced:
+        if not self.tickets or broker.fenced or not self.can_cross(broker, self.pending[0][1]):
             self.dispatch(broker, 0)
             return
+        quota = min(self.MAX_PROMOTIONS, self.reserve.promotion_budget(self.last_sent_ready_sequence))
+        if not quota:
+            self.dispatch(broker, 0)
+            return
+
         deadline = time.monotonic() + self.TURN_SECONDS
-        while len(self.pending) < self.LOOKAHEAD and time.monotonic() < deadline:
+        # Reading past a barrier cannot reveal an eligible promotion this turn.
+        while (len(self.pending) < self.LOOKAHEAD and time.monotonic() < deadline
+               and self.can_cross(broker, self.pending[-1][1])):
             item = read_next()
             if item is None:
                 break
             self.pending.append(item)
         while len(self.pending) > 1 and quota and time.monotonic() < deadline:
-            if not self.reserve.promotion_budget(self.last_sent_ready_sequence):
-                break
             index = self.next_index(broker)
             if not index:
                 break
             self.dispatch(broker, index)
-            quota -= 1
+            quota = min(quota - 1, self.reserve.promotion_budget(self.last_sent_ready_sequence))
         self.dispatch(broker, 0)

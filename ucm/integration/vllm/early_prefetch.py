@@ -210,7 +210,8 @@ class EarlyScheduler:
     def receive(self, message):
         with self.lock:
             self._receive_result(message)
-            self.ready_reserve.publish(message.get("ready_sequence"))
+            if "ready_sequence" in message:
+                self.ready_reserve.publish(message["ready_sequence"])
 
     def _receive_result(self, message):
         if message["op"] == "domain_active":
@@ -218,6 +219,7 @@ class EarlyScheduler:
             return
         if message["op"] == "domain_lost":
             self.ready_reserve.attempts.clear()
+            self.ready_reserve.publish()
             self.fatal = message["reason"]
             return
         if message["op"] == "lost":
@@ -226,6 +228,7 @@ class EarlyScheduler:
             ):
                 self.fatal = "scheduler control lost with owner generations"
             self.ready_reserve.attempts.clear()
+            self.ready_reserve.publish()
             self.closed = True
             for job in self.jobs.values():
                 job.state = "FAILED"

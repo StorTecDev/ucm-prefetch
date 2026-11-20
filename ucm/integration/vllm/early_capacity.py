@@ -4,6 +4,7 @@ This is a safe-state test, not a second allocator. Only selected, confirmed
 batches enter held; native TryGet still decides actual allocation. A holder's
 maximum is a conservative completion bound, never an up-front charge.
 """
+from collections import Counter
 from dataclasses import dataclass, field
 
 
@@ -18,9 +19,13 @@ class ExecutionWindow:
     def __init__(self, blocks):
         self.capacity = blocks
         self.claims = {}
+        # Shared prefixes count once even when several live claims protect the same block.
+        self.block_holders = Counter()
 
     def add(self, key, maximum):
-        self.claims[key] = Claim(set(maximum))
+        maximum = set(maximum)
+        self.release(key)
+        self.claims[key] = Claim(maximum)
 
     def narrow(self, key, maximum):
         claim = self.claims[key]
@@ -61,6 +66,7 @@ class ExecutionWindow:
         claim = self.claims[key]
         if not blocks <= claim.maximum or not self.safe(key, blocks):
             return False
+        self.block_holders.update(blocks - claim.held)
         claim.held.update(blocks)
         return True
 
@@ -68,8 +74,13 @@ class ExecutionWindow:
         self.claims[key].completed = True
 
     def release(self, key):
-        self.claims.pop(key, None)
+        claim = self.claims.pop(key, None)
+        if claim is not None:
+            for block in claim.held:
+                self.block_holders[block] -= 1
+                if self.block_holders[block] == 0:
+                    del self.block_holders[block]
 
     @property
     def used(self):
-        return len(set().union(*(c.held for c in self.claims.values())))
+        return len(self.block_holders)

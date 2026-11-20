@@ -127,6 +127,7 @@ def connector(request, monkeypatch):
     monkeypatch.setattr(early_store.ucmpipelinestore, "EarlyLookupWithLease",
                         lambda pipeline, ids: (pipeline.LookupOnPrefix(ids), object()))
     c._early = object.__new__(EarlyScheduler)
+    c._early.ready_reserve = early_prefetch.ReadyReserve(12)
     c._early.connector = c
     c._early.lock = threading.RLock()
     c._early.jobs = {}

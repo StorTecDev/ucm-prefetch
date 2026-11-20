@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from .early_control import Control
 from .early_errors import EarlyLookupUnavailable
+from .early_ready import ReadyReserve
 from .early_topology import worker_count, worker_rank
 
 log = logging.getLogger(__name__)
@@ -85,11 +86,18 @@ class EarlyScheduler:
             if self.dp_rank == 0
             else None
         )
+        config = getattr(connector._vllm_config, "scheduler_config", None)
+        target = getattr(config, "max_num_seqs", 0)
+        self.ready_reserve = ReadyReserve(target)
+        control_options = {}
+        if broker and broker["dp_size"] == 1 and type(target) is int and target > 0:
+            control_options["ready_reserve"] = self.ready_reserve
         self.control = control_factory(
             f"ipc:///dev/shm/ucm_early_{connector.unique_id}.sock",
             f"s{self.dp_rank}",
             self.receive,
             broker,
+            **control_options,
         )
 
     def identity(self, request):
@@ -201,55 +209,66 @@ class EarlyScheduler:
 
     def receive(self, message):
         with self.lock:
-            if message["op"] == "domain_active":
-                self.owner_domain_active = True
-                return
-            if message["op"] == "domain_lost":
-                self.fatal = message["reason"]
-                return
-            if message["op"] == "lost":
-                if self.owner_domain_active or any(
-                    job.owner for job in self.jobs.values()
-                ):
-                    self.fatal = "scheduler control lost with owner generations"
-                self.closed = True
-                for job in self.jobs.values():
-                    job.state = "FAILED"
-                return
-            job = self.by_key.get(message.get("key"))
-            if job is None or job.state not in ("PENDING", "READY"):
-                return
-            if message["op"] == "owner_assigned":
-                if message["grant"] <= job.grant:
-                    return
-                job.owner, job.attempt, job.grant = (
-                    message["owner"],
-                    message["attempt"],
-                    message["grant"],
-                )
-                return
-            if job.attempt is not None and (
-                message.get("attempt") != job.attempt
-                or message.get("grant") != job.grant
+            self._receive_result(message)
+            self.ready_reserve.publish(message.get("ready_sequence"))
+
+    def _receive_result(self, message):
+        if message["op"] == "domain_active":
+            self.owner_domain_active = True
+            return
+        if message["op"] == "domain_lost":
+            self.ready_reserve.attempts.clear()
+            self.fatal = message["reason"]
+            return
+        if message["op"] == "lost":
+            if self.owner_domain_active or any(
+                job.owner for job in self.jobs.values()
             ):
+                self.fatal = "scheduler control lost with owner generations"
+            self.ready_reserve.attempts.clear()
+            self.closed = True
+            for job in self.jobs.values():
+                job.state = "FAILED"
+            return
+        job = self.by_key.get(message.get("key"))
+        if job is None or job.state not in ("PENDING", "READY"):
+            return
+        if message["op"] == "owner_assigned":
+            if message["grant"] <= job.grant:
                 return
-            job.hit = message.get("hit", 0)
-            job.capacity_truncated = message.get("capacity_truncated", False)
-            job.state = message["state"]
-            if job.state == "READY":
-                job.ready_received_ns = time.monotonic_ns()
-            job.owner = message.get("owner")
-            job.attempt = message.get("attempt")
-            job.grant = message.get("grant", 0)
-            log.info(
-                "UCM_EARLY scheduler_result key=%s dp=%s state=%s ns=%s",
-                job.key,
-                self.dp_rank,
-                job.state,
-                time.monotonic_ns(),
+            self.ready_reserve.discard(job)
+            job.owner, job.attempt, job.grant = (
+                message["owner"],
+                message["attempt"],
+                message["grant"],
             )
+            return
+        if job.attempt is not None and (
+            message.get("attempt") != job.attempt
+            or message.get("grant") != job.grant
+        ):
+            return
+        self.ready_reserve.discard(job)
+        job.hit = message.get("hit", 0)
+        job.capacity_truncated = message.get("capacity_truncated", False)
+        job.state = message["state"]
+        if job.state == "READY":
+            job.ready_received_ns = time.monotonic_ns()
+        job.owner = message.get("owner")
+        job.attempt = message.get("attempt")
+        job.grant = message.get("grant", 0)
+        if message.get("ready_sequence") is not None and job.state == "READY" and not job.dispatched:
+            self.ready_reserve.attempts.add((job.key, job.attempt, job.grant))
+        log.info(
+            "UCM_EARLY scheduler_result key=%s dp=%s state=%s ns=%s",
+            job.key,
+            self.dp_rank,
+            job.state,
+            time.monotonic_ns(),
+        )
 
     def _cancel(self, job):
+        self.ready_reserve.discard(job)
         job.state = "CANCELLED"
         self.by_key.pop(job.key, None)
         self.control.send({"op": "cancel", "key": job.key})
@@ -272,6 +291,7 @@ class EarlyScheduler:
             for request_id, count in (scheduled_tokens or {}).items():
                 job = self.jobs.get(request_id)
                 if job is not None and job.state == "CANCELLED" and not job.dispatched:
+                    self.ready_reserve.discard(job)
                     job.dispatched = True
                     log.info(
                         "UCM_EARLY hbm_scheduled key=%s request=%s dp=%s "
@@ -292,6 +312,7 @@ class EarlyScheduler:
                     continue
                 keys[request_id] = job.key
                 if not job.dispatched:
+                    self.ready_reserve.discard(job)
                     job.dispatched = True
                     # Read the native event without consuming or changing it.
                     scheduled_ns = next(
@@ -382,6 +403,7 @@ class EarlyScheduler:
                 not isinstance(request, str) and job.request is not request
             ):
                 return
+            self.ready_reserve.discard(job)
             self.jobs.pop(request_id)
             self.by_key.pop(job.key, None)
             job.state = "CANCELLED"

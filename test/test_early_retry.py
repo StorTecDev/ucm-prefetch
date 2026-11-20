@@ -200,6 +200,7 @@ def test_invalid_retry_configuration_fails_before_admission(name, value):
 def test_scheduler_ignores_results_and_assignments_from_old_attempts():
     job = early.Job(object(), object(), (), key="generation")
     scheduler = early.EarlyScheduler.__new__(early.EarlyScheduler)
+    scheduler.ready_reserve = early.ReadyReserve(12)
     scheduler.lock = threading.RLock()
     scheduler.by_key = {job.key: job}
     scheduler.dp_rank = 0

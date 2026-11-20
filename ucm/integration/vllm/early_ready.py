@@ -104,6 +104,7 @@ class ReadyInbox:
     LOOKAHEAD = 24
     TURN_SECONDS = 0.0005
     MAX_PROMOTIONS = 4
+    MAX_FIFO_FOLLOWUPS = 3
 
     def __init__(self, reserve):
         self.reserve = reserve
@@ -172,6 +173,40 @@ class ReadyInbox:
             self.promoted += 1
             self.crossed += index
         broker.receive(peer, message)
+
+    def receive_hinted(self, broker, item, read_next, *, scheduler_readable):
+        """Handle an ordered packet while an owner has advertised readiness."""
+        peer, message = item
+        self.pending.append(item)
+        if self.can_cross(broker, peer, message):
+            self.service(broker, read_next)
+            return
+
+        # Grants and lookup completion can change eligibility for another job.
+        # Finish each prerequisite before reading the next packet across it.
+        prerequisites = ("execution_request", "lookup_complete")
+        if scheduler_readable or message["op"] not in prerequisites:
+            self.dispatch(broker, 0)
+            return
+
+        deadline = time.monotonic() + self.TURN_SECONDS
+        self.dispatch(broker, 0)
+        for _ in range(self.MAX_FIFO_FOLLOWUPS):
+            if (broker.fenced or not self.tickets or time.monotonic() >= deadline
+                    or not self.reserve.promotion_budget(self.last_sent_ready_sequence)):
+                return
+            item = read_next()
+            if item is None:
+                return
+            self.pending.append(item)
+            op = item[1]["op"]
+            if op not in prerequisites and op != "owner_answer":
+                # The next poll samples new hints and local scheduler results
+                # before ordinary lookahead or a different protocol barrier.
+                return
+            self.dispatch(broker, 0)
+            if op == "owner_answer":
+                return
 
     def service(self, broker, read_next):
         if not self.pending:

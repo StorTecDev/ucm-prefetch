@@ -208,3 +208,62 @@ def test_partial_ack_checks_generation_membership_and_same_key(op):
     inbox.tickets.add(("worker", "ordinary", "generation"))
     inbox.pending.extend([("second", event), message("owner_answer", "ordinary")])
     assert inbox.next_index(broker) == 0
+
+
+def test_hinted_fifo_dispatches_each_prerequisite_before_reading_past_it(monkeypatch):
+    monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    inbox = ready.ReadyInbox(ready.ReadyReserve(2))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    broker = Broker()
+    head = message("execution_request", "ordinary")
+    lookup = message("lookup_complete", "candidate")
+    answer = message("owner_answer", "candidate")
+    backlog = [lookup, answer]
+
+    def read_next():
+        assert broker.received == ([head] if len(backlog) == 2 else [head, lookup])
+        return backlog.pop(0)
+
+    inbox.receive_hinted(broker, head, read_next, scheduler_readable=False)
+    assert broker.received == [head, lookup, answer]
+    assert not inbox.pending and not inbox.tickets
+
+
+@pytest.mark.parametrize("busy,fenced,full,expired", [
+    (True, False, False, False), (False, True, False, False),
+    (False, False, True, False), (False, False, False, True),
+])
+def test_hinted_fifo_yields_without_speculative_receive(monkeypatch, busy, fenced, full, expired):
+    now = iter([0.0, 1.0] if expired else [0.0] * 8)
+    monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: next(now)))
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    inbox.last_sent_ready_sequence = int(full)
+    broker = Broker()
+    broker.fenced = fenced
+    head = message("execution_request", "ordinary")
+
+    def unexpected_read():
+        pytest.fail("A yielded turn must leave the next formal packet in order")
+
+    inbox.receive_hinted(broker, head, unexpected_read, scheduler_readable=busy)
+    assert broker.received == [head]
+
+
+def test_hinted_fifo_bounds_one_turn_and_preserves_next_barrier(monkeypatch):
+    monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    broker = Broker()
+    head = message("lookup_complete", "candidate")
+    ordinary = message("execution_request", "ordinary")
+    cancel = message("cancel", "candidate")
+    answer = message("owner_answer", "candidate")
+    backlog = [ordinary] * inbox.MAX_FIFO_FOLLOWUPS + [cancel, answer]
+    inbox.receive_hinted(broker, head, lambda: backlog.pop(0), scheduler_readable=False)
+    assert broker.received == [head] + [ordinary] * inbox.MAX_FIFO_FOLLOWUPS
+    assert backlog == [cancel, answer]
+    inbox.receive_hinted(broker, ordinary, lambda: backlog.pop(0), scheduler_readable=False)
+    assert list(inbox.pending) == [cancel] and backlog == [answer]
+    inbox.service(broker, lambda: backlog.pop(0))
+    assert broker.received[-1] == cancel and backlog == [answer]

@@ -255,12 +255,11 @@ class Control:
                 elif router is not None and router in events:
                     peer, payload = router.recv_multipart()
                     identity, message = peer.decode(), decode(payload)
-                    if inbox is not None and inbox.tickets and inbox.can_cross(broker, identity, message):
-                        inbox.pending.append((identity, message))
-                        inbox.service(broker, read_next)
+                    if inbox is not None and inbox.tickets:
+                        inbox.receive_hinted(
+                            broker, (identity, message), read_next, scheduler_readable=dealer in events
+                        )
                     else:
-                        if inbox is not None and message["op"] == "owner_answer":
-                            inbox.tickets.discard((identity, message["key"], message.get("attempt")))
                         broker.receive(identity, message)
                 if dealer in events:
                     message = decode(dealer.recv())

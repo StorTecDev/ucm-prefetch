@@ -30,7 +30,17 @@ class ExecutionWindow:
         claim.maximum = maximum
 
     def safe(self, key, blocks):
-        projected = {k: c.held | (set(blocks) if k == key else set())
+        blocks = set(blocks)
+        # Even counting each proposed block as new, if every live holder could
+        # finish first, removing any holder can only make the next one easier.
+        spare = self.capacity - sum(len(claim.held) for claim in self.claims.values()) - len(blocks)
+        if spare >= 0 and all(
+            claim.completed or len(claim.maximum) <= spare
+            for name, claim in self.claims.items() if claim.held or name == key
+        ):
+            return True
+
+        projected = {k: c.held | (blocks if k == key else set())
                      for k, c in self.claims.items()}
         # Only actual holders participate. Non-holders wait without pins.
         pending = {k for k, held in projected.items() if held}

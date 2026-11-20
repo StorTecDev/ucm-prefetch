@@ -122,13 +122,33 @@ class ReadyInbox:
             send(peer, message)
 
     @staticmethod
-    def can_cross(broker, message):
-        if message["op"] not in ("resource_wait", "handoff"):
+    def can_cross(broker, peer, message):
+        op = message["op"]
+        if op not in ("resource_wait", "handoff", "consumed", "quiesced"):
             return False
         job = broker.jobs.get(message.get("key"))
-        # Both operations are local bookkeeping for a live owner job. Neither
-        # changes admissions, execution grants, claims, nor the domain lifetime.
-        return job is not None and bool(job.get("owner"))
+        if job is None or not job.get("owner"):
+            return False
+        if op in ("resource_wait", "handoff"):
+            return True
+        if message.get("attempt") != job["attempt"]:
+            return False
+        if op == "consumed" and job["status"] == "READY":
+            received = job["consumers"]
+        elif op == "quiesced" and job.get("retiring"):
+            received = job["terminal"]
+        else:
+            return False
+
+        workers = broker.workers(job["dp"])
+        if peer not in workers:
+            return False
+        # Keep one outstanding worker as a barrier for the whole scanned prefix.
+        # Checking each ACK in isolation could move READY past a complete cohort.
+        barrier_peer = job["owner"]
+        if barrier_peer in received:
+            barrier_peer = min(workers - received, default=None)
+        return barrier_peer is not None and peer != barrier_peer
 
     def next_index(self, broker):
         earlier_keys = set()
@@ -138,7 +158,7 @@ class ReadyInbox:
                     and key not in earlier_keys
                     and (peer, key, message.get("attempt")) in self.tickets):
                 return index
-            if not self.can_cross(broker, message):
+            if not self.can_cross(broker, peer, message):
                 break
             earlier_keys.add(key)
         return 0
@@ -159,7 +179,7 @@ class ReadyInbox:
             if item is None:
                 return
             self.pending.append(item)
-        if not self.tickets or broker.fenced or not self.can_cross(broker, self.pending[0][1]):
+        if not self.tickets or broker.fenced or not self.can_cross(broker, *self.pending[0]):
             self.dispatch(broker, 0)
             return
         quota = min(self.MAX_PROMOTIONS, self.reserve.promotion_budget(self.last_sent_ready_sequence))
@@ -170,7 +190,7 @@ class ReadyInbox:
         deadline = time.monotonic() + self.TURN_SECONDS
         # Reading past a barrier cannot reveal an eligible promotion this turn.
         while (len(self.pending) < self.LOOKAHEAD and time.monotonic() < deadline
-               and self.can_cross(broker, self.pending[-1][1])):
+               and self.can_cross(broker, *self.pending[-1])):
             item = read_next()
             if item is None:
                 break

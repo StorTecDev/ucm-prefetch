@@ -167,3 +167,44 @@ def test_producer_enqueues_formal_ready_and_wakes_without_advisory_io():
     assert list(control.hint_outbound) == [("candidate", "generation")]
     control.writer.send.assert_called_once_with(b"x")
     control.hint_sender.notify.assert_not_called()
+
+
+@pytest.mark.parametrize("op,field", [("consumed", "consumers"), ("quiesced", "terminal")])
+def test_ready_only_crosses_incomplete_acknowledgements(op, field):
+    broker = Broker()
+    workers = {"worker", "second", "third", "fourth"}
+    broker.workers = lambda dp: workers
+    job = broker.jobs["ordinary"]
+    job.update(dp=0, status="READY", retiring=op == "quiesced", consumers=set(), terminal=set())
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    answer = message("owner_answer", "candidate")
+
+    def selection(*peers):
+        ack = message(op, "ordinary")[1]
+        inbox.pending.clear()
+        inbox.pending.extend((peer, ack) for peer in peers)
+        inbox.pending.append(answer)
+        return inbox.next_index(broker)
+
+    assert selection("second", "third", "fourth") == 3
+    assert selection("second", "third", "fourth", "worker") == 0
+    job[field].add("worker")
+    assert selection("third", "third", "second") == 3
+    assert selection("third", "second", "fourth") == 0
+    job[field].update(workers)
+    assert selection("third") == 0
+
+
+@pytest.mark.parametrize("op", ["consumed", "quiesced"])
+def test_partial_ack_checks_generation_membership_and_same_key(op):
+    broker = Broker()
+    broker.workers = lambda dp: {"worker", "second"}
+    broker.jobs["ordinary"].update(dp=0, status="READY", retiring=True, consumers=set(), terminal=set())
+    event = message(op, "ordinary")[1]
+    assert not ready.ReadyInbox.can_cross(broker, "unknown", event)
+    assert not ready.ReadyInbox.can_cross(broker, "second", dict(event, attempt="previous"))
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.tickets.add(("worker", "ordinary", "generation"))
+    inbox.pending.extend([("second", event), message("owner_answer", "ordinary")])
+    assert inbox.next_index(broker) == 0

@@ -255,7 +255,7 @@ class Control:
                 elif router is not None and router in events:
                     peer, payload = router.recv_multipart()
                     identity, message = peer.decode(), decode(payload)
-                    if inbox is not None and inbox.tickets and inbox.can_cross(broker, message):
+                    if inbox is not None and inbox.tickets and inbox.can_cross(broker, identity, message):
                         inbox.pending.append((identity, message))
                         inbox.service(broker, read_next)
                     else:

@@ -875,3 +875,37 @@ def test_whole_block_l1_keeps_logical_layer_consumers_and_physical_budget(mutati
         assert cap["task_shards"] == 625
         assert cap["native"]["shard_bytes"] == cap["native"]["block_bytes"] == 1093632
         assert cap["full_block_l1"] and cap["full_block_load"]
+
+@pytest.mark.parametrize("op", ["consumed", "quiesced"])
+def test_ready_across_partial_ack_preserves_broker_lifecycle(op):
+    control = importlib.import_module(package.__name__ + ".early_ready")
+
+    def run(prioritize):
+        cluster = Cluster(tp=4)
+        active, retiring = cluster.job("active"), cluster.job("previous")
+        cluster.ready(retiring)
+        if op == "quiesced":
+            cluster.b.receive("s0", dict(op="finish", key=retiring["key"]))
+        cluster.out.clear()
+        barrier = retiring["owner"]
+        ack = dict(op=op, key=retiring["key"], attempt=retiring["attempt"])
+        answer = dict(op="owner_answer", key=active["key"], attempt=active["attempt"],
+                      state="READY", hit=len(active["blocks"]), capacity_truncated=False)
+        peers = sorted(cluster.b.workers(0) - {barrier})
+        events = [(peer, ack) for peer in peers] + [(active["owner"], answer), (barrier, ack)]
+        if prioritize:
+            inbox = control.ReadyInbox(control.ReadyReserve(1))
+            inbox.TURN_SECONDS = 5
+            inbox.tickets.add((active["owner"], active["key"], active["attempt"]))
+            inbox.pending.extend(events)
+            while inbox.pending:
+                inbox.service(cluster.b, lambda: None)
+            assert inbox.promoted == 1
+        else:
+            for peer, event in events:
+                cluster.b.receive(peer, event)
+        assert not cluster.b.fenced
+        return (active["status"], retiring["status"], retiring["consumers"], retiring["terminal"],
+                [(peer, event["op"], event.get("key")) for peer, event in cluster.out])
+
+    assert run(True) == run(False)

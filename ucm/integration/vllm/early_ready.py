@@ -99,12 +99,11 @@ class ReadyHints:
 
 
 class ReadyInbox:
-    """Preserve receive order across barriers and yield to the scheduler each turn."""
+    """Promote independent READY messages within bounded FIFO service turns."""
 
     LOOKAHEAD = 24
     TURN_SECONDS = 0.0005
     MAX_PROMOTIONS = 4
-    MAX_FIFO_FOLLOWUPS = 3
 
     def __init__(self, reserve):
         self.reserve = reserve
@@ -125,11 +124,26 @@ class ReadyInbox:
     @staticmethod
     def can_cross(broker, peer, message):
         op = message["op"]
-        if op not in ("resource_wait", "handoff", "consumed", "quiesced"):
+        if op not in ("resource_wait", "handoff", "consumed", "quiesced",
+                      "execution_request", "lookup_complete"):
             return False
         job = broker.jobs.get(message.get("key"))
         if job is None or not job.get("owner"):
             return False
+        if op in ("execution_request", "lookup_complete"):
+            # Another job's grants may move later without invalidating the pins
+            # already held by READY. Malformed input can fence the shared domain,
+            # so it remains a barrier even when it belongs to a different job.
+            if (peer != job["owner"] or peer not in broker.workers(job["dp"])
+                    or message.get("attempt") != job["attempt"]
+                    or job["status"] != "PENDING" or job.get("retiring")):
+                return False
+            if op == "lookup_complete":
+                hit = message.get("hit")
+                return type(hit) is int and 0 <= hit <= len(job["blocks"])
+            values = [message.get(name) for name in ("batch", "begin", "count")]
+            return (all(type(value) is int and value >= 0 for value in values)
+                    and values[1] + values[2] <= len(job["blocks"]))
         if op in ("resource_wait", "handoff"):
             return True
         if message.get("attempt") != job["attempt"]:
@@ -151,13 +165,25 @@ class ReadyInbox:
             barrier_peer = min(workers - received, default=None)
         return barrier_peer is not None and peer != barrier_peer
 
+    @staticmethod
+    def valid_ready(broker, peer, message):
+        job = broker.jobs.get(message.get("key"))
+        hit = message.get("hit")
+        return (job is not None and job.get("owner") == peer
+                and peer in broker.workers(job["dp"])
+                and job.get("attempt") == message.get("attempt")
+                and job["status"] == "PENDING" and not job.get("retiring")
+                and type(hit) is int and 0 <= hit <= len(job["blocks"])
+                and type(message.get("capacity_truncated")) is bool)
+
     def next_index(self, broker):
         earlier_keys = set()
         for index, (peer, message) in enumerate(self.pending):
             key = message.get("key")
             if (message["op"] == "owner_answer" and message.get("state") == "READY"
                     and key not in earlier_keys
-                    and (peer, key, message.get("attempt")) in self.tickets):
+                    and (peer, key, message.get("attempt")) in self.tickets
+                    and self.valid_ready(broker, peer, message)):
                 return index
             if not self.can_cross(broker, peer, message):
                 break
@@ -176,37 +202,11 @@ class ReadyInbox:
 
     def receive_hinted(self, broker, item, read_next, *, scheduler_readable):
         """Handle an ordered packet while an owner has advertised readiness."""
-        peer, message = item
         self.pending.append(item)
-        if self.can_cross(broker, peer, message):
+        if scheduler_readable:
+            self.dispatch(broker, 0)
+        else:
             self.service(broker, read_next)
-            return
-
-        # Grants and lookup completion can change eligibility for another job.
-        # Finish each prerequisite before reading the next packet across it.
-        prerequisites = ("execution_request", "lookup_complete")
-        if scheduler_readable or message["op"] not in prerequisites:
-            self.dispatch(broker, 0)
-            return
-
-        deadline = time.monotonic() + self.TURN_SECONDS
-        self.dispatch(broker, 0)
-        for _ in range(self.MAX_FIFO_FOLLOWUPS):
-            if (broker.fenced or not self.tickets or time.monotonic() >= deadline
-                    or not self.reserve.promotion_budget(self.last_sent_ready_sequence)):
-                return
-            item = read_next()
-            if item is None:
-                return
-            self.pending.append(item)
-            op = item[1]["op"]
-            if op not in prerequisites and op != "owner_answer":
-                # The next poll samples new hints and local scheduler results
-                # before ordinary lookahead or a different protocol barrier.
-                return
-            self.dispatch(broker, 0)
-            if op == "owner_answer":
-                return
 
     def service(self, broker, read_next):
         if not self.pending:

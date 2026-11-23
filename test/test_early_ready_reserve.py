@@ -16,7 +16,8 @@ ready = importlib.import_module(package.__name__ + ".early_ready")
 
 
 def message(op, key):
-    return "worker", dict(op=op, key=key, attempt="generation", state="READY")
+    return "worker", dict(op=op, key=key, attempt="generation", state="READY",
+                        hit=1, capacity_truncated=False, batch=0, begin=0, count=1)
 
 
 class Broker:
@@ -24,11 +25,14 @@ class Broker:
 
     def __init__(self):
         self.jobs = {
-            key: dict(status="PENDING", owner="worker", attempt="generation")
+            key: dict(status="PENDING", owner="worker", attempt="generation", dp=0, blocks=[b"block"])
             for key in ("ordinary", "candidate", "third")
         }
         self.sessions = {"worker": "current"}
         self.received = []
+
+    def workers(self, dp):
+        return {"worker"}
 
     def receive(self, peer, event):
         self.received.append((peer, event))
@@ -58,11 +62,11 @@ def test_normal_and_promoted_results_share_one_watermark():
 @pytest.mark.parametrize("op,key,expected", [
     ("resource_wait", "ordinary", 1), ("handoff", "ordinary", 1),
     ("resource_wait", "candidate", 0), ("lookup_complete", "candidate", 0),
-    ("lookup_complete", "ordinary", 0), ("execution_request", "ordinary", 0),
+    ("lookup_complete", "ordinary", 1), ("execution_request", "ordinary", 1),
     ("cancel", "candidate", 0), ("domain_fault", "ordinary", 0),
     ("owner_drained", "ordinary", 0), ("future_message", "ordinary", 0),
 ])
-def test_only_independent_bookkeeping_can_be_crossed(op, key, expected):
+def test_only_independent_valid_messages_can_be_crossed(op, key, expected):
     inbox = ready.ReadyInbox(ready.ReadyReserve(1))
     inbox.tickets.add(("worker", "candidate", "generation"))
     inbox.pending.extend([message(op, key), message("owner_answer", "candidate")])
@@ -126,7 +130,7 @@ def test_barrier_does_not_read_past_the_formal_head():
     broker = Broker()
     inbox = ready.ReadyInbox(ready.ReadyReserve(2))
     inbox.tickets.add(("worker", "candidate", "generation"))
-    head = message("execution_request", "ordinary")
+    head = message("domain_fault", "ordinary")
     items = iter([head, message("owner_answer", "candidate")])
     inbox.service(broker, lambda: next(items, None))
     assert broker.received == [head]
@@ -210,7 +214,7 @@ def test_partial_ack_checks_generation_membership_and_same_key(op):
     assert inbox.next_index(broker) == 0
 
 
-def test_hinted_fifo_dispatches_each_prerequisite_before_reading_past_it(monkeypatch):
+def test_same_request_prerequisite_is_processed_before_ready(monkeypatch):
     monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: 0.0))
     inbox = ready.ReadyInbox(ready.ReadyReserve(2))
     inbox.tickets.add(("worker", "candidate", "generation"))
@@ -218,24 +222,19 @@ def test_hinted_fifo_dispatches_each_prerequisite_before_reading_past_it(monkeyp
     head = message("execution_request", "ordinary")
     lookup = message("lookup_complete", "candidate")
     answer = message("owner_answer", "candidate")
-    backlog = [lookup, answer]
-
-    def read_next():
-        assert broker.received == ([head] if len(backlog) == 2 else [head, lookup])
-        return backlog.pop(0)
-
-    inbox.receive_hinted(broker, head, read_next, scheduler_readable=False)
+    backlog = iter([lookup, answer])
+    inbox.receive_hinted(broker, head, lambda: next(backlog, None), scheduler_readable=False)
+    assert broker.received == [head]
+    inbox.service(broker, lambda: next(backlog, None))
+    assert broker.received == [head, lookup]
+    inbox.service(broker, lambda: next(backlog, None))
     assert broker.received == [head, lookup, answer]
-    assert not inbox.pending and not inbox.tickets
 
 
-@pytest.mark.parametrize("busy,fenced,full,expired", [
-    (True, False, False, False), (False, True, False, False),
-    (False, False, True, False), (False, False, False, True),
+@pytest.mark.parametrize("busy,fenced,full", [
+    (True, False, False), (False, True, False), (False, False, True),
 ])
-def test_hinted_fifo_yields_without_speculative_receive(monkeypatch, busy, fenced, full, expired):
-    now = iter([0.0, 1.0] if expired else [0.0] * 8)
-    monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: next(now)))
+def test_hinted_turn_yields_without_speculative_receive(busy, fenced, full):
     inbox = ready.ReadyInbox(ready.ReadyReserve(1))
     inbox.tickets.add(("worker", "candidate", "generation"))
     inbox.last_sent_ready_sequence = int(full)
@@ -250,20 +249,135 @@ def test_hinted_fifo_yields_without_speculative_receive(monkeypatch, busy, fence
     assert broker.received == [head]
 
 
-def test_hinted_fifo_bounds_one_turn_and_preserves_next_barrier(monkeypatch):
+def test_scan_budget_and_fault_barrier_are_bounded(monkeypatch):
     monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: 0.0))
     inbox = ready.ReadyInbox(ready.ReadyReserve(1))
     inbox.tickets.add(("worker", "candidate", "generation"))
     broker = Broker()
-    head = message("lookup_complete", "candidate")
     ordinary = message("execution_request", "ordinary")
-    cancel = message("cancel", "candidate")
     answer = message("owner_answer", "candidate")
-    backlog = [ordinary] * inbox.MAX_FIFO_FOLLOWUPS + [cancel, answer]
-    inbox.receive_hinted(broker, head, lambda: backlog.pop(0), scheduler_readable=False)
-    assert broker.received == [head] + [ordinary] * inbox.MAX_FIFO_FOLLOWUPS
-    assert backlog == [cancel, answer]
-    inbox.receive_hinted(broker, ordinary, lambda: backlog.pop(0), scheduler_readable=False)
-    assert list(inbox.pending) == [cancel] and backlog == [answer]
-    inbox.service(broker, lambda: backlog.pop(0))
-    assert broker.received[-1] == cancel and backlog == [answer]
+    backlog = [ordinary] * (inbox.LOOKAHEAD + 2) + [answer]
+    inbox.service(broker, lambda: backlog.pop(0) if backlog else None)
+    assert len(inbox.pending) == inbox.LOOKAHEAD - 1
+    assert len(backlog) == 3
+    assert broker.received == [ordinary]
+    inbox.pending.clear()
+    fault = message("domain_fault", "ordinary")
+    inbox.pending.extend([ordinary, fault])
+    inbox.service(broker, lambda: pytest.fail("Cannot read beyond domain fault"))
+    assert list(inbox.pending) == [fault]
+
+
+@pytest.mark.parametrize("op,change", [
+    ("execution_request", {"count": -1}),
+    ("execution_request", {"batch": True}),
+    ("execution_request", {"begin": 1, "count": 1}),
+    ("lookup_complete", {"hit": 2}),
+    ("lookup_complete", {"hit": True}),
+    ("execution_request", {"attempt": "obsolete"}),
+])
+def test_invalid_admission_message_keeps_fifo(op, change):
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    peer, item = message(op, "ordinary")
+    inbox.pending.extend([(peer, dict(item, **change)), message("owner_answer", "candidate")])
+    assert inbox.next_index(Broker()) == 0
+
+
+@pytest.mark.parametrize("change", [
+    {"attempt": "obsolete"}, {"hit": -1}, {"hit": True},
+    {"capacity_truncated": None}, {"state": "FAILED"},
+])
+def test_stale_or_invalid_ready_is_not_promoted(change):
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    peer, answer = message("owner_answer", "candidate")
+    answer.update(change)
+    inbox.tickets.add((peer, "candidate", answer["attempt"]))
+    inbox.pending.extend([message("execution_request", "ordinary"), (peer, answer)])
+    assert inbox.next_index(Broker()) == 0
+
+
+def test_ready_passes_unrelated_lookup_and_grant_without_reordering_them():
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.TURN_SECONDS = 5
+    broker = Broker()
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    items = [message("execution_request", "ordinary"), message("lookup_complete", "third")]
+    answer = message("owner_answer", "candidate")
+    inbox.pending.extend(items + [answer])
+    inbox.service(broker, lambda: None)
+    assert broker.received == [answer, items[0]]
+    inbox.service(broker, lambda: None)
+    assert broker.received == [answer, *items]
+
+
+def test_elapsed_scan_budget_keeps_fifo_progress(monkeypatch):
+    now = iter([0.0, 1.0, 1.0])
+    monkeypatch.setattr(ready, "time", SimpleNamespace(monotonic=lambda: next(now)))
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.tickets.add(("worker", "candidate", "generation"))
+    broker = Broker()
+    head = message("execution_request", "ordinary")
+    inbox.pending.append(head)
+    inbox.service(broker, lambda: pytest.fail("Scan deadline expired"))
+    assert broker.received == [head]
+
+def test_promoted_ready_keeps_capacity_until_every_consumer_drains():
+    from test_early_owner_protocol import Cluster
+
+    cluster = Cluster()
+    a = cluster.job("candidate", count=20)
+    b = cluster.job("ordinary", count=20, offset=20)
+    cluster.message(a, "lookup_complete", hit=20)
+    cluster.message(a, "execution_request", batch=0, begin=0, count=20)
+    window = a["domain"]["execution"]
+    held = window.used
+    assert held == 20
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.TURN_SECONDS = 5
+    inbox.tickets.add((a["owner"], a["key"], a["attempt"]))
+    lookup = (b["owner"], dict(op="lookup_complete", key=b["key"], attempt=b["attempt"], hit=20))
+    grant = (b["owner"], dict(op="execution_request", key=b["key"], attempt=b["attempt"], batch=0, begin=0, count=20))
+    answer = (a["owner"], dict(op="owner_answer", key=a["key"], attempt=a["attempt"], state="READY", hit=20, capacity_truncated=False))
+    inbox.pending.extend([lookup, grant, answer])
+    cluster.out.clear()
+    inbox.service(cluster.b, lambda: None)
+    assert inbox.promoted == 1
+    assert a["status"] == "READY" and window.used == held
+    assert not b["execution_grants"]
+    assert cluster.out[0][1]["op"] == "result"
+    inbox.service(cluster.b, lambda: None)
+    assert b["execution_grants"] and window.used == 40
+    cluster.message(a, "consumed", "w0.0")
+    assert window.used == 40 and not a.get("retiring")
+    cluster.message(a, "consumed", "w0.1")
+    assert a["retiring"] and window.used == 40
+    cluster.message(a, "quiesced", "w0.0")
+    cluster.message(a, "owner_drained")
+    assert window.used == 40
+    cluster.message(a, "quiesced", "w0.1")
+    cluster.message(a, "owner_drained")
+    assert window.used == 20 and a["key"] not in cluster.b.jobs
+    cluster.drain(b)
+    assert window.used == 0
+
+
+@pytest.mark.parametrize("op", ["cancel", "domain_fault", "consumer_failed"])
+def test_control_barrier_prevents_ready_publication(op):
+    from test_early_owner_protocol import Cluster
+
+    cluster = Cluster()
+    a, b = cluster.job("candidate"), cluster.job("ordinary")
+    inbox = ready.ReadyInbox(ready.ReadyReserve(1))
+    inbox.TURN_SECONDS = 5
+    inbox.tickets.add((a["owner"], a["key"], a["attempt"]))
+    peer = a["client"] if op == "cancel" else b["owner"]
+    affected = a if op == "cancel" else b
+    barrier = (peer, dict(op=op, key=affected["key"], attempt=affected["attempt"]))
+    answer = (a["owner"], dict(op="owner_answer", key=a["key"], attempt=a["attempt"], state="READY", hit=4, capacity_truncated=False))
+    inbox.pending.extend([barrier, answer])
+    cluster.out.clear()
+    inbox.service(cluster.b, lambda: None)
+    inbox.service(cluster.b, lambda: None)
+    assert not any(msg.get("state") == "READY" for _, msg in cluster.out)
+    assert inbox.promoted == 0

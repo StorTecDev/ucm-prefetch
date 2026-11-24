@@ -251,7 +251,7 @@ class Control:
                 if hint_receiver is not None and hint_receiver.socket.fileno() in events:
                     hint_receiver.receive(broker, inbox.tickets)
                 if inbox is not None and inbox.pending:
-                    inbox.service(broker, read_next)
+                    inbox.service(broker, read_next, transport_readable=router in events)
                 elif router is not None and router in events:
                     peer, payload = router.recv_multipart()
                     identity, message = peer.decode(), decode(payload)

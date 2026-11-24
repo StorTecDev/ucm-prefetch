@@ -594,3 +594,89 @@ def test_consecutive_real_ready_keeps_shared_pins_and_capacity_until_drain():
     assert window.used == 20
     cluster.drain(ordinary)
     assert window.used == 0
+
+
+def test_empty_transport_does_not_rescan_known_ordinary_prefix():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(40)]
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    scanned = inbox.scanned
+    while inbox.pending:
+        inbox.service(
+            broker, lambda: pytest.fail("No new transport readiness"),
+            transport_readable=False,
+        )
+    assert broker.received == ordinary
+    assert scanned == inbox.scanned == len(ordinary)
+    assert inbox._ordinary_prefix_size == 0
+
+
+def test_new_transport_readiness_revalidates_prefix_and_promotes_ready():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(3)]
+    answer = message("owner_answer", "candidate")
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    backlog = iter([answer])
+    inbox.service(broker, lambda: next(backlog, None), transport_readable=True)
+    assert broker.received == [ordinary[0], answer, ordinary[1]]
+    assert list(inbox.pending) == ordinary[2:]
+    assert inbox.last_sent_ready_sequence == 1
+
+
+def test_state_change_does_not_require_rescanning_packet_types_without_data():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(3)]
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    broker.jobs["ordinary"]["status"] = "CANCELLED"
+    broker.ready_order_epoch += 1
+    inbox.service(
+        broker, lambda: pytest.fail("Only FIFO must advance without new input"),
+        transport_readable=False,
+    )
+    assert broker.received == ordinary[:2]
+    answer = message("owner_answer", "candidate")
+    backlog = iter([answer])
+    inbox.service(
+        broker, lambda: next(backlog, None), transport_readable=True
+    )
+    assert broker.received == ordinary
+    assert next(backlog) == answer
+
+
+def test_new_buffered_packet_invalidates_full_prefix_coverage():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(3)]
+    answer = message("owner_answer", "candidate")
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    inbox.pending.append(answer)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    assert broker.received == [ordinary[0], answer, ordinary[1]]
+
+
+def test_unknown_transport_state_still_seeks_formal_ready():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(3)]
+    answer = message("owner_answer", "candidate")
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    backlog = iter([answer])
+    inbox.service(broker, lambda: next(backlog, None))
+    assert broker.received == [ordinary[0], answer, ordinary[1]]
+
+
+def test_empty_transport_shortcut_preserves_fault_and_cancel_order():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(3)]
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    broker.fenced = True
+    inbox.service(
+        broker, lambda: pytest.fail("Fenced broker must retain FIFO"),
+        transport_readable=False,
+    )
+    assert broker.received == ordinary[:2]
+    assert inbox.last_sent_ready_sequence == 0

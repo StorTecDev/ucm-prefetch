@@ -109,6 +109,7 @@ class ReadyInbox:
         self.crossed = 0
         self.scanned = 0
         self.priority_turns = 0
+        self._ordinary_prefix_size = 0
 
     def forward(self, send, peer, message):
         if peer == "s0" and message.get("state") == "READY" and message["op"] == "result":
@@ -175,6 +176,8 @@ class ReadyInbox:
 
     def dispatch(self, broker, *, crossed=0):
         peer, message = self.pending.popleft()
+        if self._ordinary_prefix_size:
+            self._ordinary_prefix_size -= 1
         if message["op"] == "owner_answer":
             self.tickets.discard((peer, message["key"], message.get("attempt")))
         if crossed:
@@ -190,7 +193,7 @@ class ReadyInbox:
         else:
             self.service(broker, read_next)
 
-    def service(self, broker, read_next):
+    def service(self, broker, read_next, *, transport_readable=None):
         remaining_promotions = self.reserve.promotion_budget(
             self.last_sent_ready_sequence
         )
@@ -203,6 +206,17 @@ class ReadyInbox:
             self.dispatch(broker)
             return
 
+        # A broker transition cannot turn an already buffered ordinary packet
+        # into READY. Revisit its dependencies only after new transport data.
+        if (
+            transport_readable is False
+            and self._ordinary_prefix_size == len(self.pending)
+        ):
+            self.dispatch(broker)
+            return
+
+        self._ordinary_prefix_size = 0
+        transport_exhausted = False
         deferred = deque()
         earlier_keys = set()
         ordering_epoch = broker.ready_order_epoch
@@ -212,6 +226,7 @@ class ReadyInbox:
                 if not self.pending:
                     item = read_next()
                     if item is None:
+                        transport_exhausted = True
                         break
                     self.pending.append(item)
                 if broker.fenced or broker.ready_order_epoch != ordering_epoch:
@@ -248,5 +263,7 @@ class ReadyInbox:
             # deferred predicates; other transitions invalidate the epoch.
             # Restore once even when decoding or a handler raises midway.
             self.pending.extendleft(reversed(deferred))
+            if transport_exhausted:
+                self._ordinary_prefix_size = len(deferred)
         if self.pending:
             self.dispatch(broker)

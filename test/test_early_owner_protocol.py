@@ -909,3 +909,40 @@ def test_ready_across_partial_ack_preserves_broker_lifecycle(op):
                 [(peer, event["op"], event.get("key")) for peer, event in cluster.out])
 
     assert run(True) == run(False)
+
+def test_ready_epoch_preserves_independent_grant_predicates():
+    c = Cluster()
+    a = c.job("candidate", count=20)
+    b = c.job("ordinary", count=30, offset=20)
+    window = a["domain"]["execution"]
+    window.capacity = 35
+    c.message(a, "execution_request", batch=0, begin=0, count=10)
+    c.message(b, "execution_request", batch=0, begin=0, count=10)
+    c.message(b, "execution_request", batch=1, begin=10, count=15)
+    assert 1 in b["execution_pending"] and 1 not in b["execution_grants"]
+    fields = ("owner", "attempt", "status", "dp", "retiring")
+    before = tuple(b.get(name) for name in fields)
+    epoch = c.b.ready_order_epoch
+    c.message(a, "owner_answer", state="READY", hit=10)
+    assert c.b.ready_order_epoch == epoch
+    assert tuple(b.get(name) for name in fields) == before
+    assert 1 in b["execution_grants"] and window.used == 35
+    assert len(window.claims[a["key"]].held) == 10
+    c.drain(a)
+    assert window.used == 25
+    c.drain(b)
+    assert window.used == 0
+
+
+@pytest.mark.parametrize("operation", ["cancel", "retire", "poison"])
+def test_state_changes_invalidate_ready_crossing_epoch(operation):
+    c = Cluster()
+    job = c.job()
+    epoch = c.b.ready_order_epoch
+    if operation == "cancel":
+        c.b.receive(job["client"], dict(op="cancel", key=job["key"]))
+    elif operation == "retire":
+        c.b.retire(job, "test cancellation")
+    else:
+        c.b.poison("test domain failure")
+    assert c.b.ready_order_epoch > epoch

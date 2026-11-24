@@ -170,6 +170,9 @@ class OwnerBroker(BrokerState):
         self.cursor, self.last_sequence = {}, {}
         self.fenced = False
         self.fence_reason = None
+        # READY may advance grants without changing other jobs' crossing predicates.
+        # Other transitions invalidate a scan that deferred their ordered messages.
+        self.ready_order_epoch = 0
         self.next_grant = 0
 
     def cohort(self):
@@ -504,6 +507,7 @@ class OwnerBroker(BrokerState):
     def poison(self, reason):
         if self.fenced:
             return
+        self.ready_order_epoch += 1
         self.fenced = True
         self.fence_reason = reason
         # Non-robust native locks/refcounts have no owner-death recovery. Never
@@ -517,6 +521,7 @@ class OwnerBroker(BrokerState):
     def retire(self, job, reason):
         if job.get("retiring"):
             return
+        self.ready_order_epoch += 1
         job["retiring"] = True
         job["retire_started"] = time.monotonic()
         job["status"] = "CANCELLED"
@@ -525,6 +530,8 @@ class OwnerBroker(BrokerState):
 
     def receive(self, peer, message, now=None):
         op = message["op"]
+        if op != "owner_answer" or message.get("state") != "READY":
+            self.ready_order_epoch += 1
         if self.fenced and op in ("hello", "job"):
             self.send(peer, dict(op="domain_lost", reason=self.fence_reason))
         if op == "domain_fault" and peer in self.cohort() and peer in self.sessions:

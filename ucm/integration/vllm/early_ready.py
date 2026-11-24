@@ -1,10 +1,9 @@
-"""Bounded lookahead for owner READY notifications on a local control endpoint."""
+"""Deficit-driven lookahead for owner READY on a local control endpoint."""
 
 from collections import deque
 import hashlib
 import socket
 import sys
-import time
 
 import msgspec
 
@@ -99,11 +98,7 @@ class ReadyHints:
 
 
 class ReadyInbox:
-    """Promote independent READY messages within bounded FIFO service turns."""
-
-    LOOKAHEAD = 24
-    TURN_SECONDS = 0.0005
-    MAX_PROMOTIONS = 4
+    """Promote independent READY messages using the entry reserve deficit."""
 
     def __init__(self, reserve):
         self.reserve = reserve
@@ -112,6 +107,8 @@ class ReadyInbox:
         self.last_sent_ready_sequence = 0
         self.promoted = 0
         self.crossed = 0
+        self.scanned = 0
+        self.priority_turns = 0
 
     def forward(self, send, peer, message):
         if peer == "s0" and message.get("state") == "READY" and message["op"] == "result":
@@ -176,64 +173,80 @@ class ReadyInbox:
                 and type(hit) is int and 0 <= hit <= len(job["blocks"])
                 and type(message.get("capacity_truncated")) is bool)
 
-    def next_index(self, broker):
-        earlier_keys = set()
-        for index, (peer, message) in enumerate(self.pending):
-            key = message.get("key")
-            if (message["op"] == "owner_answer" and message.get("state") == "READY"
-                    and key not in earlier_keys
-                    and (peer, key, message.get("attempt")) in self.tickets
-                    and self.valid_ready(broker, peer, message)):
-                return index
-            if not self.can_cross(broker, peer, message):
-                break
-            earlier_keys.add(key)
-        return 0
-
-    def dispatch(self, broker, index):
-        peer, message = self.pending[index]
-        del self.pending[index]
+    def dispatch(self, broker, *, crossed=0):
+        peer, message = self.pending.popleft()
         if message["op"] == "owner_answer":
             self.tickets.discard((peer, message["key"], message.get("attempt")))
-        if index:
+        if crossed:
             self.promoted += 1
-            self.crossed += index
+            self.crossed += crossed
         broker.receive(peer, message)
 
     def receive_hinted(self, broker, item, read_next, *, scheduler_readable):
         """Handle an ordered packet while an owner has advertised readiness."""
         self.pending.append(item)
         if scheduler_readable:
-            self.dispatch(broker, 0)
+            self.dispatch(broker)
         else:
             self.service(broker, read_next)
 
     def service(self, broker, read_next):
+        remaining_promotions = self.reserve.promotion_budget(
+            self.last_sent_ready_sequence
+        )
         if not self.pending:
             item = read_next()
             if item is None:
                 return
             self.pending.append(item)
-        if not self.tickets or broker.fenced or not self.can_cross(broker, *self.pending[0]):
-            self.dispatch(broker, 0)
-            return
-        quota = min(self.MAX_PROMOTIONS, self.reserve.promotion_budget(self.last_sent_ready_sequence))
-        if not quota:
-            self.dispatch(broker, 0)
+        if not self.tickets or broker.fenced or not remaining_promotions:
+            self.dispatch(broker)
             return
 
-        deadline = time.monotonic() + self.TURN_SECONDS
-        # Reading past a barrier cannot reveal an eligible promotion this turn.
-        while (len(self.pending) < self.LOOKAHEAD and time.monotonic() < deadline
-               and self.can_cross(broker, *self.pending[-1])):
-            item = read_next()
-            if item is None:
-                break
-            self.pending.append(item)
-        while len(self.pending) > 1 and quota and time.monotonic() < deadline:
-            index = self.next_index(broker)
-            if not index:
-                break
-            self.dispatch(broker, index)
-            quota = min(quota - 1, self.reserve.promotion_budget(self.last_sent_ready_sequence))
-        self.dispatch(broker, 0)
+        deferred = deque()
+        earlier_keys = set()
+        ordering_epoch = broker.ready_order_epoch
+        self.priority_turns += 1
+        try:
+            while remaining_promotions and self.tickets:
+                if not self.pending:
+                    item = read_next()
+                    if item is None:
+                        break
+                    self.pending.append(item)
+                if broker.fenced or broker.ready_order_epoch != ordering_epoch:
+                    break
+                peer, message = self.pending[0]
+                key = message.get("key")
+                self.scanned += 1
+                if (
+                    message["op"] == "owner_answer"
+                    and message.get("state") == "READY"
+                    and key not in earlier_keys
+                    and (peer, key, message.get("attempt")) in self.tickets
+                    and self.valid_ready(broker, peer, message)
+                ):
+                    sent_before = self.last_sent_ready_sequence
+                    self.dispatch(broker, crossed=len(deferred))
+                    published = self.last_sent_ready_sequence - sent_before
+                    remaining_promotions -= published
+                    if published <= 0:
+                        break
+                    # New consumption may enlarge the live deficit, but cannot
+                    # extend the quota captured before this service turn.
+                    remaining_promotions = min(
+                        remaining_promotions,
+                        self.reserve.promotion_budget(self.last_sent_ready_sequence),
+                    )
+                    continue
+                if not self.can_cross(broker, peer, message):
+                    break
+                earlier_keys.add(key)
+                deferred.append(self.pending.popleft())
+        finally:
+            # Only READY has executed. Independent grants do not alter the
+            # deferred predicates; other transitions invalidate the epoch.
+            # Restore once even when decoding or a handler raises midway.
+            self.pending.extendleft(reversed(deferred))
+        if self.pending:
+            self.dispatch(broker)

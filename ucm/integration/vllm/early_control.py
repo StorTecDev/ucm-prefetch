@@ -289,8 +289,11 @@ class Control:
         finally:
             self.stopping.set()
             if hint_receiver is not None:
-                log.info("UCM_EARLY ready_priority_summary promoted=%s crossed=%s",
-                         inbox.promoted, inbox.crossed)
+                log.info(
+                    "UCM_EARLY ready_priority_summary promoted=%s crossed=%s "
+                    "scanned=%s priority_turns=%s",
+                    inbox.promoted, inbox.crossed, inbox.scanned, inbox.priority_turns,
+                )
                 hint_receiver.socket.close()
             if self.hint_sender is not None:
                 self.hint_sender.socket.close()

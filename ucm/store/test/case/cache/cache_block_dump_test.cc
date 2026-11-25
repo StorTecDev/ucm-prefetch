@@ -1213,3 +1213,73 @@ TEST_F(UCCacheBlockDumpTest, ZeroBudgetWaitReportsFailedWriterAtPhysicalCapacity
     Verify(Id(135));
     Verify(Id(136));
 }
+
+TEST_F(UCCacheBlockDumpTest, WaitReclaimsCompletedWritesBeforeFinishingSourcePass)
+{
+    Start(2, 0, false, false, "wait", 3);
+    auto sentinel = CacheStore::EarlyBufferPins::Acquire(
+        *manager->GetTransBuffer(), Id(93), 0, false);
+    ASSERT_TRUE(sentinel);
+    std::memcpy(sentinel.Data(), source[0].data(), kBytes);
+    sentinel.MarkReady();
+
+    WriteTrace trace;
+    std::promise<void> entered, release, completed;
+    auto enteredFuture = entered.get_future();
+    auto released = release.get_future().share();
+    auto completedFuture = completed.get_future();
+    std::atomic_bool firstWrite{true};
+    trace.beforeCompletion = [&] {
+        if (firstWrite.exchange(false)) { entered.set_value(); released.wait(); }
+    };
+    bool tailVisited = false, copiedBeforeTail = false, releasedOld = false;
+    CacheStore::TestHooks::blockDumpWriteCompletedHook = [&](const auto& id) {
+        if (id == Id(90)) { completed.set_value(); }
+    };
+    CacheStore::TestHooks::blockDumpCopyHook = [&](const auto& shard) {
+        if (shard.owner == Id(91) && !releasedOld) {
+            releasedOld = true;
+            release.set_value();
+            EXPECT_EQ(completedFuture.wait_for(std::chrono::seconds(2)),
+                      std::future_status::ready);
+        }
+        if (shard.owner == Id(92) && !tailVisited) { copiedBeforeTail = true; }
+        if (shard.owner == Id(93)) {
+            tailVisited = true;
+            sentinel = {};
+        }
+        return Status::OK();
+    };
+
+    auto previous = queue->Submit({TransTask::Type::DUMP, Describe(Id(90), {0, 1}, true)});
+    EXPECT_TRUE(previous);
+    if (previous) {
+        EXPECT_EQ(queue->WaitSources(previous.Value()), Status::OK());
+        EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    }
+    Detail::TaskDesc next;
+    next.finalizeBlockDump = true;
+    for (auto id : {Id(91), Id(92)}) {
+        auto block = Describe(id, {0, 1}, true);
+        next.insert(next.end(), block.begin(), block.end());
+    }
+    auto last = Describe(Id(93), {1}, true);
+    next.insert(next.end(), last.begin(), last.end());
+    auto sent = queue->Submit({TransTask::Type::DUMP, std::move(next)});
+    EXPECT_TRUE(sent);
+    if (!sent || !previous) {
+        if (!releasedOld) { release.set_value(); releasedOld = true; }
+        sentinel = {};
+    }
+    if (sent) {
+        EXPECT_EQ(queue->WaitSources(sent.Value()), Status::OK());
+        EXPECT_EQ(queue->Wait(sent.Value()), Status::OK());
+    }
+    if (previous) { EXPECT_EQ(queue->Wait(previous.Value()), Status::OK()); }
+    queue.reset();
+    CacheStore::TestHooks::blockDumpCopyHook = {};
+    CacheStore::TestHooks::blockDumpWriteCompletedHook = {};
+    EXPECT_TRUE(tailVisited);
+    EXPECT_TRUE(copiedBeforeTail);
+    for (auto id : {Id(90), Id(91), Id(92), Id(93)}) { Verify(id); }
+}

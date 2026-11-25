@@ -21,18 +21,23 @@ class ExecutionWindow:
         self.claims = {}
         # Shared prefixes count once even when several live claims protect the same block.
         self.block_holders = Counter()
+        self._failed_acquisitions = {}
+        self._failed_capacity = blocks
 
     def add(self, key, maximum):
         maximum = set(maximum)
         self.release(key)
         self.claims[key] = Claim(maximum)
+        self._failed_acquisitions.clear()
 
     def narrow(self, key, maximum):
         claim = self.claims[key]
         maximum = set(maximum)
         if not maximum <= claim.maximum:
             raise ValueError("completion bound must not grow")
-        claim.maximum = maximum
+        if maximum != claim.maximum:
+            claim.maximum = maximum
+            self._failed_acquisitions.clear()
 
     def safe(self, key, blocks):
         blocks = set(blocks)
@@ -88,20 +93,37 @@ class ExecutionWindow:
         return True
 
     def acquire(self, key, blocks):
-        blocks = set(blocks)
+        blocks = frozenset(blocks)
         claim = self.claims[key]
-        if not blocks <= claim.maximum or not self.safe(key, blocks):
+        if not blocks <= claim.maximum:
             return False
-        self.block_holders.update(blocks - claim.held)
-        claim.held.update(blocks)
+        if self.capacity != self._failed_capacity:
+            self._failed_acquisitions.clear()
+            self._failed_capacity = self.capacity
+        if blocks in self._failed_acquisitions.get(key, ()):
+            return False
+        if not self.safe(key, blocks):
+            # Ordinary control traffic retries pending grants without necessarily
+            # changing any pins. A denial stays valid until the proof inputs change.
+            self._failed_acquisitions.setdefault(key, set()).add(blocks)
+            return False
+        extra = blocks - claim.held
+        if extra:
+            self.block_holders.update(extra)
+            claim.held.update(extra)
+            self._failed_acquisitions.clear()
         return True
 
     def complete(self, key):
-        self.claims[key].completed = True
+        claim = self.claims[key]
+        if not claim.completed:
+            claim.completed = True
+            self._failed_acquisitions.clear()
 
     def release(self, key):
         claim = self.claims.pop(key, None)
         if claim is not None:
+            self._failed_acquisitions.clear()
             for block in claim.held:
                 self.block_holders[block] -= 1
                 if self.block_holders[block] == 0:

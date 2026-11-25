@@ -92,3 +92,76 @@ def test_completed_shared_holder_does_not_free_another_claims_pin():
     assert not window.acquire("new", {4})
     assert dict(window.block_holders) == before
     assert window.claims["completed"].held == {0, 1}
+
+
+def blocked_window():
+    window = owner.ExecutionWindow(4)
+    window.add("holder", {0, 1, 2})
+    window.add("waiting", {3, 4, 5})
+    assert window.acquire("holder", {0, 1})
+    return window
+
+
+def test_repeated_denial_reuses_proof_without_pinning_or_completing(monkeypatch):
+    window = blocked_window()
+    proofs = []
+    safe = window.safe
+
+    def count_proof(key, blocks):
+        proofs.append((key, blocks))
+        return safe(key, blocks)
+
+    monkeypatch.setattr(window, "safe", count_proof)
+    before = dict(window.block_holders)
+    for _ in range(8):
+        assert not window.acquire("waiting", {3, 4})
+        assert not window.acquire("waiting", {4, 5})
+    assert len(proofs) == 2
+    assert dict(window.block_holders) == before
+    assert not window.claims["waiting"].held
+    assert not window.claims["holder"].completed
+
+
+@pytest.mark.parametrize("change", ["release", "complete", "narrow", "replace", "capacity"])
+def test_denied_grant_is_reconsidered_after_proof_inputs_change(change):
+    window = blocked_window()
+    assert not window.acquire("waiting", {3, 4})
+    if change == "release":
+        window.release("holder")
+    elif change == "complete":
+        window.complete("holder")
+    elif change == "narrow":
+        window.narrow("holder", {0, 1})
+    elif change == "replace":
+        window.add("holder", {0})
+    else:
+        window.capacity = 6
+    assert admits_in_some_order(window, "waiting", {3, 4})
+    assert window.acquire("waiting", {3, 4})
+
+
+def test_new_pins_invalidate_denials_but_duplicate_grants_do_not(monkeypatch):
+    window = blocked_window()
+    assert not window.acquire("waiting", {3, 4})
+    assert window.acquire("holder", {0, 1})
+    assert window._failed_acquisitions
+    assert window.acquire("holder", {2})
+    assert not window._failed_acquisitions
+    proofs = []
+    safe = window.safe
+
+    def count_proof(key, blocks):
+        proofs.append(key)
+        return safe(key, blocks)
+
+    monkeypatch.setattr(window, "safe", count_proof)
+    assert not window.acquire("waiting", {3, 4})
+    assert proofs == ["waiting"]
+
+
+def test_denial_cache_is_not_reused_for_a_different_proposal():
+    window = blocked_window()
+    assert not window.acquire("waiting", {3, 4})
+    assert window.acquire("waiting", {3})
+    assert window.claims["waiting"].held == {3}
+    assert window.used == 3

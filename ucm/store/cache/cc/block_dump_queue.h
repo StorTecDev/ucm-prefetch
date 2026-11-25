@@ -20,6 +20,7 @@ namespace UC::CacheStore {
 namespace TestHooks {
 // Set/clear only while no test task is running. A failure models rejected D2H.
 inline std::function<Status(const Detail::Shard&)> blockDumpCopyHook;
+inline std::function<void(const Detail::BlockId&)> blockDumpWriteCompletedHook;
 }
 #endif
 
@@ -78,6 +79,7 @@ class BlockDumpQueue final : public Detail::TaskWrapper<TransTask, Detail::TaskH
     std::unordered_map<Detail::TaskHandle, Work> sources_;
     std::atomic<size_t> admitted_{0};
     std::atomic<size_t> ioEpoch_{0};
+    size_t reapedIoEpoch_{0};
     bool stopping_{false};
     std::thread worker_;
     std::mutex ioMutex_;
@@ -250,6 +252,11 @@ private:
             }
             job->cv.notify_all();
             { std::lock_guard lock(queueMutex_); ++ioEpoch_; }
+#ifdef UCM_ENABLE_TEST_HOOKS
+            if (TestHooks::blockDumpWriteCompletedHook) {
+                TestHooks::blockDumpWriteCompletedHook(job->id);
+            }
+#endif
             wake_.notify_one();
         }
     }
@@ -285,6 +292,9 @@ private:
 
     void Reap()
     {
+        // Completions arriving during the scan must remain visible to the next
+        // capacity retry, even if their block was already visited.
+        reapedIoEpoch_ = ioEpoch_.load(std::memory_order_acquire);
         for (auto it = blocks_.begin(); it != blocks_.end();) {
             ApplyWrite(it->second);
             if (it->second.closing && !it->second.write) {
@@ -506,6 +516,14 @@ private:
             if (status.Failure()) { return status; }
         }
         auto handle = EarlyBufferPins::Acquire(*buffer_, shard.owner, shard.index, false);
+        if (!handle && WaitForCapacity() &&
+            ioEpoch_.load(std::memory_order_acquire) != reapedIoEpoch_) {
+            // A long source pass can outlive physical writes whose pins are
+            // still in blocks_. The active block is not closing, so reaping
+            // completed siblings cannot invalidate this group's reference.
+            Reap();
+            handle = EarlyBufferPins::Acquire(*buffer_, shard.owner, shard.index, false);
+        }
         if (!handle && !WaitForCapacity()) {
             for (auto& [key, other] : blocks_) {
                 if (key != shard.owner && other.pin) {

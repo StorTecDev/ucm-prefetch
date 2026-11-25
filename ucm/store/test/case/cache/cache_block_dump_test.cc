@@ -746,6 +746,7 @@ TEST_F(UCCacheBlockDumpTest, QueuedSourceFenceTimeoutStillExecutesAndReportsTime
     EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     auto queued = queue->Submit({TransTask::Type::DUMP, Describe(Id(50), {0, 1, 2}, true)});
     ASSERT_TRUE(queued);
+    testing::internal::CaptureStdout();
     auto fence = std::async(std::launch::async, [&] { return queue->WaitSources(queued.Value()); });
     EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(400)), std::future_status::timeout);
     EXPECT_EQ(laterCopies.load(), 0);
@@ -754,6 +755,14 @@ TEST_F(UCCacheBlockDumpTest, QueuedSourceFenceTimeoutStillExecutesAndReportsTime
     // The source fence proves only that HBM is safe, while final Wait must
     // preserve the expired deadline even though the write subsequently succeeds.
     EXPECT_EQ(fence.get(), Status::OK());
+    const auto diagnostics = testing::internal::GetCapturedStdout();
+    // The timed-out task is queued behind a different source task; reporting
+    // only the waited task would misidentify an active copy as a capacity wait.
+    EXPECT_NE(diagnostics.find("source_stage=copying"), std::string::npos);
+    EXPECT_NE(diagnostics.find("source_task=" + std::to_string(running.Value())),
+              std::string::npos);
+    EXPECT_NE(diagnostics.find("waiting_task=" + std::to_string(queued.Value())),
+              std::string::npos);
     EXPECT_EQ(queue->Wait(queued.Value()), Status::Timeout());
     EXPECT_EQ(queue->Wait(running.Value()), Status::OK());
     CacheStore::TestHooks::blockDumpCopyHook = {};

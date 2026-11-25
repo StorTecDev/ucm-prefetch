@@ -85,6 +85,43 @@ class BlockDumpQueue final : public Detail::TaskWrapper<TransTask, Detail::TaskH
     std::deque<std::shared_ptr<WriteJob>> ioPending_;
     bool ioStopping_{false};
     std::thread ioWorker_;
+    enum class SourceStage { Idle, Processing, AcquiringL1, Copying, DrainingDma,
+                             WaitingProgress, WaitingBackend };
+    std::atomic<SourceStage> sourceStage_{SourceStage::Idle};
+    std::atomic<Detail::TaskHandle> sourceTask_{0};
+    std::atomic<size_t> capacityMisses_{0};
+    std::atomic<size_t> copiedLayers_{0};
+    std::atomic<size_t> queuedWrites_{0};
+    std::atomic<size_t> finishedWrites_{0};
+
+    static const char* SourceStageName(SourceStage stage)
+    {
+        switch (stage) {
+            case SourceStage::Idle: return "idle";
+            case SourceStage::Processing: return "processing";
+            case SourceStage::AcquiringL1: return "acquiring_l1";
+            case SourceStage::Copying: return "copying";
+            case SourceStage::DrainingDma: return "draining_dma";
+            case SourceStage::WaitingProgress: return "waiting_progress";
+            case SourceStage::WaitingBackend: return "waiting_backend";
+        }
+        return "unknown";
+    }
+
+    void LogSourceProgress(Detail::TaskHandle waitingTask) const
+    {
+        // Independent progress samples distinguish a stalled source worker from
+        // slow backend drainage without taking locks on either producer's path.
+        UC_WARN("Block dump progress waiting_task={} source_task={} source_stage={} "
+                "capacity_misses={} copied_layers={} queued_writes={} finished_writes={}; "
+                "fields are independent observations",
+                waitingTask, sourceTask_.load(std::memory_order_relaxed),
+                SourceStageName(sourceStage_.load(std::memory_order_relaxed)),
+                capacityMisses_.load(std::memory_order_relaxed),
+                copiedLayers_.load(std::memory_order_relaxed),
+                queuedWrites_.load(std::memory_order_relaxed),
+                finishedWrites_.load(std::memory_order_relaxed));
+    }
 
 public:
     ~BlockDumpQueue()
@@ -162,8 +199,10 @@ public:
             work->pair.first->Fail(Status::Timeout());
             failureSet_.Insert(id);
             UC_WARN("Block dump sources task={} timed out; retaining queued work and source protection", id);
+            LogSourceProgress(id);
             while (!work->sources.WaitForDuration(2000)) {
                 UC_WARN("Block dump sources task={} still draining", id);
+                LogSourceProgress(id);
             }
         }
         return Status::OK();
@@ -213,13 +252,18 @@ private:
 
     Status Drain(CopyStream& stream)
     {
+        sourceStage_.store(SourceStage::DrainingDma, std::memory_order_relaxed);
         auto first = stream.Synchronize();
-        if (first.Success()) { return first; }
+        if (first.Success()) {
+            sourceStage_.store(SourceStage::Processing, std::memory_order_relaxed);
+            return first;
+        }
         // Do not release either DMA endpoint on an unproven stream error.
         while (stream.Synchronize().Failure()) {
             UC_ERROR("Block dump DMA completion unknown; retaining source and L1 pins");
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        sourceStage_.store(SourceStage::Processing, std::memory_order_relaxed);
         return first;
     }
 
@@ -243,6 +287,8 @@ private:
                 status = config_.storeBackend->CommitDump(job->id);
             }
             job->pin = {}; job->lease.reset();
+            finishedWrites_.fetch_add(1, std::memory_order_relaxed);
+            queuedWrites_.fetch_sub(1, std::memory_order_relaxed);
             {
                 std::lock_guard lock(job->mutex);
                 job->status = status;
@@ -275,9 +321,11 @@ private:
         auto job = block.write;
         if (!job) { return Status::OK(); }
         {
+            sourceStage_.store(SourceStage::WaitingBackend, std::memory_order_relaxed);
             std::unique_lock lock(job->mutex);
             job->cv.wait(lock, [&] { return job->done.load(std::memory_order_acquire); });
         }
+        sourceStage_.store(SourceStage::Processing, std::memory_order_relaxed);
         auto status = job->status;
         ApplyWrite(block);
         return status;
@@ -338,6 +386,7 @@ private:
                 std::unique_lock lock(queueMutex_);
                 if (pending_.empty() && stopping_ && finishing_.empty()) { break; }
                 if (pending_.empty()) {
+                    sourceStage_.store(SourceStage::Idle, std::memory_order_relaxed);
                     wake_.wait(lock, [&] {
                         return !pending_.empty() || ioEpoch_.load() != epoch ||
                             (stopping_ && finishing_.empty());
@@ -409,6 +458,7 @@ private:
                 }
                 if (advanced) { continue; }
             }
+            sourceStage_.store(SourceStage::WaitingProgress, std::memory_order_relaxed);
             std::unique_lock lock(queueMutex_);
             // Other processes notify the shared L1 epoch, not this local CV.
             // A foreign loader can also mark READY while retaining its pin;
@@ -443,7 +493,11 @@ private:
         }
         block.write = job;
         block.writeFailure = Status::OK();
-        { std::lock_guard lock(ioMutex_); ioPending_.push_back(job); }
+        {
+            std::lock_guard lock(ioMutex_);
+            ioPending_.push_back(job);
+            queuedWrites_.fetch_add(1, std::memory_order_relaxed);
+        }
         ioWake_.notify_one();
         return job;
     }
@@ -505,7 +559,9 @@ private:
             }
             if (status.Failure()) { return status; }
         }
+        sourceStage_.store(SourceStage::AcquiringL1, std::memory_order_relaxed);
         auto handle = EarlyBufferPins::Acquire(*buffer_, shard.owner, shard.index, false);
+        sourceStage_.store(SourceStage::Processing, std::memory_order_relaxed);
         if (!handle && !WaitForCapacity()) {
             for (auto& [key, other] : blocks_) {
                 if (key != shard.owner && other.pin) {
@@ -519,6 +575,7 @@ private:
         if (!handle || (!handle.Owner() && !handle.Ready())) {
             if (WaitForCapacity()) {
                 if (!handle) {
+                    capacityMisses_.fetch_add(1, std::memory_order_relaxed);
                     auto failure = ResidentWriteFailure();
                     if (failure.Failure()) { return failure; }
                 }
@@ -537,6 +594,7 @@ private:
         std::memset(handle.Data(), 0, packed ? packed : config_.shardSize);
         auto addresses = shard.addrs;
         auto status = Status::OK();
+        sourceStage_.store(SourceStage::Copying, std::memory_order_relaxed);
 #ifdef UCM_ENABLE_TEST_HOOKS
         if (TestHooks::blockDumpCopyHook) { status = TestHooks::blockDumpCopyHook(shard); }
 #endif
@@ -555,6 +613,7 @@ private:
             return error;
         }
         handle.MarkReady();
+        copiedLayers_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
 
@@ -595,6 +654,8 @@ private:
     Status ProcessGroup(CopyStream& stream, SourceTask& work, const SourceGroup& group,
                         bool& waiting, bool& pollReadiness)
     {
+        sourceTask_.store(work.pair.first->id, std::memory_order_relaxed);
+        sourceStage_.store(SourceStage::Processing, std::memory_order_relaxed);
         const auto& desc = work.pair.first->desc;
         const auto& id = group.id;
         auto it = blocks_.find(id);

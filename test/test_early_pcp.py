@@ -99,7 +99,10 @@ def test_each_pcp_ticket_matches_native_load_and_preserves_global_metadata(
     monkeypatch.setattr(
         UCMLayerWiseConnector,
         "bind_connector_metadata",
-        lambda self, metadata: observed.append(metadata),
+        lambda self, metadata: (
+            observed.append(metadata),
+            setattr(self, "_connector_metadata", metadata),
+        ),
     )
     for rank in range(16):
         connector = object.__new__(EarlyCPConnector)
@@ -307,7 +310,10 @@ def test_replicated_pcp_loads_full_prefix_and_persists_one_copy(
     monkeypatch.setattr(
         UCMLayerWiseConnector,
         "bind_connector_metadata",
-        lambda self, value: observed.append(value),
+        lambda self, value: (
+            observed.append(value),
+            setattr(self, "_connector_metadata", value),
+        ),
     )
     peers, writers = set(), []
     for rank in range(16):
@@ -447,3 +453,75 @@ def test_replicated_nonwriters_acknowledge_without_waiting_for_native_dump(
             assert not connector._pending_dump_tasks
     # vLLM's transfer aggregator requires all PCP workers, not only the writer.
     assert sum("dump" in (sent or set()) for sent in confirmations) == 16
+
+@pytest.mark.parametrize("rank", [0, 1, 7, 15])
+@pytest.mark.parametrize("block_count", [0, 115])
+def test_replicated_early_uses_bound_private_metadata_without_another_request_copy(
+    monkeypatch, rank, block_count
+):
+    copies = []
+
+    class Request:
+        def __init__(self, blocks):
+            self.load_block_ids = (list(blocks), list(range(len(blocks))))
+            self.dump_block_ids = (list(blocks), list(range(len(blocks))))
+
+        def __deepcopy__(self, memo):
+            copies.append(self)
+            result = Request([])
+            memo[id(self)] = result
+            result.load_block_ids = copy.deepcopy(self.load_block_ids, memo)
+            result.dump_block_ids = copy.deepcopy(self.dump_block_ids, memo)
+            return result
+
+    blocks = [i.to_bytes(16, "little") for i in range(block_count)]
+    original = SimpleNamespace(
+        request_meta={"r": Request(blocks)},
+        early_keys={"r": "job"},
+        early_owners={
+            "r": dict(key="job", attempt="generation", owner="w0.0",
+                      grant=1, expected=list(blocks))
+        },
+    )
+    monkeypatch.setattr(
+        UCMLayerWiseConnector, "bind_connector_metadata",
+        lambda self, value: setattr(self, "_connector_metadata", value),
+    )
+    connector = object.__new__(EarlyCPConnector)
+    connector.pcp_kv_cache_layout = "replicated"
+    connector.current_rank, connector.cp_world_size = 0, 1
+    connector.pcp_rank = rank
+    connector._async_dump_req_ids = set()
+    connector._early = Mock()
+    connector.bind_connector_metadata(original)
+
+    bound = connector._get_connector_metadata()
+    consumer_metadata = connector._early.bind.call_args.args[0]
+    assert consumer_metadata is bound
+    assert copies == [original.request_meta["r"]]
+    assert bound.request_meta["r"].load_block_ids[0] == blocks
+    assert bound.early_owners["r"]["expected"] == tuple(blocks)
+    assert bound.request_meta["r"].dump_block_ids[0] == (blocks if rank == 0 else [])
+    assert connector._async_dump_req_ids == ({"r"} if rank and blocks else set())
+
+    # The caller may recycle metadata before asynchronous receipts complete.
+    original.request_meta["r"].load_block_ids[0].clear()
+    original.early_owners["r"]["expected"].clear()
+    original.early_owners["r"]["attempt"] = "replacement"
+    assert bound.request_meta["r"].load_block_ids[0] == blocks
+    assert bound.early_owners["r"]["expected"] == tuple(blocks)
+    assert bound.early_owners["r"]["attempt"] == "generation"
+
+
+def test_replicated_early_does_not_bind_receipts_after_native_binding_failure(monkeypatch):
+    connector = object.__new__(EarlyCPConnector)
+    connector.pcp_kv_cache_layout = "replicated"
+    connector._early = Mock()
+    failure = RuntimeError("binding failed")
+    monkeypatch.setattr(
+        UCMCPConnector, "bind_connector_metadata", Mock(side_effect=failure)
+    )
+    with pytest.raises(RuntimeError) as raised:
+        connector.bind_connector_metadata(SimpleNamespace())
+    assert raised.value is failure
+    connector._early.bind.assert_not_called()

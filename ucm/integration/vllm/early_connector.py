@@ -392,6 +392,16 @@ class EarlyCPConnector(_EarlyConnectorMixin, UCMCPConnector):
         return config
 
     def bind_connector_metadata(self, connector_metadata):
+        if getattr(self, "pcp_kv_cache_layout", "sharded") == "replicated":
+            # CP already owns an isolated copy, including its writer decision.
+            # Bind consumer receipts to that same copy instead of cloning the
+            # full request graph again just to preserve the unsliced prefix.
+            UCMCPConnector.bind_connector_metadata(self, connector_metadata)
+            metadata = self._get_connector_metadata()
+            for ticket in metadata.early_owners.values():
+                ticket["expected"] = tuple(ticket["expected"])
+            self._early.bind(metadata)
+            return
         # Owner pins cover the global prefix. Sharded consumers acknowledge
         # their native slice; replicated consumers must finish the full prefix.
         metadata = copy.deepcopy(connector_metadata)

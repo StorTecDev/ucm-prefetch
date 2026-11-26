@@ -112,9 +112,10 @@ public:
     private:
         friend class TransBuffer;
         friend class EarlyBufferPins;
+        friend class ReservedPrefetch;
         friend struct EarlyNativeTask;
-        // Only aliases of an already-owned task pin may avoid a second shared
-        // node reference. The guard outlives both normal I/O and quarantine.
+        // Task guards and whole-block reservation groups already own native pins.
+        // Aliases must keep that owner alive through I/O and quarantine.
         Handle WithLifetime(std::shared_ptr<const void> lifetime) const
         {
             Handle result;

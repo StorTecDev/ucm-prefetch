@@ -318,7 +318,11 @@ public:
             const auto& pin = group->pins[buffer_->WholeBlock() ? 0 : shard.index];
             if (!pin || !pin.Ready()) { continue; }
             if (handles.empty()) { handles.resize(task.size()); }
-            handles[i] = buffer_->WholeBlock() ? pin.LayerView(shard.index) : pin;
+            // The group owns the whole-block pin independently of the reservation.
+            // Share its lifetime through H2D instead of repeatedly locking the
+            // shared native node for each layer reference.
+            handles[i] = buffer_->WholeBlock()
+                ? pin.WithLifetime(group).LayerView(shard.index) : pin;
             // The entire block remains referenced until this layer H2D completes.
             ++stats.matched;
         }

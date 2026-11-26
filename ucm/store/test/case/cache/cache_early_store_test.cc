@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include "cache/cc/reserved_prefetch.h"
 #include "cache/cc/load_queue.h"
+#include "cache/cc/early_native_transfer.h"
 #include "detail/mock_store.h"
 #include "detail/random.h"
 
@@ -1648,4 +1649,86 @@ TEST(UCCacheEarlyStoreTest, ConcurrentReleaseDoesNotInvalidateAcquiredLoadViews)
             EXPECT_EQ(static_cast<unsigned char*>(retained[i].Data())[0], i);
         }
     }
+}
+
+
+TEST(UCCacheEarlyStoreTest, WholeBlockViewsRetainCapacityUntilLastConsumerReleases)
+{
+    Backend backend;
+    auto c = BatchConfig(&backend);
+    c.blockSize *= 2;
+    c.bufferCapacity = c.blockSize;
+    c.cacheFullBlockL1 = true;
+    UC::CacheStore::BufferManager manager;
+    ASSERT_TRUE(manager.Setup(c).Success());
+    auto* buffer = manager.GetTransBuffer();
+    UC::Detail::BlockId block{}, replacement{};
+    replacement[0] = std::byte{1};
+    {
+        auto owner = buffer->Get(block, 0);
+        ASSERT_TRUE(owner);
+        std::memset(owner.Data(), 0x51, c.blockSize);
+        owner.WholeView().MarkReady();
+    }
+    UC::CacheStore::ReservedPrefetch early(&manager, &backend, c.blockSize, c.blockSize, 1000, true);
+    auto reservation = early.Reserve(&block, 1).Value();
+    UC::Detail::TaskDesc task{{block, 0, {nullptr}}, {block, 1, {nullptr}}};
+    task.loadReservations = {reservation.handle};
+    auto views = early.LoadHandles(task);
+    ASSERT_EQ(views.size(), 2);
+    ASSERT_TRUE(views[0]); ASSERT_TRUE(views[1]);
+    EXPECT_EQ(static_cast<char*>(views[1].Data()) - static_cast<char*>(views[0].Data()),
+              c.shardSize);
+    auto retained = views[1];
+    early.Release(reservation.handle);
+    reservation.batch.reset();
+    EXPECT_TRUE(backend.lease.expired());
+    EXPECT_TRUE(early.LoadHandles(task).empty());
+    views.clear();
+    EXPECT_FALSE(UC::CacheStore::EarlyBufferPins::Acquire(*buffer, replacement, 0, true));
+    auto moved = std::move(retained);
+    ASSERT_TRUE(moved);
+    EXPECT_EQ(static_cast<unsigned char*>(moved.Data())[0], 0x51);
+    EXPECT_FALSE(UC::CacheStore::EarlyBufferPins::Acquire(*buffer, replacement, 0, true));
+    moved = {};
+    auto available = UC::CacheStore::EarlyBufferPins::Acquire(*buffer, replacement, 0, true);
+    EXPECT_TRUE(available);
+}
+
+TEST(UCCacheEarlyStoreTest, NativeTaskAliasesRetainReleasedReservationPins)
+{
+    Backend backend;
+    auto c = BatchConfig(&backend);
+    c.cacheFullBlockL1 = true;
+    c.bufferCapacity = c.blockSize;
+    UC::CacheStore::BufferManager manager;
+    ASSERT_TRUE(manager.Setup(c).Success());
+    auto* buffer = manager.GetTransBuffer();
+    UC::Detail::BlockId block{}, replacement{};
+    replacement[0] = std::byte{1};
+    {
+        auto owner = buffer->Get(block, 0);
+        ASSERT_TRUE(owner);
+        std::memset(owner.Data(), 0x62, c.blockSize);
+        owner.MarkReady();
+    }
+    UC::CacheStore::ReservedPrefetch early(&manager, &backend, c.blockSize, c.blockSize, 1000, true);
+    auto reservation = early.Reserve(&block, 1).Value();
+    UC::Detail::TaskDesc desc{{block, 0, {nullptr}}};
+    desc.loadReservations = {reservation.handle};
+    UC::CacheStore::TransTask prepared{UC::CacheStore::TransTask::Type::LOAD, std::move(desc)};
+    prepared.loadHandles = early.LoadHandles(prepared.desc);
+    ASSERT_EQ(prepared.loadHandles.size(), 1);
+    ASSERT_TRUE(prepared.loadHandles[0]);
+    auto native = std::make_unique<UC::CacheStore::EarlyNativeTask>(std::move(prepared));
+    auto submitted = native->task.loadHandles[0];
+    early.Release(reservation.handle);
+    reservation.batch.reset();
+    native.reset();
+    EXPECT_TRUE(backend.lease.expired());
+    EXPECT_FALSE(UC::CacheStore::EarlyBufferPins::Acquire(*buffer, replacement, 0, true));
+    ASSERT_TRUE(submitted);
+    EXPECT_EQ(static_cast<unsigned char*>(submitted.Data())[0], 0x62);
+    submitted = {};
+    EXPECT_TRUE(UC::CacheStore::EarlyBufferPins::Acquire(*buffer, replacement, 0, true));
 }

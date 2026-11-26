@@ -1,5 +1,6 @@
 #ifndef UCM_CACHE_EARLY_BUFFER_PINS_H
 #define UCM_CACHE_EARLY_BUFFER_PINS_H
+#include <atomic>
 #include <vector>
 #include "trans_buffer.h"
 #include "early_domain.h"
@@ -15,6 +16,16 @@ public:
     };
     static TransBuffer::Handle Acquire(TransBuffer& buffer, const Detail::BlockId& block,
                                        size_t shard, bool load);
+
+    class LoadHints {
+        friend class EarlyBufferPins;
+        const TransBuffer* buffer_;
+        std::vector<std::atomic<size_t>> positions_;
+        LoadHints(const TransBuffer& buffer, size_t buckets);
+    };
+    static std::unique_ptr<LoadHints> MakeLoadHints(const TransBuffer& buffer);
+    static TransBuffer::Handle AcquireLoad(TransBuffer& buffer, const Detail::BlockId& block,
+                                          size_t shard, LoadHints* hints);
     static Batch PinBlocks(TransBuffer& buffer, const Detail::BlockId* blocks,
                            size_t count, size_t shardsPerBlock);
     static void Touch(TransBuffer& buffer, const std::vector<TransBuffer::Handle>& pins);

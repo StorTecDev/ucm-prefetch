@@ -37,6 +37,52 @@ TransBuffer::Handle EarlyBufferPins::Acquire(TransBuffer& buffer,
     return handle;
 }
 
+EarlyBufferPins::LoadHints::LoadHints(const TransBuffer& buffer, size_t buckets)
+    : buffer_(&buffer), positions_(buckets)
+{
+    for (auto& position : positions_) { position.store(invalidIndex, std::memory_order_relaxed); }
+}
+
+std::unique_ptr<EarlyBufferPins::LoadHints> EarlyBufferPins::MakeLoadHints(
+    const TransBuffer& buffer)
+{
+    if (!buffer.WholeBlock() || buffer.bypassHitOnLoad_) { return {}; }
+    return std::unique_ptr<LoadHints>(new LoadHints(buffer, nHashTableBucket));
+}
+
+TransBuffer::Handle EarlyBufferPins::AcquireLoad(TransBuffer& buffer,
+    const Detail::BlockId& block, size_t shard, LoadHints* hints)
+{
+    if (!hints || hints->buffer_ != &buffer || shard >= buffer.LayerCount()) {
+        return Acquire(buffer, block, shard, true);
+    }
+    auto& strategy = *buffer.strategy_;
+    auto& position = hints->positions_[Hash(block, 0)];
+    const auto node = position.load(std::memory_order_relaxed);
+    if (node < strategy.NodeCount()) {
+        strategy.NodeLock(node);
+        auto* meta = strategy.MetaAt(node);
+        // A position is only a hint: recycling changes identity under this lock.
+        // Requiring an existing reference preserves the ordinary reader path;
+        // idle, partial and failed entries keep the original acquisition rules.
+        const bool ready = meta->block == block && meta->shard == 0 && meta->reference != 0
+            && meta->state.load(std::memory_order_acquire) == TransBuffer::State::READY;
+        if (ready) {
+            ++meta->reference;
+            strategy.MarkAccessed(node);
+        }
+        strategy.NodeUnlock(node);
+        if (ready) {
+            TransBuffer::Handle result(&buffer, node, false);
+            result.view_ = shard;
+            return result;
+        }
+    }
+    auto result = Acquire(buffer, block, shard, true);
+    if (result) { position.store(result.pos_, std::memory_order_relaxed); }
+    return result;
+}
+
 Early::Domain EarlyBufferPins::DescribeDomain(TransBuffer& buffer)
 {
     Early::Domain result;

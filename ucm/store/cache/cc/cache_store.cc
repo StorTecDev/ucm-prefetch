@@ -403,6 +403,7 @@ private:
 // Reservations are destroyed before the base store releases those resources.
 class EarlyCacheStore final : public CacheStore, public Early::DomainProvider {
     std::unique_ptr<ReservedPrefetch> early_;
+    std::unique_ptr<EarlyBufferPins::LoadHints> loadHints_;
     StoreV1* readLeaseBackend_{nullptr};
     std::unique_ptr<EarlyNativeTransfer> transfers_;
     size_t earlyBlockBytes_{0}, earlyShardBytes_{0}, diskBlockBytes_{0};
@@ -431,6 +432,7 @@ public:
                 &bufferMgr_, param.storeBackend, earlyBlockBytes_, earlyShardBytes_,
                 param.timeoutMs, param.cacheFullBlockLoad);
             transfers_ = std::make_unique<EarlyNativeTransfer>(*param.storeBackend, transMgr_, param);
+            loadHints_ = EarlyBufferPins::MakeLoadHints(*bufferMgr_.GetTransBuffer());
         }
         return Status::OK();
     }
@@ -534,8 +536,9 @@ private:
         for (size_t i = 0; i < prepared.desc.size(); ++i) {
             if (prepared.loadHandles[i]) { continue; }
             const auto& shard = prepared.desc[i];
-            prepared.loadHandles[i] = EarlyBufferPins::Acquire(
-                buffer, shard.owner, shard.index, type == TransTask::Type::LOAD);
+            prepared.loadHandles[i] = type == TransTask::Type::LOAD
+                ? EarlyBufferPins::AcquireLoad(buffer, shard.owner, shard.index, loadHints_.get())
+                : EarlyBufferPins::Acquire(buffer, shard.owner, shard.index, false);
             if (!prepared.loadHandles[i]) {
                 // Nothing has entered a native queue or touched an I/O stream.
                 // EarlyTaskPins rolls back only allocation owners; shared readers

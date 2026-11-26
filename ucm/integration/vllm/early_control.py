@@ -16,7 +16,7 @@ import time
 import msgspec
 import zmq
 
-from .early_ready import ReadyHints, ReadyInbox
+from .early_ready import ReadyHints
 
 log = logging.getLogger(__name__)
 
@@ -146,7 +146,8 @@ class BrokerState:
 class Control:
     def __init__(self, endpoint, identity, callback, broker_config=None, hello=None, ready_reserve=None):
         self.endpoint, self.identity, self.callback = endpoint, identity, callback
-        self.ready_inbox = ReadyInbox(ready_reserve) if ready_reserve is not None else None
+        self.ready_reserve = ready_reserve
+        self.broker_process = None
         self.hint_sender = None
         self.broker_config = broker_config
         import uuid
@@ -175,7 +176,7 @@ class Control:
             self.writer.send(b"x")
         except (OSError, BlockingIOError):
             pass
-        self.thread.join(timeout=5)
+        self.thread.join(timeout=20 if self.broker_config is not None else 5)
 
     def _send_outbound(self, dealer, encode):
         tickets = []
@@ -198,44 +199,19 @@ class Control:
         dealer = context.socket(zmq.DEALER)
         dealer.setsockopt(zmq.IDENTITY, self.identity.encode())
         dealer.setsockopt(zmq.LINGER, 0)
-        router = hint_receiver = None
-        inbox = self.ready_inbox
+        broker = None
         encode, decode = msgspec.msgpack.encode, msgspec.msgpack.decode
         try:
             poller = zmq.Poller()
             if self.broker_config is not None:
-                router = context.socket(zmq.ROUTER)
-                router.setsockopt(zmq.LINGER, 0)
-                router.bind(self.endpoint)
+                from .early_broker import BrokerProcess
 
-                if inbox is not None:
-                    try:
-                        hint_receiver = ReadyHints(self.endpoint, receiver=True)
-                    except OSError:
-                        inbox = None
-                    else:
-                        poller.register(hint_receiver.socket.fileno(), zmq.POLLIN)
-
-                def send_to_peer(peer, message):
-                    router.send_multipart([peer.encode(), encode(message)])
-
-                from .early_owner import OwnerBroker
-                def route(peer, message):
-                    if inbox is None:
-                        return send_to_peer(peer, message)
-                    if message["op"] == "pong" and peer.startswith("w"):
-                        message = dict(message, ready_hints=True)
-                    inbox.forward(send_to_peer, peer, message)
-
-                def read_next():
-                    try:
-                        peer, payload = router.recv_multipart(zmq.NOBLOCK)
-                    except zmq.Again:
-                        return None
-                    return peer.decode(), decode(payload)
-
-                broker = OwnerBroker(route, **self.broker_config)
-                poller.register(router, zmq.POLLIN)
+                broker = BrokerProcess(
+                    self.endpoint, self.broker_config, self.ready_reserve, self.stopping
+                )
+                self.broker_process = broker
+                broker.start()
+                poller.register(broker.connection.fileno(), zmq.POLLIN)
             dealer.connect(self.endpoint)
             poller.register(dealer, zmq.POLLIN)
             poller.register(self.reader.fileno(), zmq.POLLIN)
@@ -244,26 +220,12 @@ class Control:
             connecting_since = time.monotonic()
             connect_timeout = float(os.getenv("VLLM_ENGINE_READY_TIMEOUT_S", "3600"))
             while not self.stopping.is_set():
-                events = dict(
-                    poller.poll(0 if inbox is not None and inbox.pending else
-                                broker.poll_timeout_ms() if router is not None else 1000)
-                )  # control deadlines only; no storage polling
+                events = dict(poller.poll(1000))
+                if broker is not None and broker.connection.fileno() in events:
+                    raise RuntimeError("Independent early broker exited")
                 if self.reader.fileno() in events:
                     self.reader.recv(65536)
                     self._send_outbound(dealer, encode)
-                if hint_receiver is not None and hint_receiver.socket.fileno() in events:
-                    hint_receiver.receive(broker, inbox.tickets)
-                if inbox is not None and inbox.pending:
-                    inbox.service(broker, read_next, transport_readable=router in events)
-                elif router is not None and router in events:
-                    peer, payload = router.recv_multipart()
-                    identity, message = peer.decode(), decode(payload)
-                    if inbox is not None and inbox.tickets:
-                        inbox.receive_hinted(
-                            broker, (identity, message), read_next, scheduler_readable=dealer in events
-                        )
-                    else:
-                        broker.receive(identity, message)
                 if dealer in events:
                     message = decode(dealer.recv())
                     last_reply = time.monotonic()
@@ -275,13 +237,9 @@ class Control:
                     if message["op"] != "pong":
                         self.callback(message)
                 now = time.monotonic()
-                if router is not None:
-                    broker.advance_retries(now)
                 if now - heartbeat >= 2:
                     dealer.send(encode({"op": "ping", "session": self.hello["session"]}))
                     heartbeat = now
-                    if router is not None:
-                        broker.expire(now)
                 if (
                     last_reply is None and now - connecting_since > connect_timeout
                 ) or (last_reply is not None and now - last_reply > 60):
@@ -291,18 +249,11 @@ class Control:
             self.callback({"op": "lost", "reason": str(error)})
         finally:
             self.stopping.set()
-            if hint_receiver is not None:
-                log.info(
-                    "UCM_EARLY ready_priority_summary promoted=%s crossed=%s "
-                    "scanned=%s priority_turns=%s",
-                    inbox.promoted, inbox.crossed, inbox.scanned, inbox.priority_turns,
-                )
-                hint_receiver.socket.close()
             if self.hint_sender is not None:
                 self.hint_sender.socket.close()
             dealer.close()
-            if router is not None:
-                router.close()
             context.term()
+            if broker is not None:
+                broker.close()
             self.reader.close()
             self.writer.close()

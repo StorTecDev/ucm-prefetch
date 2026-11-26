@@ -183,20 +183,17 @@ def test_hint_batch_filters_each_attempt_before_use():
 def test_producer_enqueues_formal_ready_and_wakes_without_advisory_io():
     import queue
     import threading
-    from collections import deque
     from unittest.mock import Mock
 
     control_type = importlib.import_module(package.__name__ + ".early_control").Control
     control = control_type.__new__(control_type)
     control.stopping = threading.Event()
     control.outbound = queue.SimpleQueue()
-    control.hint_outbound = deque(maxlen=32)
     control.hint_sender = Mock()
     control.writer = Mock()
     _, answer = message("owner_answer", "candidate")
     control.send(answer)
     assert control.outbound.get_nowait() is answer
-    assert list(control.hint_outbound) == [("candidate", "generation")]
     control.writer.send.assert_called_once_with(b"x")
     control.hint_sender.notify.assert_not_called()
 
@@ -680,3 +677,88 @@ def test_empty_transport_shortcut_preserves_fault_and_cancel_order():
     )
     assert broker.received == ordinary[:2]
     assert inbox.last_sent_ready_sequence == 0
+
+def outbound_control():
+    import queue
+    from unittest.mock import Mock
+
+    control_type = importlib.import_module(package.__name__ + ".early_control").Control
+    control = control_type.__new__(control_type)
+    control.outbound = queue.SimpleQueue()
+    control.hint_sender = Mock()
+    control.identity = "worker"
+    control.hello = {"session": "current"}
+    return control
+
+
+def test_ready_hint_follows_its_formal_socket_submission():
+    from unittest.mock import Mock
+
+    control = outbound_control()
+    events = []
+    ordinary = message("execution_request", "ordinary")[1]
+    answer = message("owner_answer", "candidate")[1]
+    control.outbound.put(ordinary)
+    control.outbound.put(answer)
+    dealer = Mock()
+    dealer.send.side_effect = lambda event: events.append(("formal", event))
+    control.hint_sender.notify.side_effect = lambda peer, session, tickets: events.append(
+        ("hint", list(tickets))
+    )
+    control._send_outbound(dealer, lambda event: event)
+    assert events == [
+        ("formal", ordinary), ("formal", answer),
+        ("hint", [("candidate", "generation")]),
+    ]
+
+
+@pytest.mark.parametrize("failed_submission", [0, 1])
+def test_failed_formal_submission_does_not_publish_its_hint(failed_submission):
+    from unittest.mock import Mock
+
+    control = outbound_control()
+    control.outbound.put(message("execution_request", "ordinary")[1])
+    control.outbound.put(message("owner_answer", "candidate")[1])
+    dealer = Mock()
+    dealer.send.side_effect = (
+        [RuntimeError("transport failed")]
+        if failed_submission == 0 else [None, RuntimeError("transport failed")]
+    )
+    with pytest.raises(RuntimeError, match="transport failed"):
+        control._send_outbound(dealer, lambda event: event)
+    control.hint_sender.notify.assert_not_called()
+
+
+def test_ready_hints_remain_bounded_and_only_cover_submitted_packets():
+    from unittest.mock import Mock
+
+    control = outbound_control()
+    submitted = set()
+    notifications = []
+    for index in range(65):
+        control.outbound.put(message("owner_answer", str(index))[1])
+    dealer = Mock()
+    dealer.send.side_effect = lambda event: submitted.add((event["key"], event["attempt"]))
+
+    def notify(peer, session, tickets):
+        assert set(tickets) <= submitted
+        notifications.append(list(tickets))
+
+    control.hint_sender.notify.side_effect = notify
+    control._send_outbound(dealer, lambda event: event)
+    assert [len(batch) for batch in notifications] == [32, 32, 1]
+    assert sum(notifications, []) == [(str(index), "generation") for index in range(65)]
+
+
+def test_no_hint_channel_keeps_formal_fifo_unchanged():
+    from unittest.mock import Mock
+
+    control = outbound_control()
+    control.hint_sender = None
+    events = [message("execution_request", "ordinary")[1],
+              message("owner_answer", "candidate")[1]]
+    for event in events:
+        control.outbound.put(event)
+    dealer = Mock()
+    control._send_outbound(dealer, lambda event: event)
+    assert [call.args[0] for call in dealer.send.call_args_list] == events

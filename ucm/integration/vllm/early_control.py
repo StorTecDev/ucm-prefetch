@@ -6,7 +6,6 @@ pins, leases, or L1 identities. Each socket is confined to one control thread.
 
 from __future__ import annotations
 
-from collections import deque
 import logging
 import os
 import queue
@@ -149,7 +148,6 @@ class Control:
         self.endpoint, self.identity, self.callback = endpoint, identity, callback
         self.ready_inbox = ReadyInbox(ready_reserve) if ready_reserve is not None else None
         self.hint_sender = None
-        self.hint_outbound = deque(maxlen=32)
         self.broker_config = broker_config
         import uuid
         self.hello = dict(hello or {}, session=uuid.uuid4().hex)
@@ -166,8 +164,6 @@ class Control:
         if self.stopping.is_set():
             return
         self.outbound.put(message)
-        if self.hint_sender is not None and message["op"] == "owner_answer" and message["state"] == "READY":
-            self.hint_outbound.append((message["key"], message["attempt"]))
         try:
             self.writer.send(b"x")
         except BlockingIOError:
@@ -180,6 +176,22 @@ class Control:
         except (OSError, BlockingIOError):
             pass
         self.thread.join(timeout=5)
+
+    def _send_outbound(self, dealer, encode):
+        tickets = []
+        while not self.outbound.empty():
+            message = self.outbound.get()
+            dealer.send(encode(message))
+            if (self.hint_sender is not None and message["op"] == "owner_answer"
+                    and message["state"] == "READY"):
+                tickets.append((message["key"], message["attempt"]))
+                if len(tickets) == 32:
+                    self.hint_sender.notify(self.identity, self.hello["session"], tickets)
+                    tickets = []
+        if tickets:
+            # A hint must not overtake formal work still queued in this process.
+            # Socket acceptance orders submissions, not delivery across channels.
+            self.hint_sender.notify(self.identity, self.hello["session"], tickets)
 
     def _run(self):
         context = zmq.Context()
@@ -238,16 +250,7 @@ class Control:
                 )  # control deadlines only; no storage polling
                 if self.reader.fileno() in events:
                     self.reader.recv(65536)
-                    if self.hint_outbound:
-                        # Wake the ordered transport first. If READY is behind normal
-                        # messages, its hint can still pass the rest of that backlog.
-                        if not self.outbound.empty():
-                            dealer.send(encode(self.outbound.get()))
-                        tickets = [self.hint_outbound.popleft()
-                                   for _ in range(len(self.hint_outbound))]
-                        self.hint_sender.notify(self.identity, self.hello["session"], tickets)
-                    while not self.outbound.empty():
-                        dealer.send(encode(self.outbound.get()))
+                    self._send_outbound(dealer, encode)
                 if hint_receiver is not None and hint_receiver.socket.fileno() in events:
                     hint_receiver.receive(broker, inbox.tickets)
                 if inbox is not None and inbox.pending:

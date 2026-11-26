@@ -215,6 +215,28 @@ class ReadyInbox:
             self.dispatch(broker)
             return
 
+        if self._ordinary_prefix_size == len(self.pending):
+            if not self.can_cross(broker, *self.pending[0]):
+                self.dispatch(broker)
+                return
+            # Remember only that the buffered prefix contains no READY. Its
+            # dependency checks may have expired after ordinary FIFO progress;
+            # validate it afresh only when new input can enable a promotion.
+            while True:
+                item = read_next()
+                if item is None:
+                    self.dispatch(broker)
+                    return
+                self.pending.append(item)
+                peer, message = item
+                self.scanned += 1
+                if (message["op"] == "owner_answer"
+                        and message.get("state") == "READY"):
+                    break
+                if not self.can_cross(broker, peer, message):
+                    break
+                self._ordinary_prefix_size += 1
+
         self._ordinary_prefix_size = 0
         transport_exhausted = False
         deferred = deque()

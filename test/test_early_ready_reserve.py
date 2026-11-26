@@ -762,3 +762,75 @@ def test_no_hint_channel_keeps_formal_fifo_unchanged():
     dealer = Mock()
     control._send_outbound(dealer, lambda event: event)
     assert [call.args[0] for call in dealer.send.call_args_list] == events
+
+
+def test_ordinary_arrivals_do_not_recheck_the_entire_known_prefix():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(100)]
+    answer = message("owner_answer", "candidate")
+    inbox.pending.extend(ordinary[:20])
+    inbox.service(broker, lambda: None, transport_readable=False)
+    for event in ordinary[20:]:
+        incoming = iter([event])
+        inbox.service(broker, lambda: next(incoming, None), transport_readable=True)
+    checked_without_ready = inbox.scanned
+    assert broker.received == ordinary[:81]
+    assert checked_without_ready <= len(ordinary) * 2
+    incoming = iter([answer])
+    inbox.service(broker, lambda: next(incoming, None), transport_readable=True)
+    assert broker.received[-2:] == [answer, ordinary[81]]
+    assert inbox.last_sent_ready_sequence == 1
+    assert inbox.scanned <= len(ordinary) * 3
+
+
+def test_new_ready_revalidates_dependencies_behind_the_cached_head():
+    inbox, broker = prepare_turn(["candidate"])
+    prefix = [
+        message("execution_request", "ordinary"),
+        message("execution_request", "ordinary"),
+        message("execution_request", "third"),
+    ]
+    inbox.pending.extend(prefix)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    broker.jobs["third"]["status"] = "CANCELLED"
+    broker.ready_order_epoch += 1
+    answer = message("owner_answer", "candidate")
+    incoming = iter([answer])
+    inbox.service(broker, lambda: next(incoming, None), transport_readable=True)
+    assert broker.received == prefix[:2]
+    assert list(inbox.pending) == [prefix[2], answer]
+    assert inbox.last_sent_ready_sequence == 0
+
+
+def test_receive_exception_preserves_cached_and_new_ordinary_messages():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(4)]
+    inbox.pending.extend(ordinary[:3])
+    inbox.service(broker, lambda: None, transport_readable=False)
+    incoming = iter([ordinary[3]])
+
+    def read_next():
+        item = next(incoming, None)
+        if item is None:
+            raise ValueError("decode failed")
+        return item
+
+    with pytest.raises(ValueError, match="decode failed"):
+        inbox.service(broker, read_next, transport_readable=True)
+    assert broker.received == ordinary[:1]
+    assert list(inbox.pending) == ordinary[1:]
+
+
+def test_arriving_cancel_is_not_crossed_while_waiting_for_formal_ready():
+    inbox, broker = prepare_turn(["candidate"])
+    ordinary = [message("execution_request", "ordinary") for _ in range(3)]
+    inbox.pending.extend(ordinary)
+    inbox.service(broker, lambda: None, transport_readable=False)
+    cancel = message("cancel", "candidate")
+    answer = message("owner_answer", "candidate")
+    incoming = iter([cancel, answer])
+    inbox.service(broker, lambda: next(incoming, None), transport_readable=True)
+    assert broker.received == ordinary[:2]
+    assert list(inbox.pending) == [ordinary[2], cancel]
+    assert next(incoming) == answer
+    assert inbox.last_sent_ready_sequence == 0

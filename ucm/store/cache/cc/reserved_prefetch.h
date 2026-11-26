@@ -57,6 +57,7 @@ class ReservedPrefetch {
     struct LoadEntry {
         std::weak_ptr<Reservation> reservation;
         size_t blockOffset;
+        uint64_t handle;
     };
     struct LoadPlan {
         std::vector<uint64_t> handles;
@@ -264,7 +265,7 @@ public:
                     std::lock_guard lock(r->mutex);
                     if (!r->ready || r->cancelled.load()) { continue; }
                     for (size_t b = 0; b < r->blocks.size(); ++b) {
-                        next->blocks.emplace(r->blocks[b], LoadEntry{r, b});
+                        next->blocks.emplace(r->blocks[b], LoadEntry{r, b, handle});
                     }
                 }
                 loadPlan_ = std::move(next);
@@ -282,6 +283,9 @@ public:
         selected.reserve(std::min(task.size(), plan->blocks.size()));
         const Detail::BlockId* previous = nullptr;
         std::shared_ptr<BlockPins> group;
+        std::shared_ptr<Reservation> active;
+        std::unique_lock<std::mutex> activeLock;
+        uint64_t activeHandle = 0;
         std::vector<TransBuffer::Handle> handles;
         for (size_t i = 0; i < task.size(); ++i) {
             const auto& shard = task[i];
@@ -294,11 +298,17 @@ public:
                     ++stats.blockLookups;
                     auto entry = plan->blocks.find(shard.owner);
                     if (entry != plan->blocks.end()) {
-                        if (auto r = entry->second.reservation.lock()) {
-                            std::lock_guard lock(r->mutex);
-                            if (r->ready && !r->cancelled.load()) {
-                                slot->second = r->groups[entry->second.blockOffset];
-                            }
+                        if (!active || activeHandle != entry->second.handle) {
+                            // A layer's adjacent blocks normally share a reservation.
+                            // Retain that lock only during view preparation, never I/O.
+                            // Unlock before replacing the owner of the mutex.
+                            activeLock = std::unique_lock<std::mutex>{};
+                            active = entry->second.reservation.lock();
+                            activeHandle = entry->second.handle;
+                            if (active) { activeLock = std::unique_lock(active->mutex); }
+                        }
+                        if (active && active->ready && !active->cancelled.load()) {
+                            slot->second = active->groups[entry->second.blockOffset];
                         }
                     }
                 }

@@ -1552,3 +1552,100 @@ TEST(UCCacheEarlyStoreTest, StagingConfigRejectsZeroNumericBufferSize)
         EXPECT_TRUE(store->Setup(config).Failure());
     }
 }
+
+TEST(UCCacheEarlyStoreTest, LoadViewsKeepIdentityAcrossReservationSwitches)
+{
+    Backend backend;
+    auto c = BatchConfig(&backend);
+    c.blockSize *= 2;
+    c.cacheFullBlockL1 = true;
+    UC::CacheStore::BufferManager manager;
+    ASSERT_TRUE(manager.Setup(c).Success());
+    auto* buffer = manager.GetTransBuffer();
+    std::array<UC::Detail::BlockId, 8> blocks{};
+    for (size_t b = 0; b < blocks.size(); ++b) {
+        blocks[b][0] = std::byte(b);
+        auto owner = buffer->Get(blocks[b], 0);
+        ASSERT_TRUE(owner);
+        for (size_t layer = 0; layer < 2; ++layer) {
+            auto view = owner.LayerView(layer);
+            std::memset(view.Data(), int(2 * b + layer), c.shardSize);
+        }
+        owner.WholeView().MarkReady();
+    }
+    UC::CacheStore::ReservedPrefetch early(&manager, &backend, c.blockSize, c.blockSize, 1000, true);
+    auto first = early.Reserve(blocks.data(), 4).Value();
+    auto second = early.Reserve(blocks.data() + 4, 4).Value();
+    const std::array<size_t, 11> order{0, 1, 2, 3, 7, 6, 5, 4, 2, 7, 0};
+    UC::Detail::TaskDesc task;
+    task.loadReservations = {first.handle, second.handle};
+    for (size_t i = 0; i < order.size(); ++i) {
+        task.push_back({blocks[order[i]], i % 2, {nullptr}});
+    }
+    UC::Detail::BlockId absent{};
+    absent[0] = std::byte{99};
+    task.push_back({absent, 0, {nullptr}});
+    EXPECT_CALL(backend, Load).Times(0);
+    auto views = early.LoadHandles(task);
+    ASSERT_EQ(views.size(), task.size());
+    early.Release(first.handle);
+    early.Release(second.handle);
+    EXPECT_TRUE(early.LoadHandles(task).empty());
+    for (size_t i = 0; i < order.size(); ++i) {
+        ASSERT_TRUE(views[i]);
+        EXPECT_TRUE(views[i].Ready());
+        EXPECT_EQ(static_cast<unsigned char*>(views[i].Data())[0], 2 * order[i] + i % 2);
+    }
+    EXPECT_FALSE(views.back());
+}
+
+TEST(UCCacheEarlyStoreTest, ConcurrentReleaseDoesNotInvalidateAcquiredLoadViews)
+{
+    Backend backend;
+    auto c = BatchConfig(&backend);
+    c.cacheFullBlockL1 = true;
+    UC::CacheStore::BufferManager manager;
+    ASSERT_TRUE(manager.Setup(c).Success());
+    std::array<UC::Detail::BlockId, 96> blocks{};
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        blocks[i][0] = std::byte(i);
+        auto pin = manager.GetTransBuffer()->Get(blocks[i], 0);
+        ASSERT_TRUE(pin);
+        std::memset(pin.Data(), int(i), c.shardSize);
+        pin.MarkReady();
+    }
+    UC::CacheStore::ReservedPrefetch early(&manager, &backend, c.blockSize, c.blockSize, 1000, true);
+    for (size_t repeat = 0; repeat < 16; ++repeat) {
+        auto first = early.Reserve(blocks.data(), 48).Value();
+        auto second = early.Reserve(blocks.data() + 48, 48).Value();
+        UC::Detail::TaskDesc task;
+        task.loadReservations = {first.handle, second.handle};
+        for (const auto& block : blocks) { task.push_back({block, 0, {nullptr}}); }
+        auto retained = early.LoadHandles(task);
+        ASSERT_EQ(retained.size(), blocks.size());
+        std::promise<void> start;
+        auto ready = start.get_future().share();
+        auto reader = std::async(std::launch::async, [&] {
+            ready.wait();
+            for (size_t n = 0; n < 32; ++n) {
+                auto views = early.LoadHandles(task);
+                for (size_t i = 0; i < views.size(); ++i) {
+                    if (views[i]) {
+                        EXPECT_TRUE(views[i].Ready());
+                        EXPECT_EQ(static_cast<unsigned char*>(views[i].Data())[0], i);
+                    }
+                }
+            }
+        });
+        start.set_value();
+        early.Release(first.handle);
+        early.Release(second.handle);
+        ASSERT_EQ(reader.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        reader.get();
+        EXPECT_TRUE(early.LoadHandles(task).empty());
+        for (size_t i = 0; i < retained.size(); ++i) {
+            ASSERT_TRUE(retained[i]);
+            EXPECT_EQ(static_cast<unsigned char*>(retained[i].Data())[0], i);
+        }
+    }
+}

@@ -16,6 +16,7 @@ class ReadyReserve:
         self.attempts = set()
         # The scheduler publishes both fields together while holding its job lock.
         self.snapshot = (0, 0)
+        self._shared = None
 
     def publish(self, processed_sequence=None):
         if processed_sequence is None:
@@ -23,6 +24,29 @@ class ReadyReserve:
         elif processed_sequence != self.snapshot[1] + 1:
             raise RuntimeError("Noncontiguous scheduler READY result sequence")
         self.snapshot = len(self.attempts), processed_sequence
+        shared = self._shared
+        if shared is not None:
+            shared.write(self.snapshot)
+
+    def share(self):
+        """Expose accounting without adding per-request acknowledgement messages."""
+        from .early_shared_ready import SharedReadySnapshot
+
+        if self._shared is None:
+            self._shared = SharedReadySnapshot(initial=self.snapshot)
+        return self._shared.fileno()
+
+    def attach_shared(self, descriptor):
+        from .early_shared_ready import SharedReadySnapshot
+
+        if self._shared is not None:
+            raise RuntimeError("READY accounting already shared")
+        self._shared = SharedReadySnapshot(descriptor)
+
+    def close_shared(self):
+        shared, self._shared = self._shared, None
+        if shared is not None:
+            shared.close()
 
     def discard(self, job):
         if not self.attempts:
@@ -33,7 +57,10 @@ class ReadyReserve:
             self.publish()
 
     def promotion_budget(self, last_sent_ready_sequence):
-        ready_awaiting_first_schedule, processed_sequence = self.snapshot
+        shared = self._shared
+        ready_awaiting_first_schedule, processed_sequence = (
+            self.snapshot if shared is None else shared.read()
+        )
         unacknowledged_ready_notifications = last_sent_ready_sequence - processed_sequence
         return max(0, self.target - ready_awaiting_first_schedule - unacknowledged_ready_notifications)
 
